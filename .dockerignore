@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Git
+.git/
+.gitignore
+
+# Env files (don't leak secrets into build context)
+.env
+.env.*
+!.env.docker.example
+
+# Logs and temp
+logs/
+*.log
+tmp/
+*.tmp
+
+# SQLite
+*.sqlite3
+db.sqlite3
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Django
+staticfiles/
+media/
+*.pot
+
+# Node (si tenés frontend en el mismo repo)
+node_modules/
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Internal docs
+CLAUDE.md

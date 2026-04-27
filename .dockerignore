@@ -58,3 +58,4 @@ htmlcov/
 
 # Internal docs
 CLAUDE.md
+.claude/

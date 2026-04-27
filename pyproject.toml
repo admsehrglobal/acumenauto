@@ -15,6 +15,8 @@ brevo-python = "^1.1.2"
 celery = "^5.5.0"
 redis = "^5.2.0"
 django-celery-beat = "^2.7.0"
+gunicorn = "^23.0.0"
+whitenoise = "^6.8.2"
 
 
 [build-system]

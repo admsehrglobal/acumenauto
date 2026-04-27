@@ -1,0 +1,49 @@
+# Fly.io config para acumenauto.
+#
+# Multi-process: web (gunicorn) + worker (celery + Playwright) + beat (celery beat).
+# Postgres y Redis viven en otros apps de Fly (creados con `fly pg create` y
+# `fly redis create`); se conectan via DATABASE_URL y CELERY_BROKER_URL en secrets.
+#
+# Region: iad (Ashburn, Virginia) — IPs US-clean para que DCI no bloquee.
+
+app = "acumenauto"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Corre antes de promover el release. Las migrations son idempotentes
+# (incluida 0003 que crea el admin desde ADMIN_USERNAME/ADMIN_PASSWORD).
+[deploy]
+  release_command = "python manage.py migrate --noinput"
+
+[processes]
+  web = "gunicorn acumenauto.wsgi --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -"
+  worker = "celery -A acumenauto worker --loglevel=info --concurrency=1 --max-tasks-per-child=1"
+  beat = "celery -A acumenauto beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["web"]
+
+# Web: dashboard liviano, puede dormirse cuando nadie lo visita.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["web"]
+
+# Worker: corre Playwright + Chromium. 2GB es el minimo para evitar OOM.
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+  processes = ["worker"]
+
+# Beat: solo dispara tasks por cron, no laburo pesado.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["beat"]

@@ -12,6 +12,8 @@ RUN pip install --no-cache-dir poetry
 COPY pyproject.toml poetry.lock ./
 RUN poetry install --no-root
 
+RUN playwright install chromium --with-deps
+
 COPY . .
 
 EXPOSE 8000

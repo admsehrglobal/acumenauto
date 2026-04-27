@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 import dj_database_url
@@ -22,24 +23,32 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-$d((uf9umkrni@8k@lf$6gxu3syx(^2^3t%=u3llc#5ge$#b9s'
+SECRET_KEY = os.environ["SECRET_KEY"]
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get("DEBUG", "False") == "True"
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [h for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h]
+
+# DCI portal credentials and report config.
+DCI_USERNAME = os.environ["DCI_USERNAME"]
+DCI_PASSWORD = os.environ["DCI_PASSWORD"]
+DCI_REPORT_URL = os.environ["DCI_REPORT_URL"]
+DCI_REPORT_BUTTON_NAME = os.environ["DCI_REPORT_BUTTON_NAME"]
+
+NOTIFICATION_EMAIL = os.environ["NOTIFICATION_EMAIL"]
 
 
 # Application definition
 
 INSTALLED_APPS = [
     'django.contrib.admin',
-    'app',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'app',
 ]
 
 MIDDLEWARE = [

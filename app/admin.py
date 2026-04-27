@@ -1,3 +1,23 @@
 from django.contrib import admin
 
-# Register your models here.
+from app.models import Run
+
+
+@admin.register(Run)
+class RunAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "status",
+        "started_at",
+        "finished_at",
+        "attempt_number",
+    )
+    list_filter = ("status",)
+    readonly_fields = (
+        "started_at",
+        "finished_at",
+        "status",
+        "file_url",
+        "error_message",
+        "attempt_number",
+    )

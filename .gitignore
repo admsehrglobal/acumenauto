@@ -227,3 +227,15 @@ tmp_uploads/
 # Uncomment and adjust as needed
 # /uploads/
 # /generated/
+
+# Playwright debug dumps del scraper (error.png, error_0.url, etc.)
+error*.png
+error*.url
+error*.html
+
+# Playwright codegen user-data-dirs
+pw-*/
+
+# Reportes descargados localmente (cuando hacés docker compose cp)
+acumen/
+*.xlsx

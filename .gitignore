@@ -76,6 +76,9 @@ celerybeat.pid
 secrets.json
 credentials.json
 
+# Claude Code (memoria local, no subir)
+.claude/
+
 # ===========================
 # Testing & coverage
 # ===========================

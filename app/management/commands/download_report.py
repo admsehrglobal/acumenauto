@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -8,6 +9,10 @@ from django.utils import timezone
 from app.email_utils import send_reports_email
 from app.models import Run
 from app.scraper import download_reports
+
+# Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
+# que llegan al inbox sean legibles para Paul.
+CLIENT_TZ = ZoneInfo("America/New_York")
 
 
 class Command(BaseCommand):
@@ -22,6 +27,11 @@ class Command(BaseCommand):
         run = Run.objects.create(
             status=Run.Status.RUNNING, started_at=timezone.now()
         )
+        # Timestamp del run usado en el nombre de cada archivo. Asi todos los
+        # archivos del mismo run quedan agrupados visualmente.
+        timestamp_label = run.started_at.astimezone(CLIENT_TZ).strftime(
+            "%Y-%m-%d_%Hh%M"
+        )
 
         reports = [
             (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME),
@@ -35,6 +45,7 @@ class Command(BaseCommand):
                     password=settings.DCI_PASSWORD,
                     reports=reports,
                     output_dir=output_dir,
+                    timestamp_label=timestamp_label,
                 )
             )
         except Exception as exc:
@@ -44,7 +55,7 @@ class Command(BaseCommand):
             run.save()
             raise
 
-        run.file_url = ";".join(str(p) for p in paths)
+        run.filenames = ";".join(p.name for p in paths)
 
         try:
             send_reports_email(paths, settings.NOTIFICATION_EMAIL)
@@ -54,6 +65,11 @@ class Command(BaseCommand):
             run.finished_at = timezone.now()
             run.save()
             raise
+        finally:
+            # No persistimos los Excel — el email es el storage definitivo.
+            # Limpiamos /tmp aun si el send fallo (los archivos no sirven post-run).
+            for p in paths:
+                p.unlink(missing_ok=True)
 
         run.status = Run.Status.SUCCESS
         run.finished_at = timezone.now()

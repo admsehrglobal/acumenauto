@@ -29,8 +29,13 @@ async def download_reports(
     password: str,
     reports: list[tuple[str, str]],
     output_dir: Path,
+    timestamp_label: str,
 ) -> list[Path]:
-    """Login una vez, descarga cada (report_url, button_name) reusando el popup."""
+    """Login una vez, descarga cada (report_url, button_name) reusando el popup.
+
+    `timestamp_label` se appendea al nombre del archivo para que cada run quede
+    identificable (ej: '2026-04-27_14h30').
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
@@ -53,7 +58,9 @@ async def download_reports(
                 await report_page.goto(report_url)
                 logger.warning("[REPORT] URL post-goto: %s", report_page.url)
                 paths.append(
-                    await _export_excel(report_page, button_name, output_dir)
+                    await _export_excel(
+                        report_page, button_name, output_dir, timestamp_label
+                    )
                 )
             return paths
         except Exception:
@@ -106,7 +113,7 @@ async def _xcore_login(page: Page, username: str, password: str) -> None:
 
 
 async def _export_excel(
-    page: Page, report_button_name: str, output_dir: Path
+    page: Page, report_button_name: str, output_dir: Path, timestamp_label: str
 ) -> Path:
     await page.get_by_role("button", name=report_button_name).click()
 
@@ -128,10 +135,10 @@ async def _export_excel(
         await iframe.get_by_test_id("export-btn").click(force=True)
     download = await download_info.value
 
-    # El portal siempre sugiere "data.xlsx" — derivamos del button_name para
-    # no pisar archivos cuando bajamos varios reportes en la misma corrida.
+    # El portal siempre sugiere "data.xlsx" — derivamos del button_name + timestamp
+    # para no pisar archivos y que cada run quede identificable en el inbox.
     slug = "_".join(report_button_name.lower().split())
-    target = output_dir / f"{slug}.xlsx"
+    target = output_dir / f"{slug}_{timestamp_label}.xlsx"
     await download.save_as(target)
     return target
 

@@ -13,7 +13,7 @@ class Run(models.Model):
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.PENDING
     )
-    file_url = models.URLField(blank=True)
+    filenames = models.CharField(max_length=500, blank=True, default="")
     error_message = models.TextField(blank=True)
     attempt_number = models.PositiveIntegerField(default=1)
 
@@ -21,5 +21,5 @@ class Run(models.Model):
         return f"Run {self.pk} ({self.status})"
 
     @property
-    def file_paths(self) -> list[str]:
-        return [p for p in (self.file_url or "").split(";") if p]
+    def file_names(self) -> list[str]:
+        return [n for n in (self.filenames or "").split(";") if n]

@@ -17,7 +17,7 @@ class RunAdmin(admin.ModelAdmin):
         "started_at",
         "finished_at",
         "status",
-        "file_url",
+        "filenames",
         "error_message",
         "attempt_number",
     )

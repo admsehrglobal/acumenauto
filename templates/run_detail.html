@@ -33,12 +33,12 @@
       </dd>
     </div>
     <div class="sm:col-span-2">
-      <dt class="text-slate-500">Files</dt>
+      <dt class="text-slate-500">Files emailed</dt>
       <dd class="text-slate-900">
-        {% if run.file_paths %}
+        {% if run.file_names %}
           <ul class="list-disc list-inside font-mono text-xs space-y-1">
-            {% for path in run.file_paths %}
-              <li class="break-all">{{ path }}</li>
+            {% for name in run.file_names %}
+              <li class="break-all">{{ name }}</li>
             {% endfor %}
           </ul>
         {% else %}

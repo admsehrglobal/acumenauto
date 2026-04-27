@@ -34,6 +34,51 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
+
+  redis:
+    image: redis:7-alpine
+    container_name: acumenauto-redis
+    restart: unless-stopped
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: acumenauto-celery-worker
+    init: true
+    # concurrency=1: solo un browser de Playwright a la vez (RAM/CPU).
+    # max-tasks-per-child=1: worker se reinicia tras cada task, evita leaks de Chromium.
+    command: celery -A acumenauto worker --loglevel=info --concurrency=1 --max-tasks-per-child=1
+    volumes:
+      - .:/code
+    env_file:
+      - ./.env.docker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: acumenauto-celery-beat
+    init: true
+    command: celery -A acumenauto beat --loglevel=info
+    volumes:
+      - .:/code
+    env_file:
+      - ./.env.docker
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
 volumes:
   postgres_data:

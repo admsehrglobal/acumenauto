@@ -11,6 +11,9 @@ django = "^6.0.4"
 psycopg = {extras = ["binary"], version = "^3.3.3"}
 dj-database-url = "^3.1.2"
 playwright = "^1.58.0"
+brevo-python = "^1.1.2"
+celery = "^5.5.0"
+redis = "^5.2.0"
 
 
 [build-system]

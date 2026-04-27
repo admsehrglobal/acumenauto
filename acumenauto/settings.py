@@ -40,6 +40,18 @@ DCI_REPORT_BUTTON_NAME_2 = os.environ["DCI_REPORT_BUTTON_NAME_2"]
 
 NOTIFICATION_EMAIL = os.environ["NOTIFICATION_EMAIL"]
 
+# Email (Brevo)
+BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+DEFAULT_FROM_EMAIL = os.environ["DEFAULT_FROM_EMAIL"]
+
+# Celery
+CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_TIMEZONE = "UTC"
+CELERY_TASK_TRACK_STARTED = True
+# El scraper toma ~2 min; subimos el limite por las dudas.
+CELERY_TASK_TIME_LIMIT = 10 * 60
+
 
 # Application definition
 

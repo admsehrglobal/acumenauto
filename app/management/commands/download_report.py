@@ -5,12 +5,13 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from app.email_utils import send_reports_email
 from app.models import Run
 from app.scraper import download_reports
 
 
 class Command(BaseCommand):
-    help = "Descarga los reportes Excel de DCI usando las env vars de settings."
+    help = "Descarga los reportes Excel de DCI y los envia por email."
 
     def add_arguments(self, parser):
         parser.add_argument("--output-dir", default="/tmp/acumen")
@@ -43,14 +44,25 @@ class Command(BaseCommand):
             run.save()
             raise
 
-        run.status = Run.Status.SUCCESS
         run.file_url = ";".join(str(p) for p in paths)
+
+        try:
+            send_reports_email(paths, settings.NOTIFICATION_EMAIL)
+        except Exception as exc:
+            run.status = Run.Status.FAILED
+            run.error_message = f"[email] {exc}"
+            run.finished_at = timezone.now()
+            run.save()
+            raise
+
+        run.status = Run.Status.SUCCESS
         run.finished_at = timezone.now()
         run.save()
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Descargados {len(paths)} archivos (Run #{run.pk}):\n"
+                f"Descargados {len(paths)} archivos y enviados a "
+                f"{settings.NOTIFICATION_EMAIL} (Run #{run.pk}):\n"
                 + "\n".join(f"  - {p}" for p in paths)
             )
         )

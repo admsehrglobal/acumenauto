@@ -6,11 +6,11 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from app.models import Run
-from app.scraper import download_report
+from app.scraper import download_reports
 
 
 class Command(BaseCommand):
-    help = "Descarga el reporte Excel de DCI usando las env vars de settings."
+    help = "Descarga los reportes Excel de DCI usando las env vars de settings."
 
     def add_arguments(self, parser):
         parser.add_argument("--output-dir", default="/tmp/acumen")
@@ -22,13 +22,17 @@ class Command(BaseCommand):
             status=Run.Status.RUNNING, started_at=timezone.now()
         )
 
+        reports = [
+            (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME),
+            (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2),
+        ]
+
         try:
-            path = asyncio.run(
-                download_report(
+            paths = asyncio.run(
+                download_reports(
                     username=settings.DCI_USERNAME,
                     password=settings.DCI_PASSWORD,
-                    report_url=settings.DCI_REPORT_URL,
-                    report_button_name=settings.DCI_REPORT_BUTTON_NAME,
+                    reports=reports,
                     output_dir=output_dir,
                 )
             )
@@ -40,8 +44,13 @@ class Command(BaseCommand):
             raise
 
         run.status = Run.Status.SUCCESS
-        run.file_url = str(path)
+        run.file_url = ";".join(str(p) for p in paths)
         run.finished_at = timezone.now()
         run.save()
 
-        self.stdout.write(self.style.SUCCESS(f"Descargado: {path} (Run #{run.pk})"))
+        self.stdout.write(
+            self.style.SUCCESS(
+                f"Descargados {len(paths)} archivos (Run #{run.pk}):\n"
+                + "\n".join(f"  - {p}" for p in paths)
+            )
+        )

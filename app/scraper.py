@@ -2,10 +2,10 @@
 
 Flow: login en acumen.dcisoftware.com -> click "Advanced Insights" abre popup
 que hace handshake OAuth con acumen-xcore-auth (hay que esperarlo para que
-setee cookies) -> navega al report group -> click boton del reporte especifico
--> exporta el iframe de Power BI a Excel.
+setee cookies) -> por cada reporte: navega al report group -> click boton
+del reporte -> exporta el iframe de Power BI a Excel.
 
-Selectores relevados con `playwright codegen` (2026-04-24).
+Selectores relevados con `playwright codegen` (2026-04-24 reporte 1, 2026-04-27 reporte 2).
 """
 from __future__ import annotations
 
@@ -24,14 +24,13 @@ logger = logging.getLogger(__name__)
 PORTAL_URL = "https://acumen.dcisoftware.com/"
 
 
-async def download_report(
+async def download_reports(
     username: str,
     password: str,
-    report_url: str,
-    report_button_name: str,
+    reports: list[tuple[str, str]],
     output_dir: Path,
-) -> Path:
-    """Login, navega al reporte, descarga el Excel. Retorna el path local del archivo."""
+) -> list[Path]:
+    """Login una vez, descarga cada (report_url, button_name) reusando el popup."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
@@ -48,9 +47,15 @@ async def download_report(
             page = await context.new_page()
             await _login(page, username, password)
             report_page = await _open_reports_popup(page, username, password)
-            await report_page.goto(report_url)
-            logger.warning("[REPORT] URL post-goto(report_url): %s", report_page.url)
-            return await _export_excel(report_page, report_button_name, output_dir)
+
+            paths: list[Path] = []
+            for report_url, button_name in reports:
+                await report_page.goto(report_url)
+                logger.warning("[REPORT] URL post-goto: %s", report_page.url)
+                paths.append(
+                    await _export_excel(report_page, button_name, output_dir)
+                )
+            return paths
         except Exception:
             await _dump_debug(context, output_dir)
             raise
@@ -123,7 +128,10 @@ async def _export_excel(
         await iframe.get_by_test_id("export-btn").click(force=True)
     download = await download_info.value
 
-    target = output_dir / download.suggested_filename
+    # El portal siempre sugiere "data.xlsx" — derivamos del button_name para
+    # no pisar archivos cuando bajamos varios reportes en la misma corrida.
+    slug = "_".join(report_button_name.lower().split())
+    target = output_dir / f"{slug}.xlsx"
     await download.save_as(target)
     return target
 

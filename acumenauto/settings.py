@@ -51,6 +51,13 @@ CELERY_TIMEZONE = "UTC"
 CELERY_TASK_TRACK_STARTED = True
 # El scraper toma ~2 min; subimos el limite por las dudas.
 CELERY_TASK_TIME_LIMIT = 10 * 60
+# Schedule vive en DB (django_celery_beat) para que Paul lo edite desde el dashboard.
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+
+# Auth
+LOGIN_URL = "/login/"
+LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/login/"
 
 
 # Application definition
@@ -62,6 +69,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django_celery_beat',
     'app',
 ]
 

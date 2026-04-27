@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Run #{{ run.id }} | Acumen Auto{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="{% url 'dashboard' %}" class="text-sm text-sky-600 hover:underline">&larr; Back to runs</a>
+</div>
+
+<div class="bg-white rounded-lg shadow border border-slate-200 p-6">
+  <div class="flex items-center justify-between mb-4">
+    <h1 class="text-xl font-semibold text-slate-900">Run #{{ run.id }}</h1>
+    {% if run.status == 'success' %}
+      <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">success</span>
+    {% elif run.status == 'failed' %}
+      <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-100 text-red-800">failed</span>
+    {% elif run.status == 'running' %}
+      <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-sky-100 text-sky-800">running</span>
+    {% else %}
+      <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-slate-100 text-slate-800">{{ run.status }}</span>
+    {% endif %}
+  </div>
+
+  <dl class="grid grid-cols-1 sm:grid-cols-2 gap-y-3 gap-x-6 text-sm">
+    <div>
+      <dt class="text-slate-500">Started</dt>
+      <dd class="text-slate-900">{{ run.started_at|date:"Y-m-d H:i:s" }}</dd>
+    </div>
+    <div>
+      <dt class="text-slate-500">Finished</dt>
+      <dd class="text-slate-900">
+        {% if run.finished_at %}{{ run.finished_at|date:"Y-m-d H:i:s" }}{% else %}<span class="text-slate-400">—</span>{% endif %}
+      </dd>
+    </div>
+    <div class="sm:col-span-2">
+      <dt class="text-slate-500">Files</dt>
+      <dd class="text-slate-900">
+        {% if run.file_paths %}
+          <ul class="list-disc list-inside font-mono text-xs space-y-1">
+            {% for path in run.file_paths %}
+              <li class="break-all">{{ path }}</li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <span class="text-slate-400">—</span>
+        {% endif %}
+      </dd>
+    </div>
+  </dl>
+
+  {% if run.error_message %}
+  <div class="mt-6">
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm font-medium text-slate-700">Error message</h2>
+      <button type="button" id="copy-error-btn"
+              class="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-100">
+        Copy
+      </button>
+    </div>
+    <pre id="error-message"
+         class="bg-slate-900 text-red-200 text-xs p-4 rounded overflow-x-auto whitespace-pre-wrap break-all">{{ run.error_message }}</pre>
+  </div>
+  <script>
+    document.getElementById("copy-error-btn").addEventListener("click", async () => {
+      const text = document.getElementById("error-message").innerText;
+      await navigator.clipboard.writeText(text);
+      const btn = document.getElementById("copy-error-btn");
+      const orig = btn.innerText;
+      btn.innerText = "Copied!";
+      setTimeout(() => { btn.innerText = orig; }, 1500);
+    });
+  </script>
+  {% endif %}
+</div>
+{% endblock %}

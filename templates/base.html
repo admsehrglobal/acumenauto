@@ -1,0 +1,46 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Acumen Auto{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  {% if user.is_authenticated %}
+  <nav class="bg-slate-900 text-white">
+    <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+      <a href="{% url 'dashboard' %}" class="font-semibold tracking-wide">Acumen Auto</a>
+      <div class="flex items-center gap-4 text-sm">
+        <a href="{% url 'dashboard' %}" class="hover:text-sky-300">Runs</a>
+        <a href="{% url 'settings' %}" class="hover:text-sky-300">Settings</a>
+        <span class="text-slate-400 hidden sm:inline">{{ user.username }}</span>
+        <form method="post" action="{% url 'logout' %}" class="inline">
+          {% csrf_token %}
+          <button type="submit" class="text-slate-300 hover:text-white">Logout</button>
+        </form>
+      </div>
+    </div>
+  </nav>
+  {% endif %}
+
+  <main class="max-w-5xl mx-auto px-4 py-6">
+    {% if messages %}
+      <div class="mb-4 space-y-2">
+        {% for m in messages %}
+          <div class="px-4 py-2 rounded border
+                      {% if m.tags == 'success' %}bg-green-50 border-green-200 text-green-800
+                      {% elif m.tags == 'error' %}bg-red-50 border-red-200 text-red-800
+                      {% else %}bg-slate-50 border-slate-200 text-slate-800{% endif %}">
+            {{ m }}
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

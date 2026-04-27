@@ -68,7 +68,7 @@ services:
       dockerfile: Dockerfile
     container_name: acumenauto-celery-beat
     init: true
-    command: celery -A acumenauto beat --loglevel=info
+    command: celery -A acumenauto beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
     volumes:
       - .:/code
     env_file:

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+
+{% block title %}Settings | Acumen Auto{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-semibold text-slate-900 mb-6">Settings</h1>
+
+<div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl">
+  <h2 class="text-lg font-medium text-slate-900 mb-1">Schedule</h2>
+  <p class="text-sm text-slate-600 mb-4">
+    Hours of the day (UTC) when the scraper runs. Add as many as you need.
+  </p>
+
+  <form method="post" class="space-y-4">
+    {% csrf_token %}
+    <input type="hidden" name="hours" id="hours-csv" value="{{ current_hours }}">
+
+    <div>
+      <label class="block text-sm font-medium text-slate-700 mb-1">Scheduled hours</label>
+      <div id="hour-chips"
+           class="flex flex-wrap gap-2 min-h-[2.5rem] p-2 border border-slate-300 rounded bg-slate-50">
+      </div>
+      {% if form.hours.errors %}
+        <p class="text-xs text-red-600 mt-1">{{ form.hours.errors.0 }}</p>
+      {% endif %}
+    </div>
+
+    <div class="flex gap-2 items-end">
+      <div class="flex-1">
+        <label for="hour-select" class="block text-xs text-slate-500 mb-1">Add hour</label>
+        <select id="hour-select"
+                class="w-full px-3 py-2 border border-slate-300 rounded focus:outline-none focus:ring-2 focus:ring-sky-400 font-mono">
+        </select>
+      </div>
+      <button type="button" id="add-hour"
+              class="bg-sky-600 text-white px-4 py-2 rounded hover:bg-sky-700 transition">
+        + Add
+      </button>
+    </div>
+
+    <div class="pt-2">
+      <button type="submit"
+              class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700 transition">
+        Save
+      </button>
+    </div>
+  </form>
+</div>
+
+<script>
+  (function() {
+    const initial = "{{ current_hours }}";
+    let hours = initial
+      .split(",")
+      .map(s => s.trim())
+      .filter(s => s.length)
+      .map(Number)
+      .filter(n => !isNaN(n) && n >= 0 && n <= 23);
+    hours = Array.from(new Set(hours)).sort((a, b) => a - b);
+
+    const chipsEl = document.getElementById("hour-chips");
+    const selectEl = document.getElementById("hour-select");
+    const csvEl = document.getElementById("hours-csv");
+    const addBtn = document.getElementById("add-hour");
+
+    function format(h) {
+      return String(h).padStart(2, "0") + ":00";
+    }
+
+    function rebuildSelect() {
+      selectEl.innerHTML = "";
+      for (let h = 0; h < 24; h++) {
+        if (hours.includes(h)) continue;
+        const opt = document.createElement("option");
+        opt.value = String(h);
+        opt.textContent = format(h);
+        selectEl.appendChild(opt);
+      }
+      addBtn.disabled = selectEl.options.length === 0;
+      addBtn.classList.toggle("opacity-50", addBtn.disabled);
+      addBtn.classList.toggle("cursor-not-allowed", addBtn.disabled);
+    }
+
+    function rebuildChips() {
+      chipsEl.innerHTML = "";
+      if (hours.length === 0) {
+        const empty = document.createElement("span");
+        empty.className = "text-sm text-slate-400 italic";
+        empty.textContent = "No hours scheduled — add at least one.";
+        chipsEl.appendChild(empty);
+      } else {
+        hours.forEach(h => {
+          const chip = document.createElement("span");
+          chip.className = "inline-flex items-center gap-1 bg-sky-100 text-sky-800 px-2 py-1 rounded text-sm font-mono";
+          const label = document.createElement("span");
+          label.textContent = format(h);
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.dataset.h = String(h);
+          btn.className = "text-sky-600 hover:text-red-600 leading-none text-base";
+          btn.setAttribute("aria-label", "Remove " + format(h));
+          btn.textContent = "×";
+          chip.appendChild(label);
+          chip.appendChild(btn);
+          chipsEl.appendChild(chip);
+        });
+      }
+      csvEl.value = hours.join(",");
+    }
+
+    addBtn.addEventListener("click", () => {
+      if (selectEl.options.length === 0) return;
+      const h = Number(selectEl.value);
+      if (!hours.includes(h)) {
+        hours.push(h);
+        hours.sort((a, b) => a - b);
+        rebuildChips();
+        rebuildSelect();
+      }
+    });
+
+    chipsEl.addEventListener("click", (e) => {
+      if (e.target.tagName === "BUTTON" && e.target.dataset.h !== undefined) {
+        const h = Number(e.target.dataset.h);
+        hours = hours.filter(x => x !== h);
+        rebuildChips();
+        rebuildSelect();
+      }
+    });
+
+    rebuildChips();
+    rebuildSelect();
+  })();
+</script>
+{% endblock %}

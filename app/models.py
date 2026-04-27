@@ -19,3 +19,7 @@ class Run(models.Model):
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"
+
+    @property
+    def file_paths(self) -> list[str]:
+        return [p for p in (self.file_url or "").split(";") if p]

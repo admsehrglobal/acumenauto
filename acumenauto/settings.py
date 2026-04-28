@@ -30,6 +30,13 @@ DEBUG = os.environ.get("DEBUG", "False") == "True"
 
 ALLOWED_HOSTS = [h for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h]
 
+# Detrás del proxy de Fly (TLS termina en el edge). Sin esto Django ve http://
+# en POSTs y rompe cookies seguras + check de CSRF.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+CSRF_TRUSTED_ORIGINS = [
+    f"https://{h}" for h in ALLOWED_HOSTS if h not in ("localhost", "127.0.0.1", "0.0.0.0", "web")
+]
+
 # DCI portal credentials and report config.
 DCI_USERNAME = os.environ["DCI_USERNAME"]
 DCI_PASSWORD = os.environ["DCI_PASSWORD"]

@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from app.email_utils import send_reports_email
-from app.models import Run
+from app.models import Recipient, Run
 from app.scraper import download_reports
 
 # Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
@@ -16,7 +16,7 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 
 
 class Command(BaseCommand):
-    help = "Descarga los reportes Excel de DCI y los envia por email."
+    help = "Download the DCI Excel reports and email them to active recipients."
 
     def add_arguments(self, parser):
         parser.add_argument("--output-dir", default="/tmp/acumen")
@@ -57,8 +57,12 @@ class Command(BaseCommand):
 
         run.filenames = ";".join(p.name for p in paths)
 
+        recipients = list(
+            Recipient.objects.filter(active=True).values_list("email", flat=True)
+        )
+
         try:
-            send_reports_email(paths, settings.NOTIFICATION_EMAIL)
+            send_reports_email(paths, recipients)
         except Exception as exc:
             run.status = Run.Status.FAILED
             run.error_message = f"[email] {exc}"
@@ -77,8 +81,8 @@ class Command(BaseCommand):
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"Descargados {len(paths)} archivos y enviados a "
-                f"{settings.NOTIFICATION_EMAIL} (Run #{run.pk}):\n"
+                f"Downloaded {len(paths)} files and emailed to "
+                f"{', '.join(recipients)} (Run #{run.pk}):\n"
                 + "\n".join(f"  - {p}" for p in paths)
             )
         )

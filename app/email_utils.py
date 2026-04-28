@@ -42,8 +42,11 @@ def _get_brevo_api_instance():
     return transactional_emails_api.TransactionalEmailsApi(api_client)
 
 
-def send_reports_email(paths: list[Path], recipient: str) -> None:
-    """Manda los Excels adjuntos. Levanta excepción si Brevo falla."""
+def send_reports_email(paths: list[Path], recipients: list[str]) -> None:
+    """Manda los Excels adjuntos a todos los recipients. Levanta si Brevo falla."""
+    if not recipients:
+        raise ValueError("No recipients configured.")
+
     today = date.today().isoformat()
     attachments = [
         SendSmtpEmailAttachment(
@@ -65,9 +68,9 @@ def send_reports_email(paths: list[Path], recipient: str) -> None:
 
     email = SendSmtpEmail(
         sender=SendSmtpEmailSender(
-            name="Acumen Auto", email=settings.DEFAULT_FROM_EMAIL
+            name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
         ),
-        to=[SendSmtpEmailTo(email=recipient)],
+        to=[SendSmtpEmailTo(email=r) for r in recipients],
         subject=f"DCI Reports - {today}",
         html_content=html_content,
         text_content=text_content,

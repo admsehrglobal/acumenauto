@@ -1,6 +1,18 @@
 from django.db import models
 
 
+class Recipient(models.Model):
+    email = models.EmailField(unique=True)
+    active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["email"]
+
+    def __str__(self) -> str:
+        return self.email
+
+
 class Run(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"

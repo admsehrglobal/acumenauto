@@ -2,8 +2,11 @@
 
 ScheduleForm parsea la lista de horas (ej: '1,8,20') y la valida contra el
 formato que espera CrontabSchedule.hour (string CSV de enteros 0-23).
+RecipientForm valida un email para agregar a la lista de destinatarios.
 """
 from django import forms
+
+from app.models import Recipient
 
 
 _INPUT_CLASS = (
@@ -23,16 +26,27 @@ class ScheduleForm(forms.Form):
     def clean_hours(self) -> str:
         raw = self.cleaned_data["hours"].replace(" ", "")
         if not raw:
-            raise forms.ValidationError("Tenes que poner al menos una hora.")
+            raise forms.ValidationError("You must set at least one hour.")
         parts = raw.split(",")
         normalized = []
         for p in parts:
             try:
                 n = int(p)
             except ValueError:
-                raise forms.ValidationError(f"'{p}' no es un numero entero.")
+                raise forms.ValidationError(f"'{p}' is not an integer.")
             if not 0 <= n <= 23:
-                raise forms.ValidationError(f"'{p}' fuera de rango (debe ser 0-23).")
+                raise forms.ValidationError(f"'{p}' is out of range (must be 0-23).")
             normalized.append(n)
         unique_sorted = sorted(set(normalized))
         return ",".join(str(n) for n in unique_sorted)
+
+
+class RecipientForm(forms.ModelForm):
+    class Meta:
+        model = Recipient
+        fields = ["email"]
+        widgets = {
+            "email": forms.EmailInput(
+                attrs={"class": _INPUT_CLASS, "placeholder": "name@example.com"}
+            ),
+        }

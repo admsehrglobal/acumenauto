@@ -10,4 +10,7 @@ urlpatterns = [
     path("runs/<int:pk>/", views.run_detail, name="run_detail"),
     path("run-now/", views.run_now, name="run_now"),
     path("settings/", views.settings_view, name="settings"),
+    path("settings/recipients/add/", views.recipient_add, name="recipient_add"),
+    path("settings/recipients/<int:pk>/delete/", views.recipient_delete, name="recipient_delete"),
+    path("settings/recipients/<int:pk>/toggle/", views.recipient_toggle, name="recipient_toggle"),
 ]

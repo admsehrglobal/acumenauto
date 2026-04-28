@@ -5,52 +5,142 @@
 {% block content %}
 <h1 class="text-2xl font-semibold text-slate-900 mb-6">Settings</h1>
 
-<div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl">
-  <h2 class="text-lg font-medium text-slate-900 mb-1">Schedule</h2>
-  <p class="text-sm text-slate-600 mb-4">
-    Hours of the day (UTC) when the scraper runs. Add as many as you need.
-  </p>
+<div class="border-b border-slate-200 mb-6">
+  <nav class="flex gap-6 text-sm">
+    <button type="button" data-tab="schedule"
+            class="tab-btn py-2 border-b-2 border-transparent text-slate-600 hover:text-slate-900 transition">
+      Schedule
+    </button>
+    <button type="button" data-tab="recipients"
+            class="tab-btn py-2 border-b-2 border-transparent text-slate-600 hover:text-slate-900 transition">
+      Recipients
+    </button>
+  </nav>
+</div>
 
-  <form method="post" class="space-y-4">
-    {% csrf_token %}
-    <input type="hidden" name="hours" id="hours-csv" value="{{ current_hours }}">
+<section data-tab-panel="schedule" class="hidden">
+  <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl">
+    <h2 class="text-lg font-medium text-slate-900 mb-1">Schedule</h2>
+    <p class="text-sm text-slate-600 mb-4">
+      Hours of the day when the scraper runs. Stored in UTC; New Jersey time shown alongside (DST handled automatically). Add as many as you need.
+    </p>
 
-    <div>
-      <label class="block text-sm font-medium text-slate-700 mb-1">Scheduled hours</label>
-      <div id="hour-chips"
-           class="flex flex-wrap gap-2 min-h-[2.5rem] p-2 border border-slate-300 rounded bg-slate-50">
+    <form method="post" class="space-y-4">
+      {% csrf_token %}
+      <input type="hidden" name="hours" id="hours-csv" value="{{ current_hours }}">
+
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">Scheduled hours</label>
+        <div id="hour-chips"
+             class="flex flex-wrap gap-2 min-h-[2.5rem] p-2 border border-slate-300 rounded bg-slate-50">
+        </div>
+        {% if form.hours.errors %}
+          <p class="text-xs text-red-600 mt-1">{{ form.hours.errors.0 }}</p>
+        {% endif %}
       </div>
-      {% if form.hours.errors %}
-        <p class="text-xs text-red-600 mt-1">{{ form.hours.errors.0 }}</p>
-      {% endif %}
-    </div>
 
-    <div class="flex gap-2 items-end">
+      <div class="flex gap-2 items-end">
+        <div class="flex-1">
+          <label for="hour-select" class="block text-xs text-slate-500 mb-1">Add hour</label>
+          <select id="hour-select"
+                  class="w-full px-3 py-2 border border-slate-300 rounded focus:outline-none focus:ring-2 focus:ring-sky-400 font-mono">
+          </select>
+        </div>
+        <button type="button" id="add-hour"
+                class="bg-sky-600 text-white px-4 py-2 rounded hover:bg-sky-700 transition">
+          + Add
+        </button>
+      </div>
+
+      <div class="pt-2">
+        <button type="submit"
+                class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700 transition">
+          Save
+        </button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<section data-tab-panel="recipients" class="hidden">
+  <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl">
+    <h2 class="text-lg font-medium text-slate-900 mb-1">Recipients</h2>
+    <p class="text-sm text-slate-600 mb-4">
+      Email addresses that receive the DCI reports. Inactive ones are skipped.
+    </p>
+
+    <form method="post" action="{% url 'recipient_add' %}" class="flex gap-2 items-end mb-6">
+      {% csrf_token %}
       <div class="flex-1">
-        <label for="hour-select" class="block text-xs text-slate-500 mb-1">Add hour</label>
-        <select id="hour-select"
-                class="w-full px-3 py-2 border border-slate-300 rounded focus:outline-none focus:ring-2 focus:ring-sky-400 font-mono">
-        </select>
+        <label for="id_email" class="block text-xs text-slate-500 mb-1">New recipient</label>
+        {{ recipient_form.email }}
       </div>
-      <button type="button" id="add-hour"
+      <button type="submit"
               class="bg-sky-600 text-white px-4 py-2 rounded hover:bg-sky-700 transition">
         + Add
       </button>
-    </div>
+    </form>
 
-    <div class="pt-2">
-      <button type="submit"
-              class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700 transition">
-        Save
-      </button>
-    </div>
-  </form>
-</div>
+    {% if recipients %}
+      <ul class="divide-y divide-slate-100 border border-slate-200 rounded">
+        {% for r in recipients %}
+          <li class="flex items-center justify-between px-3 py-2 gap-3">
+            <span class="font-mono text-sm {% if not r.active %}text-slate-400 line-through{% else %}text-slate-800{% endif %} break-all">
+              {{ r.email }}
+            </span>
+            <div class="flex items-center gap-2 shrink-0">
+              <form method="post" action="{% url 'recipient_toggle' r.pk %}" class="inline">
+                {% csrf_token %}
+                <button type="submit"
+                        class="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-100">
+                  {% if r.active %}Disable{% else %}Enable{% endif %}
+                </button>
+              </form>
+              <form method="post" action="{% url 'recipient_delete' r.pk %}" class="inline"
+                    onsubmit="return confirm('Remove {{ r.email }}?');">
+                {% csrf_token %}
+                <button type="submit"
+                        class="text-xs px-2 py-1 rounded border border-red-200 text-red-700 hover:bg-red-50">
+                  Remove
+                </button>
+              </form>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="text-sm text-slate-400 italic">No recipients yet — add at least one.</p>
+    {% endif %}
+  </div>
+</section>
 
 <script>
   (function() {
-    const initial = "{{ current_hours }}";
-    let hours = initial
+    // ---- Tabs ----
+    const tabs = document.querySelectorAll(".tab-btn");
+    const panels = document.querySelectorAll("[data-tab-panel]");
+
+    function activate(name) {
+      tabs.forEach(t => {
+        const on = t.dataset.tab === name;
+        t.classList.toggle("border-sky-600", on);
+        t.classList.toggle("text-slate-900", on);
+        t.classList.toggle("font-medium", on);
+      });
+      panels.forEach(p => p.classList.toggle("hidden", p.dataset.tabPanel !== name));
+      if (history.replaceState) {
+        history.replaceState(null, "", "#" + name);
+      }
+    }
+
+    tabs.forEach(t => t.addEventListener("click", () => activate(t.dataset.tab)));
+
+    const initial = (window.location.hash || "#schedule").slice(1);
+    activate(["schedule", "recipients"].includes(initial) ? initial : "schedule");
+
+    // ---- Schedule chips ----
+    const initialHours = "{{ current_hours }}";
+    let hours = initialHours
       .split(",")
       .map(s => s.trim())
       .filter(s => s.length)
@@ -63,8 +153,19 @@
     const csvEl = document.getElementById("hours-csv");
     const addBtn = document.getElementById("add-hour");
 
+    const ET_FORMATTER = new Intl.DateTimeFormat("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+      timeZone: "America/New_York",
+    });
+
     function format(h) {
-      return String(h).padStart(2, "0") + ":00";
+      const utc = String(h).padStart(2, "0") + ":00";
+      const d = new Date();
+      d.setUTCHours(h, 0, 0, 0);
+      const et = ET_FORMATTER.format(d);
+      return `${utc} UTC / ${et} NJ`;
     }
 
     function rebuildSelect() {

@@ -16,14 +16,47 @@
       <div class="flex items-center gap-4 text-sm">
         <a href="{% url 'dashboard' %}" class="hover:text-sky-300">Runs</a>
         <a href="{% url 'settings' %}" class="hover:text-sky-300">Settings</a>
-        <span class="text-slate-400 hidden sm:inline">{{ user.username }}</span>
-        <form method="post" action="{% url 'logout' %}" class="inline">
-          {% csrf_token %}
-          <button type="submit" class="text-slate-300 hover:text-white">Logout</button>
-        </form>
+
+        <div class="relative" id="user-menu">
+          <button type="button" id="user-menu-btn"
+                  class="flex items-center gap-1 text-slate-300 hover:text-white focus:outline-none">
+            <span>{{ user.username }}</span>
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+            </svg>
+          </button>
+          <div id="user-menu-dropdown"
+               class="hidden absolute right-0 mt-2 w-48 bg-white text-slate-800 rounded shadow-lg border border-slate-200 z-10">
+            <a href="{% url 'password_change' %}"
+               class="block px-4 py-2 text-sm hover:bg-slate-100">Change password</a>
+            <form method="post" action="{% url 'logout' %}" class="block">
+              {% csrf_token %}
+              <button type="submit"
+                      class="w-full text-left px-4 py-2 text-sm hover:bg-slate-100 border-t border-slate-100">
+                Logout
+              </button>
+            </form>
+          </div>
+        </div>
       </div>
     </div>
   </nav>
+  <script>
+    (function() {
+      const btn = document.getElementById("user-menu-btn");
+      const dd = document.getElementById("user-menu-dropdown");
+      if (!btn || !dd) return;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        dd.classList.toggle("hidden");
+      });
+      document.addEventListener("click", (e) => {
+        if (!dd.classList.contains("hidden") && !dd.contains(e.target)) {
+          dd.classList.add("hidden");
+        }
+      });
+    })();
+  </script>
   {% endif %}
 
   <main class="max-w-5xl mx-auto px-4 py-6">

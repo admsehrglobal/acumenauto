@@ -42,48 +42,48 @@ def _get_brevo_api_instance():
 
 
 def send_reports_email(
-    paths: list[Path], recipients: list[str], subject_label: str
+    items: list[tuple[Path, str]], recipients: list[str], subject_label: str
 ) -> None:
-    """Manda los Excels adjuntos a todos los recipients. Levanta si Brevo falla.
+    """Manda un email separado por cada (path, report_name) a los recipients.
+
+    Paul pidio un email por adjunto para que el inbox quede mas legible, asi que
+    iteramos en lugar de meter todo en un solo mail con N attachments.
 
     `subject_label` es la hora NJ del run (ej: '2026-04-28 14:24 NJ'). Va en el
-    subject para distinguir batches multiples del mismo dia.
+    subject de cada mail.
     """
     if not recipients:
         raise ValueError("No recipients configured.")
 
-    attachments = [
-        SendSmtpEmailAttachment(
-            name=p.name,
-            content=base64.b64encode(p.read_bytes()).decode("ascii"),
-        )
-        for p in paths
-    ]
-
-    file_list_html = "".join(f"<li>{p.name}</li>" for p in paths)
-    html_content = (
-        f"<p>DCI reports ({subject_label}) attached.</p>"
-        f"<ul>{file_list_html}</ul>"
-    )
-    text_content = (
-        f"DCI reports ({subject_label}) attached.\n\n"
-        + "\n".join(f"- {p.name}" for p in paths)
-    )
-
-    email = SendSmtpEmail(
-        sender=SendSmtpEmailSender(
-            name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
-        ),
-        to=[SendSmtpEmailTo(email=r) for r in recipients],
-        subject=f"DCI Reports - {subject_label}",
-        html_content=html_content,
-        text_content=text_content,
-        attachment=attachments,
-    )
-
     api = _get_brevo_api_instance()
-    response = api.send_transac_email(email)
-    logger.info("Reports email sent. Brevo message_id=%s", response.message_id)
+    for path, report_name in items:
+        attachment = SendSmtpEmailAttachment(
+            name=path.name,
+            content=base64.b64encode(path.read_bytes()).decode("ascii"),
+        )
+        html_content = (
+            f"<p>DCI report attached: <strong>{report_name}</strong> "
+            f"({subject_label}).</p>"
+        )
+        text_content = (
+            f"DCI report attached: {report_name} ({subject_label}).\n"
+            f"File: {path.name}\n"
+        )
+        email = SendSmtpEmail(
+            sender=SendSmtpEmailSender(
+                name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
+            ),
+            to=[SendSmtpEmailTo(email=r) for r in recipients],
+            subject=f"DCI Report: {report_name} - {subject_label}",
+            html_content=html_content,
+            text_content=text_content,
+            attachment=[attachment],
+        )
+        response = api.send_transac_email(email)
+        logger.info(
+            "Report email sent (%s). Brevo message_id=%s",
+            report_name, response.message_id,
+        )
 
 
 def send_error_report(run, reporter_username: str) -> None:

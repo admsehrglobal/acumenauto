@@ -14,8 +14,13 @@ primary_region = "iad"
 
 # Corre antes de promover el release. Las migrations son idempotentes
 # (incluida 0003 que crea el admin desde ADMIN_USERNAME/ADMIN_PASSWORD).
+#
+# strategy = "immediate" reemplaza las machines de cada deploy en lugar de
+# dejar las viejas vivas. Sin esto, deploys sucesivos acumulan beats huerfanos
+# que disparan el cron N veces simultaneamente — paso real, dolio.
 [deploy]
   release_command = "python manage.py migrate --noinput"
+  strategy = "immediate"
 
 [processes]
   web = "gunicorn acumenauto.wsgi --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -"

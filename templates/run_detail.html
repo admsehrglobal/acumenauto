@@ -50,15 +50,32 @@
 
   {% if run.error_message %}
   <div class="mt-6">
-    <div class="flex items-center justify-between mb-2">
+    <div class="flex items-center justify-between mb-2 gap-2 flex-wrap">
       <h2 class="text-sm font-medium text-slate-700">Error message</h2>
-      <button type="button" id="copy-error-btn"
-              class="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-100">
-        Copy
-      </button>
+      <div class="flex items-center gap-2">
+        <button type="button" id="copy-error-btn"
+                class="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-100">
+          Copy
+        </button>
+        {% if run.status == 'failed' %}
+        <form method="post" action="{% url 'report_error' run.pk %}" class="inline"
+              onsubmit="return confirm('Send this error to support?');">
+          {% csrf_token %}
+          <button type="submit"
+                  class="text-xs px-2 py-1 rounded bg-red-600 text-white hover:bg-red-700">
+            Report this error to support
+          </button>
+        </form>
+        {% endif %}
+      </div>
     </div>
     <pre id="error-message"
          class="bg-slate-900 text-red-200 text-xs p-4 rounded overflow-x-auto whitespace-pre-wrap break-all">{{ run.error_message }}</pre>
+    {% if run.status == 'failed' %}
+    <p class="text-xs text-slate-500 mt-2">
+      Clicking <span class="font-medium">Report this error to support</span> emails the developer with the full details above. No need to write anything.
+    </p>
+    {% endif %}
   </div>
   <script>
     document.getElementById("copy-error-btn").addEventListener("click", async () => {

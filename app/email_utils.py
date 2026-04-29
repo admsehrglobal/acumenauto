@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import base64
 import logging
-from datetime import date
 from pathlib import Path
 
 import urllib3
@@ -42,12 +41,17 @@ def _get_brevo_api_instance():
     return transactional_emails_api.TransactionalEmailsApi(api_client)
 
 
-def send_reports_email(paths: list[Path], recipients: list[str]) -> None:
-    """Manda los Excels adjuntos a todos los recipients. Levanta si Brevo falla."""
+def send_reports_email(
+    paths: list[Path], recipients: list[str], subject_label: str
+) -> None:
+    """Manda los Excels adjuntos a todos los recipients. Levanta si Brevo falla.
+
+    `subject_label` es la hora NJ del run (ej: '2026-04-28 14:24 NJ'). Va en el
+    subject para distinguir batches multiples del mismo dia.
+    """
     if not recipients:
         raise ValueError("No recipients configured.")
 
-    today = date.today().isoformat()
     attachments = [
         SendSmtpEmailAttachment(
             name=p.name,
@@ -58,11 +62,11 @@ def send_reports_email(paths: list[Path], recipients: list[str]) -> None:
 
     file_list_html = "".join(f"<li>{p.name}</li>" for p in paths)
     html_content = (
-        f"<p>DCI reports for {today} attached.</p>"
+        f"<p>DCI reports ({subject_label}) attached.</p>"
         f"<ul>{file_list_html}</ul>"
     )
     text_content = (
-        f"DCI reports for {today} attached.\n\n"
+        f"DCI reports ({subject_label}) attached.\n\n"
         + "\n".join(f"- {p.name}" for p in paths)
     )
 
@@ -71,7 +75,7 @@ def send_reports_email(paths: list[Path], recipients: list[str]) -> None:
             name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
         ),
         to=[SendSmtpEmailTo(email=r) for r in recipients],
-        subject=f"DCI Reports - {today}",
+        subject=f"DCI Reports - {subject_label}",
         html_content=html_content,
         text_content=text_content,
         attachment=attachments,
@@ -80,3 +84,49 @@ def send_reports_email(paths: list[Path], recipients: list[str]) -> None:
     api = _get_brevo_api_instance()
     response = api.send_transac_email(email)
     logger.info("Reports email sent. Brevo message_id=%s", response.message_id)
+
+
+def send_error_report(run, reporter_username: str) -> None:
+    """Notifica al SUPPORT_EMAIL con el detalle de un Run fallido."""
+    subject = f"[AcumenAuto] Run #{run.pk} failed"
+    text_content = (
+        f"Run #{run.pk} failed.\n\n"
+        f"Reported by: {reporter_username}\n"
+        f"Started:     {run.started_at}\n"
+        f"Finished:    {run.finished_at}\n"
+        f"Status:      {run.status}\n"
+        f"Attempt:     {run.attempt_number}\n"
+        f"Files:       {run.filenames or '(none)'}\n\n"
+        f"Error:\n{run.error_message or '(no message)'}\n"
+    )
+    html_content = (
+        f"<p><strong>Run #{run.pk}</strong> failed.</p>"
+        f"<ul>"
+        f"<li>Reported by: {reporter_username}</li>"
+        f"<li>Started: {run.started_at}</li>"
+        f"<li>Finished: {run.finished_at}</li>"
+        f"<li>Status: {run.status}</li>"
+        f"<li>Attempt: {run.attempt_number}</li>"
+        f"<li>Files: {run.filenames or '(none)'}</li>"
+        f"</ul>"
+        f"<p><strong>Error:</strong></p>"
+        f"<pre style='white-space:pre-wrap;background:#111;color:#fbb;padding:8px'>"
+        f"{run.error_message or '(no message)'}</pre>"
+    )
+
+    email = SendSmtpEmail(
+        sender=SendSmtpEmailSender(
+            name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
+        ),
+        to=[SendSmtpEmailTo(email=settings.SUPPORT_EMAIL)],
+        subject=subject,
+        html_content=html_content,
+        text_content=text_content,
+    )
+
+    api = _get_brevo_api_instance()
+    response = api.send_transac_email(email)
+    logger.info(
+        "Error report sent for Run #%s. Brevo message_id=%s",
+        run.pk, response.message_id,
+    )

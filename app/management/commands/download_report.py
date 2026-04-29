@@ -27,11 +27,11 @@ class Command(BaseCommand):
         run = Run.objects.create(
             status=Run.Status.RUNNING, started_at=timezone.now()
         )
-        # Timestamp del run usado en el nombre de cada archivo. Asi todos los
-        # archivos del mismo run quedan agrupados visualmente.
-        timestamp_label = run.started_at.astimezone(CLIENT_TZ).strftime(
-            "%Y-%m-%d_%Hh%M"
-        )
+        # Timestamps del run, ambos en NJ time. El primero va en filenames
+        # (sin caracteres raros), el segundo en el subject del email.
+        nj_started = run.started_at.astimezone(CLIENT_TZ)
+        timestamp_label = nj_started.strftime("%Y-%m-%d_%Hh%M_NJ")
+        subject_label = nj_started.strftime("%Y-%m-%d %H:%M NJ")
 
         reports = [
             (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME),
@@ -62,7 +62,7 @@ class Command(BaseCommand):
         )
 
         try:
-            send_reports_email(paths, recipients)
+            send_reports_email(paths, recipients, subject_label)
         except Exception as exc:
             run.status = Run.Status.FAILED
             run.error_message = f"[email] {exc}"

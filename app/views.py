@@ -4,11 +4,13 @@ HTMX se usa solo en run-now para no recargar la pagina entera.
 """
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
+from django.core.paginator import Paginator
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 from django_celery_beat.models import PeriodicTask
 
+from app.email_utils import send_error_report
 from app.forms import RecipientForm, ScheduleForm
 from app.models import Recipient, Run
 from app.tasks import download_dci_reports
@@ -18,8 +20,9 @@ PERIODIC_TASK_NAME = "download-dci-reports-daily"
 
 @login_required
 def dashboard(request):
-    runs = Run.objects.order_by("-id")[:50]
-    return render(request, "dashboard.html", {"runs": runs})
+    paginator = Paginator(Run.objects.order_by("-id"), 25)
+    page = paginator.get_page(request.GET.get("page"))
+    return render(request, "dashboard.html", {"runs": page, "page": page})
 
 
 @login_required
@@ -101,6 +104,22 @@ def recipient_delete(request, pk: int):
     recipient.delete()
     messages.success(request, f"Recipient {email} removed.")
     return redirect("/settings/#recipients")
+
+
+@login_required
+@require_POST
+def report_error(request, pk: int):
+    run = get_object_or_404(Run, pk=pk)
+    if run.status != Run.Status.FAILED:
+        messages.error(request, "Only failed runs can be reported.")
+        return redirect("run_detail", pk=pk)
+    try:
+        send_error_report(run, request.user.username)
+    except Exception as exc:
+        messages.error(request, f"Could not send report: {exc}")
+        return redirect("run_detail", pk=pk)
+    messages.success(request, "Error report sent to support.")
+    return redirect("run_detail", pk=pk)
 
 
 @login_required

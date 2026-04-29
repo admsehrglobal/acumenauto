@@ -48,6 +48,8 @@ DCI_REPORT_BUTTON_NAME_2 = os.environ["DCI_REPORT_BUTTON_NAME_2"]
 # Email (Brevo)
 BREVO_API_KEY = os.environ["BREVO_API_KEY"]
 DEFAULT_FROM_EMAIL = os.environ["DEFAULT_FROM_EMAIL"]
+# Casilla a la que Paul puede reportar errores con un click desde run detail.
+SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "ebanvk@gmail.com")
 
 # Celery
 CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]

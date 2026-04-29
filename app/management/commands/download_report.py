@@ -61,8 +61,12 @@ class Command(BaseCommand):
             Recipient.objects.filter(active=True).values_list("email", flat=True)
         )
 
+        # Pareo cada path descargado con el button_name del reporte que lo generó,
+        # asi el email lleva un subject legible ("DCI Report: Foo Bar").
+        items = list(zip(paths, [bn for _, bn in reports]))
+
         try:
-            send_reports_email(paths, recipients, subject_label)
+            send_reports_email(items, recipients, subject_label)
         except Exception as exc:
             run.status = Run.Status.FAILED
             run.error_message = f"[email] {exc}"

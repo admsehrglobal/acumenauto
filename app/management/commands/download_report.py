@@ -20,6 +20,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--output-dir", default="/tmp/acumen")
+        parser.add_argument(
+            "--no-email",
+            action="store_true",
+            help="Descarga y mergea pero no manda email; deja los archivos en --output-dir.",
+        )
 
     def handle(self, *args, **options):
         output_dir = Path(options["output_dir"])
@@ -49,6 +54,7 @@ class Command(BaseCommand):
                 settings.DCI_REPORT_URL_3,
                 settings.DCI_REPORT_BUTTON_NAME_3,
                 settings.DCI_REPORT_3_START_DATE,
+                nj_started.date(),
                 config.vendor_authorization_accrual_chunks,
             )
 
@@ -72,6 +78,19 @@ class Command(BaseCommand):
 
         paths = [p for p, _ in items]
         run.filenames = ";".join(p.name for p in paths)
+
+        if options["no_email"]:
+            run.status = Run.Status.SUCCESS
+            run.finished_at = timezone.now()
+            run.save()
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Downloaded {len(paths)} files (no email sent, "
+                    f"Run #{run.pk}):\n"
+                    + "\n".join(f"  - {p}" for p in paths)
+                )
+            )
+            return
 
         recipients = list(
             Recipient.objects.filter(active=True).values_list("email", flat=True)

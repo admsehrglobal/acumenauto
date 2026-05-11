@@ -6,7 +6,7 @@ RecipientForm valida un email para agregar a la lista de destinatarios.
 """
 from django import forms
 
-from app.models import Recipient
+from app.models import AppConfig, Recipient
 
 
 _INPUT_CLASS = (
@@ -50,3 +50,20 @@ class RecipientForm(forms.ModelForm):
                 attrs={"class": _INPUT_CLASS, "placeholder": "name@example.com"}
             ),
         }
+
+
+class AppConfigForm(forms.ModelForm):
+    class Meta:
+        model = AppConfig
+        fields = ["vendor_authorization_accrual_chunks"]
+        widgets = {
+            "vendor_authorization_accrual_chunks": forms.NumberInput(
+                attrs={"class": _INPUT_CLASS, "min": 1, "max": 20}
+            ),
+        }
+
+    def clean_vendor_authorization_accrual_chunks(self) -> int:
+        n = self.cleaned_data["vendor_authorization_accrual_chunks"]
+        if not 1 <= n <= 20:
+            raise forms.ValidationError("Must be between 1 and 20.")
+        return n

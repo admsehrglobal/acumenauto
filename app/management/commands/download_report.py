@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from app.email_utils import send_reports_email
-from app.models import Recipient, Run
+from app.models import AppConfig, Recipient, Run
 from app.scraper import download_reports
 
 # Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
@@ -37,15 +37,22 @@ class Command(BaseCommand):
             (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME),
             (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2),
         ]
+        chunked_report = (
+            settings.DCI_REPORT_URL_3,
+            settings.DCI_REPORT_BUTTON_NAME_3,
+            settings.DCI_REPORT_3_START_DATE,
+            AppConfig.load().vendor_authorization_accrual_chunks,
+        )
 
         try:
-            paths = asyncio.run(
+            items = asyncio.run(
                 download_reports(
                     username=settings.DCI_USERNAME,
                     password=settings.DCI_PASSWORD,
                     reports=reports,
                     output_dir=output_dir,
                     timestamp_label=timestamp_label,
+                    chunked_report=chunked_report,
                 )
             )
         except Exception as exc:
@@ -55,15 +62,12 @@ class Command(BaseCommand):
             run.save()
             raise
 
+        paths = [p for p, _ in items]
         run.filenames = ";".join(p.name for p in paths)
 
         recipients = list(
             Recipient.objects.filter(active=True).values_list("email", flat=True)
         )
-
-        # Pareo cada path descargado con el button_name del reporte que lo generó,
-        # asi el email lleva un subject legible ("DCI Report: Foo Bar").
-        items = list(zip(paths, [bn for _, bn in reports]))
 
         try:
             send_reports_email(items, recipients, subject_label)

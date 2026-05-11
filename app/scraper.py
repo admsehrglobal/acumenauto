@@ -8,6 +8,8 @@ del reporte -> exporta el iframe de Power BI a Excel.
 El reporte 3 (Vendor Authorization Accrual Balances) excede 150k filas/export
 asi que se baja en N chunks: click una sola vez al boton, despues loop
 seteando el date filter (textbox Angular Material) y exportando cada rango.
+Los N chunks se mergean en un unico xlsx antes de devolver, para que el
+cliente reciba un solo adjunto en lugar de N emails separados.
 
 Selectores relevados con `playwright codegen` (reporte 1: 2026-04-24,
 reporte 2: 2026-04-27, reporte 3: 2026-05-10).
@@ -19,6 +21,7 @@ import datetime as dt
 import logging
 from pathlib import Path
 
+from openpyxl import Workbook, load_workbook
 from playwright.async_api import (
     BrowserContext,
     Page,
@@ -37,13 +40,13 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_report: tuple[str, str, dt.date, int] | None = None,
+    chunked_report: tuple[str, str, dt.date, dt.date, int] | None = None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_report` es el reporte que excede el limite de filas por export y
-    se descarga en N chunks: (url, button_name, start_date, n_chunks).
+    se descarga en N chunks: (url, button_name, start_date, end_date, n_chunks).
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
 
@@ -78,7 +81,7 @@ async def download_reports(
                 results.append((path, button_name))
 
             if chunked_report is not None:
-                url, button_name, start_date, n_chunks = chunked_report
+                url, button_name, start_date, end_date, n_chunks = chunked_report
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 results.extend(
@@ -86,6 +89,7 @@ async def download_reports(
                         report_page,
                         button_name,
                         start_date,
+                        end_date,
                         n_chunks,
                         output_dir,
                         timestamp_label,
@@ -176,15 +180,22 @@ async def _export_chunked_report(
     page: Page,
     button_name: str,
     start_date: dt.date,
+    end_date: dt.date,
     n_chunks: int,
     output_dir: Path,
     timestamp_label: str,
 ) -> list[tuple[Path, str]]:
-    """Click el boton del reporte una vez, lee el end date default del filtro,
-    y exporta N veces cambiando el rango (sin recargar la pagina entre chunks).
+    """Click el boton del reporte una vez y exporta N veces cambiando el rango
+    (sin recargar la pagina entre chunks).
 
-    Cada chunk sale como un archivo separado con su propio display_name para
-    que `send_reports_email` mande un email por chunk.
+    `end_date` viene del caller (tipicamente hoy en NJ tz). Lee el default del
+    portal solo para detectar el formato de fecha (US/EU); el valor del default
+    se ignora (es 2-3 años en el futuro por authorizations programadas y
+    produciria columnas vacias en el export).
+
+    Los N chunks se mergean en un unico xlsx al final. Si cualquier chunk
+    falla, la excepcion propaga sin mergear (abort-on-fail: el cliente no
+    recibe un archivo parcial).
     """
     await page.get_by_role("button", name=button_name).click()
 
@@ -195,16 +206,16 @@ async def _export_chunked_report(
 
     end_input = iframe.get_by_role("textbox", name="End date. Available input")
     await end_input.wait_for()
-    end_str = await end_input.input_value()
-    end_date, date_fmt = _parse_filter_date(end_str)
+    default_end_str = await end_input.input_value()
+    _, date_fmt = _parse_filter_date(default_end_str)
     logger.warning(
-        "[REPORT chunked] Default end date filter: %r -> %s (fmt %s)",
-        end_str, end_date, date_fmt,
+        "[REPORT chunked] End date forced to %s (portal default was %r, fmt %s)",
+        end_date, default_end_str, date_fmt,
     )
 
     chunks = _chunk_date_range(start_date, end_date, n_chunks)
     slug = "_".join(button_name.lower().split())
-    results: list[tuple[Path, str]] = []
+    part_paths: list[Path] = []
 
     for i, (chunk_start, chunk_end) in enumerate(chunks, start=1):
         chunk_label = (
@@ -228,15 +239,134 @@ async def _export_chunked_report(
             await iframe.get_by_test_id("export-btn").click(force=True)
         download = await download_info.value
 
-        target = output_dir / (
+        part_path = output_dir / (
             f"{slug}_part_{i}_of_{n_chunks}"
             f"_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        await download.save_as(target)
-        results.append((target, f"{button_name} - {chunk_label}"))
+        await download.save_as(part_path)
+        rows = _validate_chunk_xlsx(part_path)
+        logger.warning(
+            "[REPORT chunked] %s OK (%d data rows)", chunk_label, rows
+        )
+        part_paths.append(part_path)
 
-    return results
+    merged_path = output_dir / (
+        f"{slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
+        f"_{timestamp_label}.xlsx"
+    )
+    _merge_xlsx_files(part_paths, merged_path)
+    for p in part_paths:
+        p.unlink(missing_ok=True)
+
+    display_name = (
+        f"{button_name} ({start_date.isoformat()} to {end_date.isoformat()})"
+    )
+    return [(merged_path, display_name)]
+
+
+def _validate_chunk_xlsx(path: Path) -> int:
+    """Confirma que el chunk recien descargado es un xlsx valido con datos.
+
+    Atrapa los modos de falla silenciosos mas comunes: descarga truncada
+    (openpyxl no puede abrir), filtro no aplicado o sesion caida (export
+    vacio o sin data rows). Si algo falla, raise -> el reporte aborta antes
+    de seguir con los proximos chunks o el merge.
+
+    Devuelve la cantidad de data rows (excluyendo header) para logging.
+    """
+    wb = load_workbook(path, read_only=True)
+    try:
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            header = next(rows_iter)
+        except StopIteration:
+            raise ValueError(f"{path.name}: archivo vacio (sin header)")
+        if not any(cell is not None for cell in header):
+            raise ValueError(f"{path.name}: header row vacio")
+        data_rows = sum(1 for _ in rows_iter)
+        if data_rows == 0:
+            raise ValueError(f"{path.name}: sin data rows (solo header)")
+        return data_rows
+    finally:
+        wb.close()
+
+
+def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
+    """Concat vertical de N xlsx con union de columnas por header.
+
+    El reporte Power BI es una matriz con fechas pivoteadas como columnas:
+    header de 2 filas (row 0 = grupo "Week Starting" + fechas, row 1 = column
+    names), cada chunk tiene un set distinto de columnas de fecha. La
+    identidad de cada columna es la tupla (row0_value, row1_value).
+
+    Las columnas que solo aparecen en algunos chunks se preservan; en los
+    chunks donde no estan, las celdas quedan vacias. Las data rows se
+    concatenan tal cual (sin dedup por PA — el downstream agrupa si quiere).
+    """
+    if not paths:
+        raise ValueError("No paths to merge")
+
+    canonical: list[tuple] = []
+    seen: set[tuple] = set()
+    chunk_headers: list[list[tuple]] = []
+    for path in paths:
+        wb = load_workbook(path, read_only=True)
+        try:
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                row0 = next(rows_iter)
+                row1 = next(rows_iter)
+            except StopIteration:
+                raise ValueError(f"{path.name}: header de 2 filas no presente")
+            if len(row0) != len(row1):
+                raise ValueError(
+                    f"{path.name}: top header ({len(row0)} cells) y "
+                    f"bottom header ({len(row1)}) no matchean"
+                )
+            composite = list(zip(row0, row1))
+            chunk_headers.append(composite)
+            for key in composite:
+                if key not in seen:
+                    seen.add(key)
+                    canonical.append(key)
+        finally:
+            wb.close()
+
+    out_wb = Workbook()
+    out_ws = out_wb.active
+    out_ws.append([k[0] for k in canonical])
+    out_ws.append([k[1] for k in canonical])
+
+    total_rows = 0
+    for path, composite in zip(paths, chunk_headers):
+        chunk_lookup = {key: i for i, key in enumerate(composite)}
+        idx_map = [chunk_lookup.get(key) for key in canonical]
+
+        wb = load_workbook(path, read_only=True)
+        try:
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            next(rows_iter)
+            next(rows_iter)
+            for row in rows_iter:
+                aligned = [
+                    row[i] if i is not None and i < len(row) else None
+                    for i in idx_map
+                ]
+                out_ws.append(aligned)
+                total_rows += 1
+        finally:
+            wb.close()
+
+    logger.warning(
+        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d unique cols)",
+        len(paths), output_path.name, total_rows, len(canonical),
+    )
+    out_wb.save(output_path)
+    return output_path
 
 
 def _chunk_date_range(

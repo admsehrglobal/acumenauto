@@ -41,6 +41,13 @@ class AppConfig(models.Model):
     """Singleton de config editable desde el dashboard. Para valores que
     cambian "live" (vs env vars que requieren redeploy)."""
 
+    # Toggle por reporte. R1 y R2 vienen activos (es lo que el cliente ya
+    # recibia); R3 chunked off-by-default — se activa solo cuando Paul lo
+    # confirma porque el volumen del email cambia.
+    report_1_enabled = models.BooleanField(default=True)
+    report_2_enabled = models.BooleanField(default=True)
+    report_3_enabled = models.BooleanField(default=False)
+
     vendor_authorization_accrual_chunks = models.PositiveSmallIntegerField(
         default=4,
         help_text=(

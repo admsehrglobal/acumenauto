@@ -11,8 +11,8 @@ from django.views.decorators.http import require_POST
 from django_celery_beat.models import PeriodicTask
 
 from app.email_utils import send_error_report
-from app.forms import RecipientForm, ScheduleForm
-from app.models import Recipient, Run
+from app.forms import AppConfigForm, RecipientForm, ScheduleForm
+from app.models import AppConfig, Recipient, Run
 from app.tasks import download_dci_reports
 
 PERIODIC_TASK_NAME = "download-dci-reports-daily"
@@ -67,6 +67,7 @@ def settings_view(request):
 
     recipient_form = RecipientForm()
     recipients = Recipient.objects.all()
+    app_config_form = AppConfigForm(instance=AppConfig.load())
 
     return render(
         request,
@@ -77,9 +78,24 @@ def settings_view(request):
             "task": task,
             "recipient_form": recipient_form,
             "recipients": recipients,
+            "app_config_form": app_config_form,
             "active_tab": "schedule",
         },
     )
+
+
+@login_required
+@require_POST
+def app_config_update(request):
+    config = AppConfig.load()
+    form = AppConfigForm(request.POST, instance=config)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "Report configuration updated.")
+    else:
+        first_error = next(iter(form.errors.values()))[0]
+        messages.error(request, first_error)
+    return redirect("/settings/#reports")
 
 
 @login_required

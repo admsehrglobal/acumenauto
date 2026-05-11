@@ -2,6 +2,7 @@
 
 HTMX se usa solo en run-now para no recargar la pagina entera.
 """
+from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib import messages
 from django.core.paginator import Paginator
@@ -79,6 +80,9 @@ def settings_view(request):
             "recipient_form": recipient_form,
             "recipients": recipients,
             "app_config_form": app_config_form,
+            "report_1_name": settings.DCI_REPORT_BUTTON_NAME,
+            "report_2_name": settings.DCI_REPORT_BUTTON_NAME_2,
+            "report_3_name": settings.DCI_REPORT_BUTTON_NAME_3,
             "active_tab": "schedule",
         },
     )

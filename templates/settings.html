@@ -122,29 +122,52 @@
   <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl">
     <h2 class="text-lg font-medium text-slate-900 mb-1">Reports</h2>
     <p class="text-sm text-slate-600 mb-4">
-      Configuration for the chunked Vendor Authorization Accrual Balances report.
-      Acumen caps each export at 150,000 rows, so the report is split into N
-      date-range chunks. Increase N if a single chunk starts hitting the cap.
+      Pick which DCI reports the scraper should download and email on each run.
+      Unchecked reports are skipped entirely.
     </p>
 
-    <form method="post" action="{% url 'app_config_update' %}" class="space-y-4">
+    <form method="post" action="{% url 'app_config_update' %}" class="space-y-5">
       {% csrf_token %}
-      <div>
-        <label for="id_vendor_authorization_accrual_chunks"
-               class="block text-sm font-medium text-slate-700 mb-1">
-          Chunks for Vendor Authorization Accrual Balances
-        </label>
-        {{ app_config_form.vendor_authorization_accrual_chunks }}
-        <p class="text-xs text-slate-500 mt-1">
-          {{ app_config_form.vendor_authorization_accrual_chunks.help_text }}
-          Range: 1-20.
-        </p>
-        {% if app_config_form.vendor_authorization_accrual_chunks.errors %}
-          <p class="text-xs text-red-600 mt-1">
-            {{ app_config_form.vendor_authorization_accrual_chunks.errors.0 }}
-          </p>
-        {% endif %}
-      </div>
+
+      <ul class="divide-y divide-slate-100 border border-slate-200 rounded">
+        <li class="flex items-center gap-3 px-3 py-3">
+          {{ app_config_form.report_1_enabled }}
+          <label for="{{ app_config_form.report_1_enabled.id_for_label }}"
+                 class="text-sm text-slate-800 font-mono break-all cursor-pointer flex-1">
+            {{ report_1_name }}
+          </label>
+        </li>
+        <li class="flex items-center gap-3 px-3 py-3">
+          {{ app_config_form.report_2_enabled }}
+          <label for="{{ app_config_form.report_2_enabled.id_for_label }}"
+                 class="text-sm text-slate-800 font-mono break-all cursor-pointer flex-1">
+            {{ report_2_name }}
+          </label>
+        </li>
+        <li class="px-3 py-3">
+          <div class="flex items-center gap-3">
+            {{ app_config_form.report_3_enabled }}
+            <label for="{{ app_config_form.report_3_enabled.id_for_label }}"
+                   class="text-sm text-slate-800 font-mono break-all cursor-pointer flex-1">
+              {{ report_3_name }}
+            </label>
+          </div>
+          <div class="mt-3 ml-7">
+            <label for="id_vendor_authorization_accrual_chunks"
+                   class="block text-xs text-slate-500 mb-1">
+              Chunks (date-range splits to dodge Acumen's 150k row cap per export)
+            </label>
+            <div class="max-w-[8rem]">
+              {{ app_config_form.vendor_authorization_accrual_chunks }}
+            </div>
+            {% if app_config_form.vendor_authorization_accrual_chunks.errors %}
+              <p class="text-xs text-red-600 mt-1">
+                {{ app_config_form.vendor_authorization_accrual_chunks.errors.0 }}
+              </p>
+            {% endif %}
+          </div>
+        </li>
+      </ul>
 
       <div class="pt-2">
         <button type="submit"

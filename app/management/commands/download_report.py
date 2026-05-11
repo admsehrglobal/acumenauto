@@ -33,16 +33,24 @@ class Command(BaseCommand):
         timestamp_label = nj_started.strftime("%Y-%m-%d_%Hh%M_NJ")
         subject_label = nj_started.strftime("%Y-%m-%d %H:%M NJ")
 
-        reports = [
-            (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME),
-            (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2),
-        ]
-        chunked_report = (
-            settings.DCI_REPORT_URL_3,
-            settings.DCI_REPORT_BUTTON_NAME_3,
-            settings.DCI_REPORT_3_START_DATE,
-            AppConfig.load().vendor_authorization_accrual_chunks,
-        )
+        config = AppConfig.load()
+        reports = []
+        if config.report_1_enabled:
+            reports.append(
+                (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME)
+            )
+        if config.report_2_enabled:
+            reports.append(
+                (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2)
+            )
+        chunked_report = None
+        if config.report_3_enabled:
+            chunked_report = (
+                settings.DCI_REPORT_URL_3,
+                settings.DCI_REPORT_BUTTON_NAME_3,
+                settings.DCI_REPORT_3_START_DATE,
+                config.vendor_authorization_accrual_chunks,
+            )
 
         try:
             items = asyncio.run(

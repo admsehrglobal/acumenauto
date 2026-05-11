@@ -52,11 +52,22 @@ class RecipientForm(forms.ModelForm):
         }
 
 
+_CHECKBOX_CLASS = "h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-400"
+
+
 class AppConfigForm(forms.ModelForm):
     class Meta:
         model = AppConfig
-        fields = ["vendor_authorization_accrual_chunks"]
+        fields = [
+            "report_1_enabled",
+            "report_2_enabled",
+            "report_3_enabled",
+            "vendor_authorization_accrual_chunks",
+        ]
         widgets = {
+            "report_1_enabled": forms.CheckboxInput(attrs={"class": _CHECKBOX_CLASS}),
+            "report_2_enabled": forms.CheckboxInput(attrs={"class": _CHECKBOX_CLASS}),
+            "report_3_enabled": forms.CheckboxInput(attrs={"class": _CHECKBOX_CLASS}),
             "vendor_authorization_accrual_chunks": forms.NumberInput(
                 attrs={"class": _INPUT_CLASS, "min": 1, "max": 20}
             ),

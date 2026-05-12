@@ -29,5 +29,4 @@ urlpatterns = [
     path("settings/recipients/add/", views.recipient_add, name="recipient_add"),
     path("settings/recipients/<int:pk>/delete/", views.recipient_delete, name="recipient_delete"),
     path("settings/recipients/<int:pk>/toggle/", views.recipient_toggle, name="recipient_toggle"),
-    path("settings/reports/", views.app_config_update, name="app_config_update"),
 ]

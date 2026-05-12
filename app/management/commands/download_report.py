@@ -25,6 +25,15 @@ class Command(BaseCommand):
             action="store_true",
             help="Descarga y mergea pero no manda email; deja los archivos en --output-dir.",
         )
+        parser.add_argument(
+            "--reports",
+            default="",
+            help=(
+                "Comma-separated report IDs to run (1,2,3). Empty = todos los "
+                "habilitados en AppConfig. La interseccion: si pasas '1,3' pero "
+                "R1 esta disabled en AppConfig, solo corre R3."
+            ),
+        )
 
     def handle(self, *args, **options):
         output_dir = Path(options["output_dir"])
@@ -39,17 +48,22 @@ class Command(BaseCommand):
         subject_label = nj_started.strftime("%Y-%m-%d %H:%M NJ")
 
         config = AppConfig.load()
+        if options["reports"]:
+            filter_ids = {int(s) for s in options["reports"].split(",") if s.strip()}
+        else:
+            filter_ids = {1, 2, 3}
+
         reports = []
-        if config.report_1_enabled:
+        if config.report_1_enabled and 1 in filter_ids:
             reports.append(
                 (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME)
             )
-        if config.report_2_enabled:
+        if config.report_2_enabled and 2 in filter_ids:
             reports.append(
                 (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2)
             )
         chunked_report = None
-        if config.report_3_enabled:
+        if config.report_3_enabled and 3 in filter_ids:
             chunked_report = (
                 settings.DCI_REPORT_URL_3,
                 settings.DCI_REPORT_BUTTON_NAME_3,
@@ -57,6 +71,20 @@ class Command(BaseCommand):
                 nj_started.date(),
                 config.vendor_authorization_accrual_chunks,
             )
+
+        if not reports and chunked_report is None:
+            run.status = Run.Status.SUCCESS
+            run.finished_at = timezone.now()
+            run.save()
+            self.stdout.write(
+                self.style.WARNING(
+                    f"No reports to run (filter={sorted(filter_ids)}, config: "
+                    f"R1={config.report_1_enabled} R2={config.report_2_enabled} "
+                    f"R3={config.report_3_enabled}). Run #{run.pk} marked success "
+                    "with no work."
+                )
+            )
+            return
 
         try:
             items = asyncio.run(

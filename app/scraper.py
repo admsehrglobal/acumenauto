@@ -339,9 +339,13 @@ def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
     if not paths:
         raise ValueError("No paths to merge")
 
+    # write_only=True: stream-escribe a disco en lugar de mantener todas las
+    # celdas en RAM. Para 218k filas la diferencia es ~600MB vs ~11MB peak,
+    # critico en el worker de Fly (2GB) donde Chromium aun corre en paralelo
+    # y la presion de memoria hace que out_wb.save() default tarde 4+ min.
     canonical_header: tuple | None = None
-    out_wb = Workbook()
-    out_ws = out_wb.active
+    out_wb = Workbook(write_only=True)
+    out_ws = out_wb.create_sheet()
     total_rows = 0
 
     for path in paths:

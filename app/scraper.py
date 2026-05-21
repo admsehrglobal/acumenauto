@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import re
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -40,15 +41,17 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_report: tuple[str, str, int] | None = None,
+    chunked_report: tuple[str, str, int, dt.date] | None = None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_report` es el reporte que excede el limite de filas por export y
-    se descarga en N chunks: (url, button_name, n_chunks). start_date y
-    end_date se leen dinamicamente del portal (full available range del
-    slicer der: capturar todos los scheduled accruals existentes).
+    se descarga en N chunks: (url, button_name, n_chunks, today).
+    El rango de fechas se determina asi: start_date = lo mas anterior que
+    permita el PBI (MIN del slicer Accrual Schedule Date, leido del aria-label);
+    end_date = `today` (hoy en NJ tz, lo pasa el caller), clamped al MAX del
+    slicer si today va mas alla.
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
 
@@ -83,7 +86,7 @@ async def download_reports(
                 results.append((path, button_name))
 
             if chunked_report is not None:
-                url, button_name, n_chunks = chunked_report
+                url, button_name, n_chunks, today = chunked_report
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 results.extend(
@@ -93,6 +96,7 @@ async def download_reports(
                         n_chunks,
                         output_dir,
                         timestamp_label,
+                        today,
                     )
                 )
             return results
@@ -211,13 +215,23 @@ async def _export_chunked_report(
     n_chunks: int,
     output_dir: Path,
     timestamp_label: str,
+    today: dt.date,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
 
-    start_date y end_date se leen del portal default (slicer der): la "Available
-    input range" expone los min/max de End Date entre todos los PAs existentes.
-    Asi capturamos el horizonte completo sin depender de configuracion estatica.
+    El tab tiene 2 date range slicers: izq filtra por PA Start Date, der
+    filtra por Accrual Schedule Date. Chunkeamos por el der → cada accrual
+    cae en un solo chunk. Identificamos el slicer der parseando el aria-label
+    `Available input range MIN to MAX` (pickeamos el par con MAX mas lejano
+    en el futuro — el Accrual Schedule Date extent siempre va mas alla del
+    PA Start Date extent porque incluye accruals futuros programados).
+    El selector `.last` no es estable: el DOM order de los slicers varia
+    entre runs segun timing de render de PBI (confirmado 2026-05-21 — en
+    runs sucesivos `.last` agarro tanto slicer A como slicer B).
+
+    start_date = MIN del slicer der (lo mas anterior que permite PBI).
+    end_date = `today` (hoy NJ), clamped al MAX del slicer si fuera necesario.
 
     Los N chunks se mergean en un unico xlsx al final. Si cualquier chunk
     falla, la excepcion propaga sin mergear (abort-on-fail: el cliente no
@@ -236,29 +250,24 @@ async def _export_chunked_report(
     # solo tiene totales). Switch al tab con detalle PA + schedule semanal.
     await iframe.get_by_role("tab", name="PA Details and Schedule by").click()
 
-    # El tab tiene 2 pares de date slicers: izq filtra PAs por su Start Date,
-    # der filtra PAs por su End Date (confirmado en el "Applied filters" footer
-    # del export). Chunkeamos por slicer der → cada PA cae en un solo chunk
-    # (su End Date esta en un unico rango). Slicer izq queda wide-open.
-    # .last selecciona el slicer der en DOM order.
-    start_input = iframe.get_by_role("textbox", name="Start date. Available input").last
-    end_input = iframe.get_by_role("textbox", name="End date. Available input").last
-    await end_input.wait_for()
-    # DIAG: dump todos los inputs con aria-label para confirmar layout del
-    # slicer (cuantos hay, en que orden, y que dice el "Available input range"
-    # completo). El range expone el MIN/MAX que PBI permite — distinto del
-    # input_value() que es la seleccion actual.
-    all_inputs = await iframe.locator("input[aria-label]").evaluate_all(
-        "els => els.map((e, i) => ({i: i, label: e.getAttribute('aria-label'), value: e.value}))"
+    # Esperar a que los date inputs del slicer esten en el DOM antes de leerlos.
+    await iframe.get_by_role(
+        "textbox", name="End date. Available input"
+    ).first.wait_for()
+
+    start_label, end_label, slicer_min, slicer_max, date_fmt = (
+        await _identify_accrual_slicer(iframe)
     )
-    logger.warning("[DIAG R3 slicer] inputs: %r", all_inputs)
-    default_start_str = await start_input.input_value()
-    default_end_str = await end_input.input_value()
-    start_date, date_fmt = _parse_filter_date(default_start_str)
-    end_date, _ = _parse_filter_date(default_end_str)
+    start_date = slicer_min
+    end_date = min(today, slicer_max)
     logger.warning(
-        "[REPORT chunked] Date range read from portal: %s to %s (fmt %s)",
-        start_date, end_date, date_fmt,
+        "[REPORT chunked] Slicer identified: start_label=%r end_label=%r "
+        "range=%s to %s (fmt %s)",
+        start_label, end_label, slicer_min, slicer_max, date_fmt,
+    )
+    logger.warning(
+        "[REPORT chunked] Effective range: %s to %s (today=%s, clamped to slicer max=%s)",
+        start_date, end_date, today, slicer_max,
     )
 
     chunks = _chunk_date_range(start_date, end_date, n_chunks)
@@ -272,7 +281,9 @@ async def _export_chunked_report(
         )
         logger.warning("[REPORT chunked] Exporting %s", chunk_label)
 
-        await _set_date_filter(iframe, chunk_start, chunk_end, date_fmt)
+        await _set_date_filter(
+            iframe, chunk_start, chunk_end, date_fmt, start_label, end_label
+        )
 
         # El tab nuevo tiene multiples visuals — scope al table visual via
         # aria-label ("Row" lo distingue de los charts).
@@ -460,7 +471,12 @@ def _parse_filter_date(s: str) -> tuple[dt.date, str]:
 
 
 async def _set_date_filter(
-    iframe, start_date: dt.date, end_date: dt.date, date_fmt: str
+    iframe,
+    start_date: dt.date,
+    end_date: dt.date,
+    date_fmt: str,
+    start_label: str,
+    end_label: str,
 ) -> None:
     """Escribe directo en los textbox del filtro Angular Material.
 
@@ -472,15 +488,13 @@ async def _set_date_filter(
 
     El slicer commitea por debounce automatico (no necesita Tab/Enter) pero
     necesita un sleep para que el commit alcance a procesarse antes del
-    proximo cambio o de exportar."""
-    # .last → slicer der (Accrual Schedule Date range). Ver nota en
-    # _export_chunked_report sobre por qué solo tocamos este par.
-    start_input = iframe.get_by_role(
-        "textbox", name="Start date. Available input"
-    ).last
-    end_input = iframe.get_by_role(
-        "textbox", name="End date. Available input"
-    ).last
+    proximo cambio o de exportar.
+
+    `start_label` y `end_label` son los aria-labels exactos del slicer der
+    (identificados via _identify_accrual_slicer). No usamos `.last` porque
+    el DOM order de los slicers no es estable entre runs."""
+    start_input = iframe.locator(f'input[aria-label="{start_label}"]')
+    end_input = iframe.locator(f'input[aria-label="{end_label}"]')
 
     await end_input.click()
     await end_input.fill(end_date.strftime(date_fmt))
@@ -493,6 +507,62 @@ async def _set_date_filter(
     # listo". Esperar un poco evita exportar mientras el visual aun esta
     # re-rendereando con los datos viejos.
     await asyncio.sleep(3)
+
+
+_LABEL_RANGE_RE = re.compile(r"Available input range (\S+) to (\S+)$")
+
+
+async def _identify_accrual_slicer(
+    iframe,
+) -> tuple[str, str, dt.date, dt.date, str]:
+    """Identifica el slicer 'Accrual Schedule Date' entre los dos date range
+    slicers del tab 'PA Details and Schedule by Client'.
+
+    Cada slicer expone su rango disponible en el aria-label de sus 2 textbox
+    ("Start date. Available input range MIN to MAX" / "End date..."). El
+    slicer Accrual Schedule Date es el que tiene MAX mas lejano en el futuro
+    (incluye accruals programados a futuro, mientras que el slicer PA Start
+    Date no va mas alla del PA mas reciente).
+
+    Devuelve (start_label, end_label, slicer_min, slicer_max, date_fmt) — los
+    labels son los aria-labels completos exactos, para usar como selector
+    estable (vs `.last` que dependia del DOM order volatil)."""
+    inputs = await iframe.locator("input[aria-label]").evaluate_all(
+        "els => els.map(e => ({label: e.getAttribute('aria-label')}))"
+    )
+    grouped: dict[tuple[str, str], dict[str, str]] = {}
+    for item in inputs:
+        label = item["label"] or ""
+        m = _LABEL_RANGE_RE.search(label)
+        if not m:
+            continue
+        if label.startswith("Start date."):
+            kind = "start"
+        elif label.startswith("End date."):
+            kind = "end"
+        else:
+            continue
+        grouped.setdefault((m.group(1), m.group(2)), {})[kind] = label
+
+    pairs = []
+    date_fmt = None
+    for (min_s, max_s), labels in grouped.items():
+        if "start" not in labels or "end" not in labels:
+            continue
+        min_d, fmt = _parse_filter_date(min_s)
+        max_d, _ = _parse_filter_date(max_s)
+        date_fmt = fmt
+        pairs.append((max_d, min_d, labels["start"], labels["end"]))
+
+    if not pairs:
+        raise ValueError(
+            f"No date-range slicer pairs found. Inputs were: {inputs!r}"
+        )
+
+    # Mas lejano en el futuro = Accrual Schedule Date (slicer der).
+    pairs.sort(key=lambda x: x[0], reverse=True)
+    max_d, min_d, start_label, end_label = pairs[0]
+    return start_label, end_label, min_d, max_d, date_fmt
 
 
 async def _dump_debug(context: BrowserContext, output_dir: Path) -> None:

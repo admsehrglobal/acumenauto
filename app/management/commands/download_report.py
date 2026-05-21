@@ -68,6 +68,7 @@ class Command(BaseCommand):
                 settings.DCI_REPORT_URL_3,
                 settings.DCI_REPORT_BUTTON_NAME_3,
                 config.vendor_authorization_accrual_chunks,
+                nj_started.date(),
             )
 
         if not reports and chunked_report is None:

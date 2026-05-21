@@ -64,8 +64,10 @@ CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
 CELERY_TIMEZONE = "UTC"
 CELERY_TASK_TRACK_STARTED = True
-# El scraper toma ~2 min; subimos el limite por las dudas.
-CELERY_TASK_TIME_LIMIT = 10 * 60
+# Run Now corre R1+R2+R3: R3 chunked (~9min) + R1+R2 (~1min) + merge + email
+# = ~12min. 25min cubre eso con margen suficiente sin dejar al worker hung
+# eternamente si algo se cuelga.
+CELERY_TASK_TIME_LIMIT = 25 * 60
 # Schedule vive en DB (django_celery_beat) para que Paul lo edite desde el dashboard.
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 

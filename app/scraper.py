@@ -250,25 +250,41 @@ async def _export_chunked_report(
     # solo tiene totales). Switch al tab con detalle PA + schedule semanal.
     await iframe.get_by_role("tab", name="PA Details and Schedule by").click()
 
-    # Esperar a que los date inputs del slicer esten en el DOM antes de leerlos.
-    await iframe.get_by_role(
-        "textbox", name="End date. Available input"
-    ).first.wait_for()
+    # Slicer A (PA Start Date) suele cargar primero; B (Accrual Schedule Date)
+    # carga unos segundos despues. Si leemos antes de que B este, identificamos
+    # mal y caemos en A. Esperar hasta tener los 4 inputs date (2 slicers x 2
+    # textboxes cada uno) garantiza que ambos esten antes de identificar.
+    date_inputs = iframe.locator(
+        "input[aria-label*='Available input range']"
+    )
+    deadline = asyncio.get_event_loop().time() + 30
+    while True:
+        count = await date_inputs.count()
+        if count >= 4:
+            break
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError(
+                f"Only {count} date inputs after 30s — slicer B nunca cargo"
+            )
+        await asyncio.sleep(0.5)
 
-    start_label, end_label, slicer_min, slicer_max, date_fmt = (
-        await _identify_accrual_slicer(iframe)
+    start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+        await _identify_accrual_slicer(date_inputs)
     )
     start_date = slicer_min
     end_date = min(today, slicer_max)
     logger.warning(
-        "[REPORT chunked] Slicer identified: start_label=%r end_label=%r "
+        "[REPORT chunked] Slicer identified: start_idx=%d end_idx=%d "
         "range=%s to %s (fmt %s)",
-        start_label, end_label, slicer_min, slicer_max, date_fmt,
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt,
     )
     logger.warning(
         "[REPORT chunked] Effective range: %s to %s (today=%s, clamped to slicer max=%s)",
         start_date, end_date, today, slicer_max,
     )
+
+    start_input = date_inputs.nth(start_idx)
+    end_input = date_inputs.nth(end_idx)
 
     chunks = _chunk_date_range(start_date, end_date, n_chunks)
     slug = "_".join(button_name.lower().split())
@@ -282,7 +298,7 @@ async def _export_chunked_report(
         logger.warning("[REPORT chunked] Exporting %s", chunk_label)
 
         await _set_date_filter(
-            iframe, chunk_start, chunk_end, date_fmt, start_label, end_label
+            start_input, end_input, chunk_start, chunk_end, date_fmt
         )
 
         # El tab nuevo tiene multiples visuals — scope al table visual via
@@ -471,12 +487,11 @@ def _parse_filter_date(s: str) -> tuple[dt.date, str]:
 
 
 async def _set_date_filter(
-    iframe,
+    start_input,
+    end_input,
     start_date: dt.date,
     end_date: dt.date,
     date_fmt: str,
-    start_label: str,
-    end_label: str,
 ) -> None:
     """Escribe directo en los textbox del filtro Angular Material.
 
@@ -490,12 +505,10 @@ async def _set_date_filter(
     necesita un sleep para que el commit alcance a procesarse antes del
     proximo cambio o de exportar.
 
-    `start_label` y `end_label` son los aria-labels exactos del slicer der
-    (identificados via _identify_accrual_slicer). No usamos `.last` porque
-    el DOM order de los slicers no es estable entre runs."""
-    start_input = iframe.locator(f'input[aria-label="{start_label}"]')
-    end_input = iframe.locator(f'input[aria-label="{end_label}"]')
-
+    `start_input` y `end_input` son locators ya posicionados (via .nth dentro
+    de los date inputs del iframe). El aria-label se actualiza al commitear
+    un filtro (la parte "range MIN to MAX" reproduce la seleccion actual), por
+    eso el caller no debe pasar selectores por aria-label exacto."""
     await end_input.click()
     await end_input.fill(end_date.strftime(date_fmt))
     await asyncio.sleep(2)
@@ -513,8 +526,8 @@ _LABEL_RANGE_RE = re.compile(r"Available input range (\S+) to (\S+)$")
 
 
 async def _identify_accrual_slicer(
-    iframe,
-) -> tuple[str, str, dt.date, dt.date, str]:
+    date_inputs,
+) -> tuple[int, int, dt.date, dt.date, str]:
     """Identifica el slicer 'Accrual Schedule Date' entre los dos date range
     slicers del tab 'PA Details and Schedule by Client'.
 
@@ -524,13 +537,15 @@ async def _identify_accrual_slicer(
     (incluye accruals programados a futuro, mientras que el slicer PA Start
     Date no va mas alla del PA mas reciente).
 
-    Devuelve (start_label, end_label, slicer_min, slicer_max, date_fmt) — los
-    labels son los aria-labels completos exactos, para usar como selector
-    estable (vs `.last` que dependia del DOM order volatil)."""
-    inputs = await iframe.locator("input[aria-label]").evaluate_all(
-        "els => els.map(e => ({label: e.getAttribute('aria-label')}))"
+    `date_inputs` es el locator `input[aria-label*="Available input range"]`
+    del iframe — todos los inputs date de los slicers. Devolvemos los INDICES
+    de los inputs de slicer B dentro de ese locator (no los aria-labels), para
+    que el caller pueda usar `date_inputs.nth(idx)` como selector estable —
+    el aria-label se mueve cuando aplicamos un filtro, las posiciones no."""
+    inputs = await date_inputs.evaluate_all(
+        "els => els.map((e, i) => ({i: i, label: e.getAttribute('aria-label')}))"
     )
-    grouped: dict[tuple[str, str], dict[str, str]] = {}
+    grouped: dict[tuple[str, str], dict[str, int]] = {}
     for item in inputs:
         label = item["label"] or ""
         m = _LABEL_RANGE_RE.search(label)
@@ -542,17 +557,17 @@ async def _identify_accrual_slicer(
             kind = "end"
         else:
             continue
-        grouped.setdefault((m.group(1), m.group(2)), {})[kind] = label
+        grouped.setdefault((m.group(1), m.group(2)), {})[kind] = item["i"]
 
     pairs = []
     date_fmt = None
-    for (min_s, max_s), labels in grouped.items():
-        if "start" not in labels or "end" not in labels:
+    for (min_s, max_s), idxs in grouped.items():
+        if "start" not in idxs or "end" not in idxs:
             continue
         min_d, fmt = _parse_filter_date(min_s)
         max_d, _ = _parse_filter_date(max_s)
         date_fmt = fmt
-        pairs.append((max_d, min_d, labels["start"], labels["end"]))
+        pairs.append((max_d, min_d, idxs["start"], idxs["end"]))
 
     if not pairs:
         raise ValueError(
@@ -561,8 +576,8 @@ async def _identify_accrual_slicer(
 
     # Mas lejano en el futuro = Accrual Schedule Date (slicer der).
     pairs.sort(key=lambda x: x[0], reverse=True)
-    max_d, min_d, start_label, end_label = pairs[0]
-    return start_label, end_label, min_d, max_d, date_fmt
+    max_d, min_d, start_idx, end_idx = pairs[0]
+    return start_idx, end_idx, min_d, max_d, date_fmt
 
 
 async def _dump_debug(context: BrowserContext, output_dir: Path) -> None:

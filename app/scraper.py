@@ -151,7 +151,11 @@ async def _export_excel(
     await page.get_by_role("button", name=report_button_name).click()
 
     iframe_element = page.locator('iframe[title="Embedded report"]')
-    await iframe_element.wait_for()
+    # 180s en lugar del default de 60s: Power BI a veces tarda > 60s en insertar
+    # el iframe en el DOM post-click (confirmado 2026-05-21 con DIAG: iframe=[]
+    # a los 23s post-click, recien aparecio entre 60-90s). Default mataba el
+    # cron daily intermitentemente.
+    await iframe_element.wait_for(timeout=180000)
     # Hover sobre el iframe fuerza que Power BI muestre el menú "..." del visual.
     # Sin esto, en headless el boton visual-more-options-btn puede no renderizarse.
     await iframe_element.hover()
@@ -197,7 +201,9 @@ async def _export_chunked_report(
     await page.get_by_role("button", name=button_name).click()
 
     iframe_element = page.locator('iframe[title="Embedded report"]')
-    await iframe_element.wait_for()
+    # Mismo motivo que en _export_excel: 180s para tolerar inserciones lentas
+    # del iframe por parte de Power BI.
+    await iframe_element.wait_for(timeout=180000)
     await iframe_element.hover()
     iframe = iframe_element.content_frame
 

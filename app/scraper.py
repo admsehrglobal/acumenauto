@@ -150,8 +150,33 @@ async def _export_excel(
 ) -> Path:
     await page.get_by_role("button", name=report_button_name).click()
 
+    # DIAG: capturar estado post-click para saber si la pagina hung, o si el
+    # iframe esta presente con otro title. Borrar despues de diagnosticar.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+        networkidle = "ok"
+    except PlaywrightTimeoutError:
+        networkidle = "timeout-10s"
+    all_iframe_titles = await page.locator("iframe").evaluate_all(
+        "els => els.map(e => e.getAttribute('title'))"
+    )
+    logger.warning(
+        "[DIAG export_excel] post-click button=%r url=%s networkidle=%s iframes=%r",
+        report_button_name, page.url, networkidle, all_iframe_titles,
+    )
+
     iframe_element = page.locator('iframe[title="Embedded report"]')
-    await iframe_element.wait_for()
+    try:
+        await iframe_element.wait_for()
+    except PlaywrightTimeoutError:
+        final_titles = await page.locator("iframe").evaluate_all(
+            "els => els.map(e => e.getAttribute('title'))"
+        )
+        logger.error(
+            "[DIAG export_excel] wait_for FAILED. final url=%s iframes=%r",
+            page.url, final_titles,
+        )
+        raise
     # Hover sobre el iframe fuerza que Power BI muestre el menú "..." del visual.
     # Sin esto, en headless el boton visual-more-options-btn puede no renderizarse.
     await iframe_element.hover()

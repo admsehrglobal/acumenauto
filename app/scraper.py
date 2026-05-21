@@ -238,6 +238,14 @@ async def _export_chunked_report(
     start_input = iframe.get_by_role("textbox", name="Start date. Available input").last
     end_input = iframe.get_by_role("textbox", name="End date. Available input").last
     await end_input.wait_for()
+    # DIAG: dump todos los inputs con aria-label para confirmar layout del
+    # slicer (cuantos hay, en que orden, y que dice el "Available input range"
+    # completo). El range expone el MIN/MAX que PBI permite — distinto del
+    # input_value() que es la seleccion actual.
+    all_inputs = await iframe.locator("input[aria-label]").evaluate_all(
+        "els => els.map((e, i) => ({i: i, label: e.getAttribute('aria-label'), value: e.value}))"
+    )
+    logger.warning("[DIAG R3 slicer] inputs: %r", all_inputs)
     default_start_str = await start_input.input_value()
     default_end_str = await end_input.input_value()
     start_date, date_fmt = _parse_filter_date(default_start_str)

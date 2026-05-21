@@ -40,13 +40,15 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_report: tuple[str, str, dt.date, dt.date, int] | None = None,
+    chunked_report: tuple[str, str, int] | None = None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_report` es el reporte que excede el limite de filas por export y
-    se descarga en N chunks: (url, button_name, start_date, end_date, n_chunks).
+    se descarga en N chunks: (url, button_name, n_chunks). start_date y
+    end_date se leen dinamicamente del portal (full available range del
+    slicer der: capturar todos los scheduled accruals existentes).
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
 
@@ -81,15 +83,13 @@ async def download_reports(
                 results.append((path, button_name))
 
             if chunked_report is not None:
-                url, button_name, start_date, end_date, n_chunks = chunked_report
+                url, button_name, n_chunks = chunked_report
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 results.extend(
                     await _export_chunked_report(
                         report_page,
                         button_name,
-                        start_date,
-                        end_date,
                         n_chunks,
                         output_dir,
                         timestamp_label,
@@ -179,8 +179,6 @@ async def _export_excel(
 async def _export_chunked_report(
     page: Page,
     button_name: str,
-    start_date: dt.date,
-    end_date: dt.date,
     n_chunks: int,
     output_dir: Path,
     timestamp_label: str,
@@ -188,10 +186,9 @@ async def _export_chunked_report(
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
 
-    `end_date` viene del caller (tipicamente hoy en NJ tz). Lee el default del
-    portal solo para detectar el formato de fecha (US/EU); el valor del default
-    se ignora (es 2-3 años en el futuro por authorizations programadas y
-    produciria columnas vacias en el export).
+    start_date y end_date se leen del portal default (slicer der): la "Available
+    input range" expone los min/max de End Date entre todos los PAs existentes.
+    Asi capturamos el horizonte completo sin depender de configuracion estatica.
 
     Los N chunks se mergean en un unico xlsx al final. Si cualquier chunk
     falla, la excepcion propaga sin mergear (abort-on-fail: el cliente no
@@ -204,13 +201,25 @@ async def _export_chunked_report(
     await iframe_element.hover()
     iframe = iframe_element.content_frame
 
-    end_input = iframe.get_by_role("textbox", name="End date. Available input")
+    # El reporte abre por default en el tab 'Estimated Accrual Balances' (que
+    # solo tiene totales). Switch al tab con detalle PA + schedule semanal.
+    await iframe.get_by_role("tab", name="PA Details and Schedule by").click()
+
+    # El tab tiene 2 pares de date slicers: izq filtra PAs por su Start Date,
+    # der filtra PAs por su End Date (confirmado en el "Applied filters" footer
+    # del export). Chunkeamos por slicer der → cada PA cae en un solo chunk
+    # (su End Date esta en un unico rango). Slicer izq queda wide-open.
+    # .last selecciona el slicer der en DOM order.
+    start_input = iframe.get_by_role("textbox", name="Start date. Available input").last
+    end_input = iframe.get_by_role("textbox", name="End date. Available input").last
     await end_input.wait_for()
+    default_start_str = await start_input.input_value()
     default_end_str = await end_input.input_value()
-    _, date_fmt = _parse_filter_date(default_end_str)
+    start_date, date_fmt = _parse_filter_date(default_start_str)
+    end_date, _ = _parse_filter_date(default_end_str)
     logger.warning(
-        "[REPORT chunked] End date forced to %s (portal default was %r, fmt %s)",
-        end_date, default_end_str, date_fmt,
+        "[REPORT chunked] Date range read from portal: %s to %s (fmt %s)",
+        start_date, end_date, date_fmt,
     )
 
     chunks = _chunk_date_range(start_date, end_date, n_chunks)
@@ -226,13 +235,35 @@ async def _export_chunked_report(
 
         await _set_date_filter(iframe, chunk_start, chunk_end, date_fmt)
 
-        # Re-hover por si el mouse se movio durante el set del filtro;
-        # el menu "..." de Power BI requiere hover sobre el iframe.
-        await iframe_element.hover()
-        more_btn = iframe.get_by_test_id("visual-more-options-btn")
-        await more_btn.wait_for(state="attached")
-        await more_btn.click(force=True)
-        await iframe.get_by_test_id("pbimenu-item.Export data").click(force=True)
+        # El tab nuevo tiene multiples visuals — scope al table visual via
+        # aria-label ("Row" lo distingue de los charts).
+        table_visual = iframe.get_by_role("group").filter(
+            has_text="Scroll left Scroll right Row"
+        )
+        more_btn = table_visual.get_by_test_id("visual-more-options-btn")
+        export_item = iframe.get_by_test_id("pbimenu-item.Export data")
+
+        # En iter >= 2 a veces el click sobre "..." no abre el menu (el visual
+        # esta busy con el re-render del filtro nuevo). Retry con Escape + hover
+        # entre intentos para limpiar el estado.
+        for attempt in range(3):
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+            await table_visual.hover()
+            await more_btn.wait_for(state="visible")
+            await more_btn.click(force=True)
+            try:
+                await export_item.wait_for(state="visible", timeout=5000)
+                break
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    "[REPORT chunked] Menu didn't open on attempt %d/3, retrying",
+                    attempt + 1,
+                )
+                if attempt == 2:
+                    raise
+
+        await export_item.click(force=True)
         await iframe.get_by_text("Data with current layout").click(force=True)
 
         async with page.expect_download() as download_info:
@@ -294,76 +325,59 @@ def _validate_chunk_xlsx(path: Path) -> int:
 
 
 def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
-    """Concat vertical de N xlsx con union de columnas por header.
+    """Concat vertical de N xlsx con single-row header.
 
-    El reporte Power BI es una matriz con fechas pivoteadas como columnas:
-    header de 2 filas (row 0 = grupo "Week Starting" + fechas, row 1 = column
-    names), cada chunk tiene un set distinto de columnas de fecha. La
-    identidad de cada columna es la tupla (row0_value, row1_value).
+    El tab 'PA Details and Schedule by Client' devuelve tabla plana (header
+    de 1 fila, columnas fijas). Como chunkeamos por Accrual Schedule Date,
+    cada accrual aparece en exactamente un chunk (sin overlap). Concat vertical
+    directo; las rows se preservan tal cual.
 
-    Las columnas que solo aparecen en algunos chunks se preservan; en los
-    chunks donde no estan, las celdas quedan vacias. Las data rows se
-    concatenan tal cual (sin dedup por PA — el downstream agrupa si quiere).
+    Validamos que todos los chunks tengan el mismo header (Power BI siempre
+    devuelve las mismas columnas para el mismo visual, independiente del
+    filtro de fechas).
     """
     if not paths:
         raise ValueError("No paths to merge")
 
-    canonical: list[tuple] = []
-    seen: set[tuple] = set()
-    chunk_headers: list[list[tuple]] = []
+    canonical_header: tuple | None = None
+    out_wb = Workbook()
+    out_ws = out_wb.active
+    total_rows = 0
+
     for path in paths:
         wb = load_workbook(path, read_only=True)
         try:
             ws = wb.active
             rows_iter = ws.iter_rows(values_only=True)
             try:
-                row0 = next(rows_iter)
-                row1 = next(rows_iter)
+                header = next(rows_iter)
             except StopIteration:
-                raise ValueError(f"{path.name}: header de 2 filas no presente")
-            if len(row0) != len(row1):
+                raise ValueError(f"{path.name}: archivo vacio")
+            if canonical_header is None:
+                canonical_header = header
+                out_ws.append(list(header))
+            elif header != canonical_header:
                 raise ValueError(
-                    f"{path.name}: top header ({len(row0)} cells) y "
-                    f"bottom header ({len(row1)}) no matchean"
+                    f"{path.name}: header no matchea con el primer chunk "
+                    f"({header!r} vs {canonical_header!r})"
                 )
-            composite = list(zip(row0, row1))
-            chunk_headers.append(composite)
-            for key in composite:
-                if key not in seen:
-                    seen.add(key)
-                    canonical.append(key)
-        finally:
-            wb.close()
-
-    out_wb = Workbook()
-    out_ws = out_wb.active
-    out_ws.append([k[0] for k in canonical])
-    out_ws.append([k[1] for k in canonical])
-
-    total_rows = 0
-    for path, composite in zip(paths, chunk_headers):
-        chunk_lookup = {key: i for i, key in enumerate(composite)}
-        idx_map = [chunk_lookup.get(key) for key in canonical]
-
-        wb = load_workbook(path, read_only=True)
-        try:
-            ws = wb.active
-            rows_iter = ws.iter_rows(values_only=True)
-            next(rows_iter)
-            next(rows_iter)
             for row in rows_iter:
-                aligned = [
-                    row[i] if i is not None and i < len(row) else None
-                    for i in idx_map
-                ]
-                out_ws.append(aligned)
+                # Power BI inyecta una fila al final de cada export con el
+                # filtro aplicado (ej: "Applied filters: EndDate is on or
+                # after X and is before Y"). La salteamos para que el archivo
+                # final tenga solo data.
+                first = row[0] if row else None
+                if isinstance(first, str) and first.startswith("Applied filters:"):
+                    continue
+                out_ws.append(list(row))
                 total_rows += 1
         finally:
             wb.close()
 
     logger.warning(
-        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d unique cols)",
-        len(paths), output_path.name, total_rows, len(canonical),
+        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols)",
+        len(paths), output_path.name, total_rows,
+        len(canonical_header) if canonical_header else 0,
     )
     out_wb.save(output_path)
     return output_path
@@ -416,10 +430,14 @@ async def _set_date_filter(
     El slicer commitea por debounce automatico (no necesita Tab/Enter) pero
     necesita un sleep para que el commit alcance a procesarse antes del
     proximo cambio o de exportar."""
+    # .last → slicer der (Accrual Schedule Date range). Ver nota en
+    # _export_chunked_report sobre por qué solo tocamos este par.
     start_input = iframe.get_by_role(
         "textbox", name="Start date. Available input"
-    )
-    end_input = iframe.get_by_role("textbox", name="End date. Available input")
+    ).last
+    end_input = iframe.get_by_role(
+        "textbox", name="End date. Available input"
+    ).last
 
     await end_input.click()
     await end_input.fill(end_date.strftime(date_fmt))

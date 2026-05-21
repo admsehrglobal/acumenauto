@@ -10,7 +10,6 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-import datetime as dt
 import os
 from pathlib import Path
 
@@ -47,13 +46,10 @@ DCI_REPORT_URL_2 = os.environ["DCI_REPORT_URL_2"]
 DCI_REPORT_BUTTON_NAME_2 = os.environ["DCI_REPORT_BUTTON_NAME_2"]
 # Reporte 3 (Vendor Authorization Accrual Balances) excede el limite de 150k
 # filas/export del portal, asi que se baja partido en N chunks por rango de
-# fechas. Start date es fija (lo que Acumen tiene como historico minimo); end
-# date la lee el scraper del filtro al cargar el reporte (se mueve sola).
+# fechas. Start/end date las lee el scraper del filtro al cargar el reporte
+# (full available range del slicer der).
 DCI_REPORT_URL_3 = os.environ["DCI_REPORT_URL_3"]
 DCI_REPORT_BUTTON_NAME_3 = os.environ["DCI_REPORT_BUTTON_NAME_3"]
-DCI_REPORT_3_START_DATE = dt.date.fromisoformat(
-    os.environ.get("DCI_REPORT_3_START_DATE", "2025-05-30")
-)
 # DCI_REPORT_3_CHUNKS movido a AppConfig (DB-backed) para que Paul lo edite
 # desde el dashboard sin redeploy.
 

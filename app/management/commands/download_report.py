@@ -67,8 +67,6 @@ class Command(BaseCommand):
             chunked_report = (
                 settings.DCI_REPORT_URL_3,
                 settings.DCI_REPORT_BUTTON_NAME_3,
-                settings.DCI_REPORT_3_START_DATE,
-                nj_started.date(),
                 config.vendor_authorization_accrual_chunks,
             )
 

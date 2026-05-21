@@ -70,10 +70,7 @@ def settings_view(request):
     daily_schedule_form = ScheduleForm(initial={"hours": daily_crontab.hour})
     weekly_config_form = WeeklyReportConfigForm(instance=config)
     weekly_schedule_form = WeeklyScheduleForm(
-        initial={
-            "weekly_day_of_week": str(weekly_crontab.day_of_week),
-            "weekly_hours": weekly_crontab.hour,
-        }
+        initial={"weekly_hours": weekly_crontab.hour}
     )
 
     if request.method == "POST":
@@ -85,12 +82,10 @@ def settings_view(request):
                 weekly_config_form.save()
                 weekly_crontab.hour = weekly_schedule_form.cleaned_data["weekly_hours"]
                 weekly_crontab.minute = "0"
-                weekly_crontab.day_of_week = weekly_schedule_form.cleaned_data[
-                    "weekly_day_of_week"
-                ]
+                weekly_crontab.day_of_week = "*"
                 weekly_crontab.save()
                 _touch_periodic_task(weekly_task)
-                messages.success(request, "Weekly report configuration updated.")
+                messages.success(request, "Long report configuration updated.")
                 return redirect("settings")
         else:
             daily_config_form = DailyReportsConfigForm(request.POST, instance=config)
@@ -117,7 +112,6 @@ def settings_view(request):
             "weekly_schedule_form": weekly_schedule_form,
             "current_hours": daily_crontab.hour,
             "weekly_current_hours": weekly_crontab.hour,
-            "weekly_current_dow": str(weekly_crontab.day_of_week),
             "recipient_form": recipient_form,
             "recipients": recipients,
             "report_1_name": settings.DCI_REPORT_BUTTON_NAME,

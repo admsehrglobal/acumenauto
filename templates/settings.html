@@ -85,9 +85,9 @@
   </div>
 
   <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-2xl">
-    <h2 class="text-lg font-medium text-slate-900 mb-1">Weekly report</h2>
+    <h2 class="text-lg font-medium text-slate-900 mb-1">Long report</h2>
     <p class="text-sm text-slate-600 mb-4">
-      The chunked accrual report runs on its own weekly schedule.
+      The chunked accrual report runs on its own daily schedule (separate from the short reports above).
     </p>
 
     <form method="post" class="grid gap-6 md:grid-cols-2">
@@ -123,11 +123,6 @@
       </div>
 
       <div class="space-y-3">
-        <div>
-          <label for="id_weekly_day_of_week" class="block text-sm font-medium text-slate-700 mb-1">Day of week</label>
-          {{ weekly_schedule_form.weekly_day_of_week }}
-        </div>
-
         <div>
           <label class="block text-sm font-medium text-slate-700 mb-1">Scheduled hours</label>
           <div id="weekly-hour-chips"
@@ -349,12 +344,6 @@
       addBtnId: "weekly-add-hour",
       initial: "{{ weekly_current_hours }}",
     });
-
-    // Pre-seleccionar el day_of_week actual del weekly cron.
-    const weeklyDowSelect = document.getElementById("id_weekly_day_of_week");
-    if (weeklyDowSelect) {
-      weeklyDowSelect.value = "{{ weekly_current_dow }}";
-    }
   })();
 </script>
 {% endblock %}

@@ -45,24 +45,7 @@ class ScheduleForm(forms.Form):
         return _validate_hours_csv(self.cleaned_data["hours"])
 
 
-# CrontabSchedule.day_of_week: 0=Sunday, 1=Monday, ..., 6=Saturday.
-WEEKDAY_CHOICES = [
-    ("1", "Monday"),
-    ("2", "Tuesday"),
-    ("3", "Wednesday"),
-    ("4", "Thursday"),
-    ("5", "Friday"),
-    ("6", "Saturday"),
-    ("0", "Sunday"),
-]
-
-
 class WeeklyScheduleForm(forms.Form):
-    weekly_day_of_week = forms.ChoiceField(
-        label="Day of week",
-        choices=WEEKDAY_CHOICES,
-        widget=forms.Select(attrs={"class": _INPUT_CLASS}),
-    )
     weekly_hours = forms.CharField(
         label="Hours (UTC)",
         max_length=200,

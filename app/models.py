@@ -48,11 +48,12 @@ class AppConfig(models.Model):
     report_2_enabled = models.BooleanField(default=True)
     report_3_enabled = models.BooleanField(default=False)
 
-    vendor_authorization_accrual_chunks = models.PositiveSmallIntegerField(
+    date_range_chunks = models.PositiveSmallIntegerField(
         default=4,
         help_text=(
-            "Number of date-range chunks for the Vendor Authorization Accrual "
-            "Balances report (150k row limit workaround)."
+            "Number of date-range chunks for the chunked reports (Vendor "
+            "Payment Activity and Vendor Authorization Accrual Balances). "
+            "Workaround for Acumen's 150k row export cap."
         ),
     )
 

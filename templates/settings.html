@@ -106,16 +106,17 @@
             </label>
           </div>
           <div class="ml-7">
-            <label for="id_vendor_authorization_accrual_chunks"
+            <label for="id_date_range_chunks"
                    class="block text-xs text-slate-500 mb-1">
-              Chunks (date-range splits to dodge Acumen's 150k row cap)
+              Chunks (date-range splits to dodge Acumen's 150k row cap; applies
+              to Vendor Payment Activity and Accrual Balances)
             </label>
             <div class="max-w-[8rem]">
-              {{ weekly_config_form.vendor_authorization_accrual_chunks }}
+              {{ weekly_config_form.date_range_chunks }}
             </div>
-            {% if weekly_config_form.vendor_authorization_accrual_chunks.errors %}
+            {% if weekly_config_form.date_range_chunks.errors %}
               <p class="text-xs text-red-600 mt-1">
-                {{ weekly_config_form.vendor_authorization_accrual_chunks.errors.0 }}
+                {{ weekly_config_form.date_range_chunks.errors.0 }}
               </p>
             {% endif %}
           </div>

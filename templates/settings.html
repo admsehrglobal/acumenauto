@@ -22,7 +22,7 @@
   <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-2xl">
     <h2 class="text-lg font-medium text-slate-900 mb-1">Daily reports</h2>
     <p class="text-sm text-slate-600 mb-4">
-      The short reports — enabled below — run on this shared daily schedule (UTC; NJ time shown alongside).
+      These reports run on this shared daily schedule (UTC; NJ time shown alongside).
     </p>
 
     <form method="post" class="grid gap-6 md:grid-cols-2">
@@ -36,8 +36,12 @@
           <li class="flex items-center gap-3 px-3 py-3">
             {{ daily_config_form.report_1_enabled }}
             <label for="{{ daily_config_form.report_1_enabled.id_for_label }}"
-                   class="text-sm text-slate-800 font-mono break-all cursor-pointer flex-1">
-              {{ report_1_name }}
+                   class="flex-1 cursor-pointer">
+              <span class="text-sm text-slate-800 font-mono break-all">{{ report_1_name }}</span>
+              <span class="ml-1 inline-block px-1.5 py-0.5 text-[10px] font-sans font-medium rounded bg-amber-100 text-amber-800 align-middle">Chunked</span>
+              <span class="block text-xs text-slate-500 mt-0.5">
+                Split into date-range pieces (count set in the Accrual report card below) to stay under Acumen's 150k row cap.
+              </span>
             </label>
           </li>
           <li class="flex items-center gap-3 px-3 py-3">
@@ -85,9 +89,9 @@
   </div>
 
   <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-2xl">
-    <h2 class="text-lg font-medium text-slate-900 mb-1">Long report</h2>
+    <h2 class="text-lg font-medium text-slate-900 mb-1">Accrual report</h2>
     <p class="text-sm text-slate-600 mb-4">
-      The chunked accrual report runs on its own daily schedule (separate from the short reports above).
+      The Vendor Authorization Accrual Balances report is chunked and runs on its own daily schedule, separate from the daily reports above.
     </p>
 
     <form method="post" class="grid gap-6 md:grid-cols-2">
@@ -101,15 +105,17 @@
           <div class="flex items-center gap-3">
             {{ weekly_config_form.report_3_enabled }}
             <label for="{{ weekly_config_form.report_3_enabled.id_for_label }}"
-                   class="text-sm text-slate-800 font-mono break-all cursor-pointer flex-1">
-              {{ report_3_name }}
+                   class="cursor-pointer flex-1">
+              <span class="text-sm text-slate-800 font-mono break-all">{{ report_3_name }}</span>
+              <span class="ml-1 inline-block px-1.5 py-0.5 text-[10px] font-sans font-medium rounded bg-amber-100 text-amber-800 align-middle">Chunked</span>
             </label>
           </div>
           <div class="ml-7">
             <label for="id_date_range_chunks"
                    class="block text-xs text-slate-500 mb-1">
-              Chunks (date-range splits to dodge Acumen's 150k row cap; applies
-              to Vendor Payment Activity and Accrual Balances)
+              Number of date-range splits — applies to <strong>both</strong> chunked
+              reports (Vendor Payment Activity + Accrual Balances). Dodges Acumen's
+              150k row cap.
             </label>
             <div class="max-w-[8rem]">
               {{ weekly_config_form.date_range_chunks }}

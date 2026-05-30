@@ -85,16 +85,16 @@ class DailyReportsConfigForm(forms.ModelForm):
 class WeeklyReportConfigForm(forms.ModelForm):
     class Meta:
         model = AppConfig
-        fields = ["report_3_enabled", "vendor_authorization_accrual_chunks"]
+        fields = ["report_3_enabled", "date_range_chunks"]
         widgets = {
             "report_3_enabled": forms.CheckboxInput(attrs={"class": _CHECKBOX_CLASS}),
-            "vendor_authorization_accrual_chunks": forms.NumberInput(
+            "date_range_chunks": forms.NumberInput(
                 attrs={"class": _INPUT_CLASS, "min": 1, "max": 20}
             ),
         }
 
-    def clean_vendor_authorization_accrual_chunks(self) -> int:
-        n = self.cleaned_data["vendor_authorization_accrual_chunks"]
+    def clean_date_range_chunks(self) -> int:
+        n = self.cleaned_data["date_range_chunks"]
         if not 1 <= n <= 20:
             raise forms.ValidationError("Must be between 1 and 20.")
         return n

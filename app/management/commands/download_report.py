@@ -54,24 +54,39 @@ class Command(BaseCommand):
             filter_ids = {1, 2, 3}
 
         reports = []
+        chunked_reports = []
+        # R1 (Vendor Payment Activity) se chunkea por date of service: un solo
+        # date range slicer, sin tabs.
         if config.report_1_enabled and 1 in filter_ids:
-            reports.append(
-                (settings.DCI_REPORT_URL, settings.DCI_REPORT_BUTTON_NAME)
+            chunked_reports.append(
+                (
+                    settings.DCI_REPORT_URL,
+                    settings.DCI_REPORT_BUTTON_NAME,
+                    config.date_range_chunks,
+                    nj_started.date(),
+                    None,  # tab_name: R1 no tiene tabs
+                    True,  # single_slicer: un solo date slicer
+                )
             )
+        # R2 (Vendor Authorization report) sigue siendo export simple.
         if config.report_2_enabled and 2 in filter_ids:
             reports.append(
                 (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2)
             )
-        chunked_report = None
+        # R3 (Vendor Auth Accrual): tab con detalle PA + 2 date slicers.
         if config.report_3_enabled and 3 in filter_ids:
-            chunked_report = (
-                settings.DCI_REPORT_URL_3,
-                settings.DCI_REPORT_BUTTON_NAME_3,
-                config.vendor_authorization_accrual_chunks,
-                nj_started.date(),
+            chunked_reports.append(
+                (
+                    settings.DCI_REPORT_URL_3,
+                    settings.DCI_REPORT_BUTTON_NAME_3,
+                    config.date_range_chunks,
+                    nj_started.date(),
+                    "PA Details and Schedule by",  # tab_name
+                    False,  # single_slicer: 2 slicers, identificar el correcto
+                )
             )
 
-        if not reports and chunked_report is None:
+        if not reports and not chunked_reports:
             run.status = Run.Status.SUCCESS
             run.finished_at = timezone.now()
             run.save()
@@ -93,7 +108,7 @@ class Command(BaseCommand):
                     reports=reports,
                     output_dir=output_dir,
                     timestamp_label=timestamp_label,
-                    chunked_report=chunked_report,
+                    chunked_reports=chunked_reports,
                 )
             )
         except Exception as exc:

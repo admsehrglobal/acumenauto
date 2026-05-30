@@ -41,17 +41,21 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_report: tuple[str, str, int, dt.date] | None = None,
+    chunked_reports: list[tuple[str, str, int, dt.date, str | None, bool]] = (),
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
-    `chunked_report` es el reporte que excede el limite de filas por export y
-    se descarga en N chunks: (url, button_name, n_chunks, today).
+    `chunked_reports` son los reportes que se descargan en N chunks por rango
+    de fechas: (url, button_name, n_chunks, today, tab_name, single_slicer).
+    `tab_name` es el tab a abrir antes de chunkear (None si el reporte no tiene
+    tabs, ej. R1 Vendor Payment Activity). `single_slicer` es True cuando el
+    reporte tiene un solo date range slicer (R1); False cuando tiene dos y hay
+    que identificar el correcto (R3, ver `_identify_accrual_slicer`).
     El rango de fechas se determina asi: start_date = lo mas anterior que
-    permita el PBI (MIN del slicer Accrual Schedule Date, leido del aria-label);
-    end_date = `today` (hoy en NJ tz, lo pasa el caller), clamped al MAX del
-    slicer si today va mas alla.
+    permita el PBI (MIN del slicer, leido del aria-label); end_date = `today`
+    (hoy en NJ tz, lo pasa el caller), clamped al MAX del slicer si today va
+    mas alla.
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
 
@@ -85,8 +89,8 @@ async def download_reports(
                 )
                 results.append((path, button_name))
 
-            if chunked_report is not None:
-                url, button_name, n_chunks, today = chunked_report
+            for spec in chunked_reports:
+                url, button_name, n_chunks, today, tab_name, single_slicer = spec
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 results.extend(
@@ -97,6 +101,8 @@ async def download_reports(
                         output_dir,
                         timestamp_label,
                         today,
+                        tab_name=tab_name,
+                        single_slicer=single_slicer,
                     )
                 )
             return results
@@ -191,21 +197,28 @@ async def _export_chunked_report(
     output_dir: Path,
     timestamp_label: str,
     today: dt.date,
+    *,
+    tab_name: str | None = None,
+    single_slicer: bool = False,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
 
-    El tab tiene 2 date range slicers: izq filtra por PA Start Date, der
-    filtra por Accrual Schedule Date. Chunkeamos por el der → cada accrual
-    cae en un solo chunk. Identificamos el slicer der parseando el aria-label
-    `Available input range MIN to MAX` (pickeamos el par con MAX mas lejano
-    en el futuro — el Accrual Schedule Date extent siempre va mas alla del
-    PA Start Date extent porque incluye accruals futuros programados).
-    El selector `.last` no es estable: el DOM order de los slicers varia
-    entre runs segun timing de render de PBI (confirmado 2026-05-21 — en
-    runs sucesivos `.last` agarro tanto slicer A como slicer B).
+    Sirve a dos reportes con estructura distinta:
+    - R1 (Vendor Payment Activity): `tab_name=None`, `single_slicer=True`. Un
+      solo date range slicer (date of service); no hay tabs.
+    - R3 (Vendor Auth Accrual): `tab_name='PA Details and Schedule by'`,
+      `single_slicer=False`. El tab tiene 2 date range slicers: izq filtra por
+      PA Start Date, der por Accrual Schedule Date. Chunkeamos por el der →
+      cada accrual cae en un solo chunk. Lo identificamos parseando el
+      aria-label `Available input range MIN to MAX` (par con MAX mas lejano en
+      el futuro — el Accrual Schedule Date extent siempre va mas alla del PA
+      Start Date extent porque incluye accruals futuros programados). El
+      selector `.last` no es estable: el DOM order de los slicers varia entre
+      runs segun timing de render de PBI (confirmado 2026-05-21 — en runs
+      sucesivos `.last` agarro tanto slicer A como slicer B).
 
-    start_date = MIN del slicer der (lo mas anterior que permite PBI).
+    start_date = MIN del slicer (lo mas anterior que permite PBI).
     end_date = `today` (hoy NJ), clamped al MAX del slicer si fuera necesario.
 
     Los N chunks se mergean en un unico xlsx al final. Si cualquier chunk
@@ -221,31 +234,39 @@ async def _export_chunked_report(
     await iframe_element.hover()
     iframe = iframe_element.content_frame
 
-    # El reporte abre por default en el tab 'Estimated Accrual Balances' (que
-    # solo tiene totales). Switch al tab con detalle PA + schedule semanal.
-    await iframe.get_by_role("tab", name="PA Details and Schedule by").click()
+    # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
+    # totales). Switch al tab con detalle PA + schedule semanal. R1 no tiene
+    # tabs (tab_name=None) → se saltea.
+    if tab_name is not None:
+        await iframe.get_by_role("tab", name=tab_name).click()
 
-    # Slicer A (PA Start Date) suele cargar primero; B (Accrual Schedule Date)
-    # carga unos segundos despues. Si leemos antes de que B este, identificamos
-    # mal y caemos en A. Esperar hasta tener los 4 inputs date (2 slicers x 2
-    # textboxes cada uno) garantiza que ambos esten antes de identificar.
+    # Esperamos a que carguen todos los date inputs antes de leer el slicer.
+    # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
+    # Date) carga unos segundos despues del A, leer antes identifica mal.
+    # R1: 1 slicer x 2 textboxes = 2 inputs.
+    needed_inputs = 2 if single_slicer else 4
     date_inputs = iframe.locator(
         "input[aria-label*='Available input range']"
     )
     deadline = asyncio.get_event_loop().time() + 30
     while True:
         count = await date_inputs.count()
-        if count >= 4:
+        if count >= needed_inputs:
             break
         if asyncio.get_event_loop().time() > deadline:
             raise TimeoutError(
-                f"Only {count} date inputs after 30s — slicer B nunca cargo"
+                f"Only {count} date inputs after 30s (needed {needed_inputs})"
             )
         await asyncio.sleep(0.5)
 
-    start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
-        await _identify_accrual_slicer(date_inputs)
-    )
+    if single_slicer:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _read_single_slicer(date_inputs)
+        )
+    else:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _identify_accrual_slicer(date_inputs)
+        )
     start_date = slicer_min
     end_date = min(today, slicer_max)
     logger.warning(
@@ -552,6 +573,44 @@ async def _identify_accrual_slicer(
     # Mas lejano en el futuro = Accrual Schedule Date (slicer der).
     pairs.sort(key=lambda x: x[0], reverse=True)
     max_d, min_d, start_idx, end_idx = pairs[0]
+    return start_idx, end_idx, min_d, max_d, date_fmt
+
+
+async def _read_single_slicer(
+    date_inputs,
+) -> tuple[int, int, dt.date, dt.date, str]:
+    """Lee el unico date range slicer de un reporte (R1 Vendor Payment Activity
+    chunkea por date of service). A diferencia de `_identify_accrual_slicer`
+    no hay que elegir entre dos slicers: solo hay un par Start date / End date.
+
+    Devuelve (start_idx, end_idx, min, max, date_fmt) — mismos campos que
+    `_identify_accrual_slicer`. Los indices son posiciones dentro de
+    `date_inputs` para que el caller use `date_inputs.nth(idx)` como selector
+    estable (el aria-label se mueve al aplicar un filtro, la posicion no).
+    """
+    inputs = await date_inputs.evaluate_all(
+        "els => els.map((e, i) => ({i: i, label: e.getAttribute('aria-label')}))"
+    )
+    start_idx = end_idx = None
+    range_s: tuple[str, str] | None = None
+    for item in inputs:
+        label = item["label"] or ""
+        m = _LABEL_RANGE_RE.search(label)
+        if not m:
+            continue
+        if label.startswith("Start date."):
+            start_idx = item["i"]
+            range_s = (m.group(1), m.group(2))
+        elif label.startswith("End date."):
+            end_idx = item["i"]
+
+    if start_idx is None or end_idx is None or range_s is None:
+        raise ValueError(
+            f"No single date-range slicer found. Inputs were: {inputs!r}"
+        )
+
+    min_d, date_fmt = _parse_filter_date(range_s[0])
+    max_d, _ = _parse_filter_date(range_s[1])
     return start_idx, end_idx, min_d, max_d, date_fmt
 
 

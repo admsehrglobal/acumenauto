@@ -155,21 +155,46 @@ async def _xcore_login(page: Page, username: str, password: str) -> None:
     await page.wait_for_url(lambda url: "/Account/Login" not in url)
 
 
+async def _open_report_iframe(
+    page: Page,
+    button_name: str,
+    *,
+    attempts: int = 3,
+    timeout_ms: int = 120000,
+):
+    """Click el boton del reporte y devuelve el content_frame del iframe de PBI.
+
+    Power BI a veces no inserta el iframe 'Embedded report' en el DOM (timeout
+    intermitente — ~1/3 de las corridas del cron fallaban asi, jun 2026). Subir
+    el timeout solo hace el fallo mas lento; en cambio reintentamos: recargamos
+    la pagina y re-clickeamos el boton hasta `attempts` veces. El segundo intento
+    casi siempre monta el iframe.
+
+    El hover fuerza que PBI renderice el menu "..." del visual (en headless, sin
+    hover, el boton visual-more-options-btn puede no aparecer).
+    """
+    iframe_element = page.locator('iframe[title="Embedded report"]')
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.get_by_role("button", name=button_name).click()
+            await iframe_element.wait_for(timeout=timeout_ms)
+            await iframe_element.hover()
+            return iframe_element.content_frame
+        except PlaywrightTimeoutError:
+            logger.warning(
+                "[REPORT] iframe 'Embedded report' no aparecio en %ds (intento %d/%d)%s",
+                timeout_ms // 1000, attempt, attempts,
+                ", recargando y reintentando" if attempt < attempts else " — abortando",
+            )
+            if attempt >= attempts:
+                raise
+            await page.reload(wait_until="load")
+
+
 async def _export_excel(
     page: Page, report_button_name: str, output_dir: Path, timestamp_label: str
 ) -> Path:
-    await page.get_by_role("button", name=report_button_name).click()
-
-    iframe_element = page.locator('iframe[title="Embedded report"]')
-    # 180s en lugar del default de 60s: Power BI a veces tarda > 60s en insertar
-    # el iframe en el DOM post-click (confirmado 2026-05-21 con DIAG: iframe=[]
-    # a los 23s post-click, recien aparecio entre 60-90s). Default mataba el
-    # cron daily intermitentemente.
-    await iframe_element.wait_for(timeout=180000)
-    # Hover sobre el iframe fuerza que Power BI muestre el menú "..." del visual.
-    # Sin esto, en headless el boton visual-more-options-btn puede no renderizarse.
-    await iframe_element.hover()
-    iframe = iframe_element.content_frame
+    iframe = await _open_report_iframe(page, report_button_name)
 
     more_btn = iframe.get_by_test_id("visual-more-options-btn")
     await more_btn.wait_for(state="attached")
@@ -225,14 +250,7 @@ async def _export_chunked_report(
     falla, la excepcion propaga sin mergear (abort-on-fail: el cliente no
     recibe un archivo parcial).
     """
-    await page.get_by_role("button", name=button_name).click()
-
-    iframe_element = page.locator('iframe[title="Embedded report"]')
-    # Mismo motivo que en _export_excel: 180s para tolerar inserciones lentas
-    # del iframe por parte de Power BI.
-    await iframe_element.wait_for(timeout=180000)
-    await iframe_element.hover()
-    iframe = iframe_element.content_frame
+    iframe = await _open_report_iframe(page, button_name)
 
     # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
     # totales). Switch al tab con detalle PA + schedule semanal. R1 no tiene

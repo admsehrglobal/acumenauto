@@ -90,7 +90,8 @@ async def download_reports(
                 results.append((path, button_name))
 
             for spec in chunked_reports:
-                url, button_name, n_chunks, today, tab_name, single_slicer = spec
+                (url, button_name, n_chunks, today, tab_name,
+                 single_slicer, snapshot_column) = spec
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 results.extend(
@@ -103,6 +104,7 @@ async def download_reports(
                         today,
                         tab_name=tab_name,
                         single_slicer=single_slicer,
+                        snapshot_column=snapshot_column,
                     )
                 )
             return results
@@ -200,6 +202,7 @@ async def _export_chunked_report(
     *,
     tab_name: str | None = None,
     single_slicer: bool = False,
+    snapshot_column: str | None = None,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -268,15 +271,25 @@ async def _export_chunked_report(
             await _identify_accrual_slicer(date_inputs)
         )
     start_date = slicer_min
-    end_date = min(today, slicer_max)
+    # R3 (snapshot_column seteado): el slicer que chunkeamos es la PA End Date, no
+    # el Accrual Schedule Date (que es solo una columna, sin slicer). Chunkear su
+    # rango COMPLETO hasta slicer_max para no dejar afuera autorizaciones vigentes
+    # (End Date futura). El "snapshot a hoy" que pide Paul se aplica despues sobre
+    # la columna Accrual Schedule Date en el merge — clampear el slicer aca borraria
+    # PAs enteros (bug confirmado 2026-06-02).
+    # R1 (snapshot_column=None): chunkea date of service; clamp a hoy es correcto.
+    if snapshot_column is not None:
+        end_date = slicer_max
+    else:
+        end_date = min(today, slicer_max)
     logger.warning(
         "[REPORT chunked] Slicer identified: start_idx=%d end_idx=%d "
         "range=%s to %s (fmt %s)",
         start_idx, end_idx, slicer_min, slicer_max, date_fmt,
     )
     logger.warning(
-        "[REPORT chunked] Effective range: %s to %s (today=%s, clamped to slicer max=%s)",
-        start_date, end_date, today, slicer_max,
+        "[REPORT chunked] Effective range: %s to %s (today=%s, slicer max=%s, snapshot_col=%s)",
+        start_date, end_date, today, slicer_max, snapshot_column,
     )
 
     start_input = date_inputs.nth(start_idx)
@@ -344,16 +357,22 @@ async def _export_chunked_report(
         )
         part_paths.append(part_path)
 
+    # Para R3 el slicer llega hasta slicer_max (2027) pero el contenido se recorta
+    # a hoy en el merge; etiquetamos con `today` para que el nombre refleje el dato.
+    label_end = today if snapshot_column is not None else end_date
     merged_path = output_dir / (
-        f"{slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
+        f"{slug}_{start_date.isoformat()}_to_{label_end.isoformat()}"
         f"_{timestamp_label}.xlsx"
     )
-    _merge_xlsx_files(part_paths, merged_path)
+    _merge_xlsx_files(
+        part_paths, merged_path,
+        cutoff_column=snapshot_column, cutoff_date=today,
+    )
     for p in part_paths:
         p.unlink(missing_ok=True)
 
     display_name = (
-        f"{button_name} ({start_date.isoformat()} to {end_date.isoformat()})"
+        f"{button_name} ({start_date.isoformat()} to {label_end.isoformat()})"
     )
     return [(merged_path, display_name)]
 
@@ -386,13 +405,25 @@ def _validate_chunk_xlsx(path: Path) -> int:
         wb.close()
 
 
-def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
+def _merge_xlsx_files(
+    paths: list[Path],
+    output_path: Path,
+    *,
+    cutoff_column: str | None = None,
+    cutoff_date: dt.date | None = None,
+) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
     El tab 'PA Details and Schedule by Client' devuelve tabla plana (header
-    de 1 fila, columnas fijas). Como chunkeamos por Accrual Schedule Date,
-    cada accrual aparece en exactamente un chunk (sin overlap). Concat vertical
-    directo; las rows se preservan tal cual.
+    de 1 fila, columnas fijas). Como chunkeamos por PA End Date, cada PA aparece
+    en exactamente un chunk (sin overlap). Concat vertical directo; las rows se
+    preservan tal cual.
+
+    `cutoff_column`/`cutoff_date` (R3): descartamos las filas cuya columna
+    `cutoff_column` (Accrual Schedule Date) sea posterior a `cutoff_date` (hoy).
+    Es el "snapshot a hoy" de Paul: el slicer chunkea la End Date en rango
+    completo (para no perder PAs vigentes) y el recorte de accruals futuros se
+    hace aca sobre la columna, no sobre el slicer.
 
     Validamos que todos los chunks tengan el mismo header (Power BI siempre
     devuelve las mismas columnas para el mismo visual, independiente del
@@ -406,9 +437,11 @@ def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
     # critico en el worker de Fly (2GB) donde Chromium aun corre en paralelo
     # y la presion de memoria hace que out_wb.save() default tarde 4+ min.
     canonical_header: tuple | None = None
+    cutoff_idx: int | None = None
     out_wb = Workbook(write_only=True)
     out_ws = out_wb.create_sheet()
     total_rows = 0
+    dropped_future = 0
 
     for path in paths:
         wb = load_workbook(path, read_only=True)
@@ -422,6 +455,14 @@ def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
             if canonical_header is None:
                 canonical_header = header
                 out_ws.append(list(header))
+                if cutoff_column is not None:
+                    try:
+                        cutoff_idx = list(header).index(cutoff_column)
+                    except ValueError:
+                        raise ValueError(
+                            f"cutoff_column {cutoff_column!r} no esta en el "
+                            f"header {header!r}"
+                        )
             elif header != canonical_header:
                 raise ValueError(
                     f"{path.name}: header no matchea con el primer chunk "
@@ -435,15 +476,27 @@ def _merge_xlsx_files(paths: list[Path], output_path: Path) -> Path:
                 first = row[0] if row else None
                 if isinstance(first, str) and first.startswith("Applied filters:"):
                     continue
+                # Snapshot a hoy: descartar accruals con fecha futura.
+                if cutoff_idx is not None:
+                    cell = row[cutoff_idx] if len(row) > cutoff_idx else None
+                    cell_date = (
+                        cell.date() if isinstance(cell, dt.datetime)
+                        else cell if isinstance(cell, dt.date) else None
+                    )
+                    if cell_date is not None and cell_date > cutoff_date:
+                        dropped_future += 1
+                        continue
                 out_ws.append(list(row))
                 total_rows += 1
         finally:
             wb.close()
 
     logger.warning(
-        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols)",
+        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols, "
+        "%d future accrual rows dropped by cutoff %s)",
         len(paths), output_path.name, total_rows,
         len(canonical_header) if canonical_header else 0,
+        dropped_future, cutoff_date if cutoff_column else None,
     )
     out_wb.save(output_path)
     return output_path

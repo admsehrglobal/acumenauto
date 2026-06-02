@@ -66,6 +66,7 @@ class Command(BaseCommand):
                     nj_started.date(),
                     None,  # tab_name: R1 no tiene tabs
                     True,  # single_slicer: un solo date slicer
+                    None,  # snapshot_column: R1 no recorta accruals
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.
@@ -83,6 +84,10 @@ class Command(BaseCommand):
                     nj_started.date(),
                     "PA Details and Schedule by",  # tab_name
                     False,  # single_slicer: 2 slicers, identificar el correcto
+                    # snapshot_column: chunkeamos la PA End Date en rango completo
+                    # (no perder PAs vigentes) y recortamos accruals > hoy en el
+                    # merge sobre esta columna. Ver bug confirmado 2026-06-02.
+                    "Accrual Schedule Date",
                 )
             )
 

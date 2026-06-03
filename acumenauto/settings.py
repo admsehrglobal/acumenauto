@@ -64,10 +64,12 @@ CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
 CELERY_TIMEZONE = "UTC"
 CELERY_TASK_TRACK_STARTED = True
-# Run Now corre R1+R2+R3: R3 chunked (~9min) + R1+R2 (~1min) + merge + email
-# = ~12min. 25min cubre eso con margen suficiente sin dejar al worker hung
-# eternamente si algo se cuelga.
-CELERY_TASK_TIME_LIMIT = 25 * 60
+# Run Now corre R1+R2+R3. Desde que R3 baja el rango completo a 2027 (para no
+# perder PAs vigentes) y se recorta en el merge, el volumen subio fuerte. El
+# merge se reescribio a calamine+xlsxwriter (~3x mas rapido que openpyxl) para
+# bajar el runtime de raiz; 40min es red de seguridad para picos/crecimiento de
+# datos sin dejar al worker hung eternamente si algo se cuelga.
+CELERY_TASK_TIME_LIMIT = 40 * 60
 # Schedule vive en DB (django_celery_beat) para que Paul lo edite desde el dashboard.
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 

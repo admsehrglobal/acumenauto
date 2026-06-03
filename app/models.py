@@ -51,9 +51,11 @@ class AppConfig(models.Model):
     date_range_chunks = models.PositiveSmallIntegerField(
         default=4,
         help_text=(
-            "Number of date-range chunks for the chunked reports (Vendor "
-            "Payment Activity and Vendor Authorization Accrual Balances). "
-            "Workaround for Acumen's 150k row export cap."
+            "Starting number of date-range chunks for the chunked reports "
+            "(Vendor Payment Activity and Vendor Authorization Accrual "
+            "Balances). This is a floor: any chunk that approaches Acumen's "
+            "150k row export cap is auto-subdivided, so you rarely need to "
+            "change it."
         ),
     )
 

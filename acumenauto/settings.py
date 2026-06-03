@@ -70,6 +70,12 @@ CELERY_TASK_TRACK_STARTED = True
 # bajar el runtime de raiz; 40min es red de seguridad para picos/crecimiento de
 # datos sin dejar al worker hung eternamente si algo se cuelga.
 CELERY_TASK_TIME_LIMIT = 40 * 60
+# Soft limit 2 min antes del hard: el hard mata el proceso sin dejar correr el
+# `except` del comando -> el Run quedaba zombie en "running" para siempre. El
+# soft lanza SoftTimeLimitExceeded DENTRO del task (lo atrapa `except Exception`)
+# -> marca el Run FAILED y limpia. El hard queda como backstop si el soft no
+# alcanza a entregarse (proceso trabado en C).
+CELERY_TASK_SOFT_TIME_LIMIT = 38 * 60
 # Schedule vive en DB (django_celery_beat) para que Paul lo edite desde el dashboard.
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 

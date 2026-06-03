@@ -24,7 +24,6 @@ from pathlib import Path
 
 import python_calamine
 import xlsxwriter
-from openpyxl import load_workbook
 from playwright.async_api import (
     BrowserContext,
     Page,
@@ -330,16 +329,13 @@ async def _export_chunked_report(
     start_input = date_inputs.nth(start_idx)
     end_input = date_inputs.nth(end_idx)
 
-    chunks = _chunk_date_range(start_date, end_date, n_chunks)
     slug = "_".join(button_name.lower().split())
-    part_paths: list[Path] = []
 
-    for i, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        chunk_label = (
-            f"Part {i}/{n_chunks} ({chunk_start.isoformat()} to "
-            f"{chunk_end.isoformat()})"
-        )
-        logger.warning("[REPORT chunked] Exporting %s", chunk_label)
+    async def _export_one_range(chunk_start, chunk_end, seq):
+        """Setea el filtro de fechas, exporta el visual a xlsx y devuelve
+        (path, data_rows). Lo llama el driver adaptativo."""
+        label = f"{chunk_start.isoformat()} to {chunk_end.isoformat()}"
+        logger.warning("[REPORT chunked] Exporting part %d (%s)", seq, label)
 
         await _set_date_filter(
             start_input, end_input, chunk_start, chunk_end, date_fmt
@@ -381,16 +377,25 @@ async def _export_chunked_report(
         download = await download_info.value
 
         part_path = output_dir / (
-            f"{slug}_part_{i}_of_{n_chunks}"
+            f"{slug}_part_{seq:03d}"
             f"_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
         await download.save_as(part_path)
         rows = _validate_chunk_xlsx(part_path)
         logger.warning(
-            "[REPORT chunked] %s OK (%d data rows)", chunk_label, rows
+            "[REPORT chunked] Part %d (%s) OK (%d data rows)", seq, label, rows
         )
-        part_paths.append(part_path)
+        return part_path, rows
+
+    # n_chunks es un PISO: si un chunk roza el cap de 150k de PBI, el driver lo
+    # subdivide solo (ver _export_ranges_adaptive) para no truncar.
+    part_paths = await _export_ranges_adaptive(
+        _export_one_range,
+        _chunk_date_range(start_date, end_date, n_chunks),
+        threshold=_RESPLIT_THRESHOLD,
+        max_parts=_MAX_PARTS,
+    )
 
     # Para R3 el slicer llega hasta slicer_max (2027) pero el contenido se recorta
     # a hoy en el merge; etiquetamos con `today` para que el nombre refleje el dato.
@@ -413,31 +418,36 @@ async def _export_chunked_report(
 
 
 def _validate_chunk_xlsx(path: Path) -> int:
-    """Confirma que el chunk recien descargado es un xlsx valido con datos.
+    """Valida el chunk recien descargado y devuelve su cantidad de data rows.
 
-    Atrapa los modos de falla silenciosos mas comunes: descarga truncada
-    (openpyxl no puede abrir), filtro no aplicado o sesion caida (export
-    vacio o sin data rows). Si algo falla, raise -> el reporte aborta antes
-    de seguir con los proximos chunks o el merge.
+    Usa calamine (rapido) porque el driver adaptativo cuenta CADA chunk para
+    decidir si subdividir. Atrapa los modos de falla duros: descarga truncada/
+    corrupta (calamine no puede abrir) o export sin header (sesion caida).
 
-    Devuelve la cantidad de data rows (excluyendo header) para logging.
+    NO falla si data_rows == 0: con el chunking adaptativo un sub-rango vacio es
+    legitimo. El caso "reporte entero vacio" lo atrapa _merge_xlsx_files. El
+    conteo excluye el header y la fila "Applied filters:" que inyecta PBI, para
+    que matchee con lo que cuenta el merge (y con el cap de 150k de PBI).
     """
-    wb = load_workbook(path, read_only=True)
     try:
-        ws = wb.active
-        rows_iter = ws.iter_rows(values_only=True)
-        try:
-            header = next(rows_iter)
-        except StopIteration:
-            raise ValueError(f"{path.name}: archivo vacio (sin header)")
-        if not any(cell is not None for cell in header):
-            raise ValueError(f"{path.name}: header row vacio")
-        data_rows = sum(1 for _ in rows_iter)
-        if data_rows == 0:
-            raise ValueError(f"{path.name}: sin data rows (solo header)")
-        return data_rows
-    finally:
-        wb.close()
+        sheet = python_calamine.CalamineWorkbook.from_path(
+            str(path)
+        ).get_sheet_by_index(0)
+        rows = sheet.to_python(skip_empty_area=True)
+    except Exception as exc:
+        raise ValueError(
+            f"{path.name}: no se pudo abrir (descarga truncada/corrupta): {exc}"
+        )
+    if not rows or not any(c not in (None, "") for c in rows[0]):
+        raise ValueError(f"{path.name}: sin header (export vacio / sesion caida)")
+    data_rows = 0
+    for row in rows[1:]:
+        first = row[0] if row else None
+        if isinstance(first, str) and first.startswith("Applied filters:"):
+            continue
+        if any(c not in (None, "") for c in row):
+            data_rows += 1
+    return data_rows
 
 
 def _merge_xlsx_files(
@@ -551,7 +561,66 @@ def _merge_xlsx_files(
         dropped_future, cutoff_date if cutoff_column else None,
     )
     out_wb.close()
+    # Guard a nivel reporte: sub-rangos vacios individuales son validos (el
+    # chunking adaptativo puede generarlos), pero un merge con 0 filas en TOTAL
+    # significa que el reporte salio vacio (filtro no aplicado / sesion caida).
+    if total_rows == 0:
+        raise ValueError(
+            f"{output_path.name}: merge produjo 0 data rows — reporte vacio"
+        )
     return output_path
+
+
+# Power BI "Data with current layout" trunca SILENCIOSAMENTE a 150k filas. Si un
+# chunk se acerca, lo subdividimos antes de rozar el cap (margen de 5k).
+_EXPORT_ROW_CAP = 150_000
+_RESPLIT_THRESHOLD = 145_000
+_MAX_PARTS = 100  # backstop anti-loop (en la practica nunca se acerca)
+
+
+async def _export_ranges_adaptive(export_fn, initial_ranges, *, threshold, max_parts):
+    """Exporta cada rango de fechas con `export_fn`; si un export devuelve
+    >= `threshold` filas (cerca del cap de 150k de PBI -> riesgo de truncado
+    silencioso), descarta ese export, parte el rango en dos mitades y las
+    re-encola al frente (orden cronologico). Asi el numero de chunks se
+    auto-ajusta a la densidad real de los datos, sin tener que tunear N a mano.
+
+    `export_fn(start, end, seq) -> (Path, data_rows)` exporta UN rango.
+    Devuelve la lista de Paths de los parts finales (todos < threshold, salvo un
+    rango de 1 dia que ya no se puede subdividir — ahi se acepta con warning).
+    """
+    pending = list(initial_ranges)
+    parts: list[Path] = []
+    seq = 0
+    while pending:
+        cs, ce = pending.pop(0)
+        seq += 1
+        if seq > max_parts:
+            raise RuntimeError(
+                f"Adaptive chunking supero {max_parts} exports — posible loop "
+                f"(rango {cs}..{ce})"
+            )
+        path, rows = await export_fn(cs, ce, seq)
+        if rows >= threshold and (ce - cs).days >= 1:
+            # Demasiado grande y subdividible: descartar y partir en dos.
+            path.unlink(missing_ok=True)
+            mid = cs + dt.timedelta(days=(ce - cs).days // 2)
+            pending.insert(0, (mid + dt.timedelta(days=1), ce))
+            pending.insert(0, (cs, mid))
+            logger.warning(
+                "[REPORT chunked] Chunk %s..%s = %d filas (>= %d) -> subdividiendo",
+                cs, ce, rows, threshold,
+            )
+            continue
+        if rows >= threshold:
+            # Rango de 1 dia: no se puede subdividir mas. Aceptamos y avisamos.
+            logger.warning(
+                "[REPORT chunked] Chunk %s = %d filas (>= cap) y es 1 solo dia: "
+                "no se puede subdividir, RIESGO de truncado en PBI",
+                cs, rows,
+            )
+        parts.append(path)
+    return parts
 
 
 def _chunk_date_range(

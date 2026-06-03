@@ -1,14 +1,17 @@
 import asyncio
+import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from app.email_utils import send_reports_email
 from app.models import AppConfig, Recipient, Run
 from app.scraper import download_reports
+
+logger = logging.getLogger(__name__)
 
 # Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
 # que llegan al inbox sean legibles para Paul.
@@ -105,6 +108,41 @@ class Command(BaseCommand):
             )
             return
 
+        no_email = options["no_email"]
+        recipients: list[str] = []
+        if not no_email:
+            recipients = list(
+                Recipient.objects.filter(active=True).values_list("email", flat=True)
+            )
+            if not recipients:
+                run.status = Run.Status.FAILED
+                run.error_message = "[email] No active recipients configured."
+                run.finished_at = timezone.now()
+                run.save()
+                raise CommandError("No active recipients configured.")
+
+        # Entrega incremental: cada reporte se manda apenas esta listo, NO al
+        # final. Asi si R3 falla, R1/R2 ya llegaron al inbox. Un fallo de envio
+        # de un reporte se registra pero no aborta los demas.
+        sent: list[str] = []
+        send_errors: list[str] = []
+
+        def on_report_ready(path: Path, display_name: str) -> None:
+            if no_email:
+                # --no-email: dejamos el archivo en output_dir para inspeccion.
+                sent.append(path.name)
+                return
+            try:
+                send_reports_email([(path, display_name)], recipients, subject_label)
+                sent.append(path.name)
+                logger.warning("[REPORT] Emailed %s", display_name)
+            except Exception as exc:
+                logger.exception("[email] fallo enviando %s", display_name)
+                send_errors.append(f"{display_name}: {exc}")
+            finally:
+                # El email es el storage definitivo; no persistimos el xlsx.
+                path.unlink(missing_ok=True)
+
         try:
             items = asyncio.run(
                 download_reports(
@@ -114,57 +152,46 @@ class Command(BaseCommand):
                     output_dir=output_dir,
                     timestamp_label=timestamp_label,
                     chunked_reports=chunked_reports,
+                    on_report_ready=on_report_ready,
                 )
             )
         except Exception as exc:
+            # Algunos reportes pueden haberse entregado antes del fallo.
             run.status = Run.Status.FAILED
+            run.filenames = ";".join(sent)
             run.error_message = str(exc)
             run.finished_at = timezone.now()
             run.save()
             raise
 
-        paths = [p for p, _ in items]
-        run.filenames = ";".join(p.name for p in paths)
-
-        if options["no_email"]:
-            run.status = Run.Status.SUCCESS
-            run.finished_at = timezone.now()
-            run.save()
-            self.stdout.write(
-                self.style.SUCCESS(
-                    f"Downloaded {len(paths)} files (no email sent, "
-                    f"Run #{run.pk}):\n"
-                    + "\n".join(f"  - {p}" for p in paths)
-                )
-            )
-            return
-
-        recipients = list(
-            Recipient.objects.filter(active=True).values_list("email", flat=True)
-        )
-
-        try:
-            send_reports_email(items, recipients, subject_label)
-        except Exception as exc:
+        run.filenames = ";".join(sent)
+        if send_errors:
             run.status = Run.Status.FAILED
-            run.error_message = f"[email] {exc}"
-            run.finished_at = timezone.now()
-            run.save()
-            raise
-        finally:
-            # No persistimos los Excel — el email es el storage definitivo.
-            # Limpiamos /tmp aun si el send fallo (los archivos no sirven post-run).
-            for p in paths:
-                p.unlink(missing_ok=True)
-
-        run.status = Run.Status.SUCCESS
+            run.error_message = "[email] " + " | ".join(send_errors)
+        else:
+            run.status = Run.Status.SUCCESS
         run.finished_at = timezone.now()
         run.save()
 
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Downloaded {len(paths)} files and emailed to "
-                f"{', '.join(recipients)} (Run #{run.pk}):\n"
-                + "\n".join(f"  - {p}" for p in paths)
+        if no_email:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Downloaded {len(items)} files (no email sent, "
+                    f"Run #{run.pk}):\n"
+                    + "\n".join(f"  - {p}" for p, _ in items)
+                )
             )
-        )
+        elif send_errors:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Run #{run.pk}: enviados {len(sent)}, "
+                    f"{len(send_errors)} fallaron: {send_errors}"
+                )
+            )
+        else:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Emailed {len(sent)} report(s) to "
+                    f"{', '.join(recipients)} (Run #{run.pk})."
+                )
+            )

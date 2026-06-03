@@ -22,7 +22,9 @@ import logging
 import re
 from pathlib import Path
 
-from openpyxl import Workbook, load_workbook
+import python_calamine
+import xlsxwriter
+from openpyxl import load_workbook
 from playwright.async_api import (
     BrowserContext,
     Page,
@@ -42,6 +44,7 @@ async def download_reports(
     output_dir: Path,
     timestamp_label: str,
     chunked_reports: list[tuple[str, str, int, dt.date, str | None, bool]] = (),
+    on_report_ready=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
@@ -58,6 +61,12 @@ async def download_reports(
     mas alla.
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
+
+    `on_report_ready(path, display_name)` (opcional): se invoca apenas cada
+    reporte termina de bajar, ANTES de seguir con el proximo. Lo usa el caller
+    para mandar el email de ese reporte enseguida (entrega incremental) — asi un
+    fallo en R3 no se lleva puesto el envio de R1/R2 que ya estaban listos. Se
+    ejecuta en un thread para no bloquear el event loop de Playwright.
 
     Devuelve lista de (path, display_name) por archivo descargado — un tuple
     por reporte simple, N tuples por reporte chunked. El display_name va al
@@ -80,6 +89,11 @@ async def download_reports(
             await _login(page, username, password)
             report_page = await _open_reports_popup(page, username, password)
 
+            async def _ready(item: tuple[Path, str]) -> None:
+                # Corre en thread: el callback hace I/O bloqueante (email Brevo).
+                if on_report_ready is not None:
+                    await asyncio.to_thread(on_report_ready, item[0], item[1])
+
             results: list[tuple[Path, str]] = []
             for report_url, button_name in reports:
                 await report_page.goto(report_url)
@@ -87,26 +101,29 @@ async def download_reports(
                 path = await _export_excel(
                     report_page, button_name, output_dir, timestamp_label
                 )
-                results.append((path, button_name))
+                item = (path, button_name)
+                results.append(item)
+                await _ready(item)
 
             for spec in chunked_reports:
                 (url, button_name, n_chunks, today, tab_name,
                  single_slicer, snapshot_column) = spec
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
-                results.extend(
-                    await _export_chunked_report(
-                        report_page,
-                        button_name,
-                        n_chunks,
-                        output_dir,
-                        timestamp_label,
-                        today,
-                        tab_name=tab_name,
-                        single_slicer=single_slicer,
-                        snapshot_column=snapshot_column,
-                    )
+                chunked_items = await _export_chunked_report(
+                    report_page,
+                    button_name,
+                    n_chunks,
+                    output_dir,
+                    timestamp_label,
+                    today,
+                    tab_name=tab_name,
+                    single_slicer=single_slicer,
+                    snapshot_column=snapshot_column,
                 )
+                results.extend(chunked_items)
+                for item in chunked_items:
+                    await _ready(item)
             return results
         except Exception:
             await _dump_debug(context, output_dir)
@@ -446,68 +463,85 @@ def _merge_xlsx_files(
     Validamos que todos los chunks tengan el mismo header (Power BI siempre
     devuelve las mismas columnas para el mismo visual, independiente del
     filtro de fechas).
+
+    Motor: calamine (Rust) para leer + xlsxwriter `constant_memory` para
+    escribir. Antes era openpyxl (read_only + write_only): correcto pero ~3x
+    mas lento en CPU; en el worker shared-cpu de Fly un merge de 157k filas
+    tardaba ~9 min y chocaba con el time limit de Celery (25 min). calamine lee
+    ~10x mas rapido y xlsxwriter escribe ~2x mas rapido, manteniendo la RAM baja
+    (~140MB peak, sigue siendo seguro con Chromium corriendo en el worker 2GB).
+    Benchmark 157k filas: 108s -> 38s.
     """
     if not paths:
         raise ValueError("No paths to merge")
 
-    # write_only=True: stream-escribe a disco en lugar de mantener todas las
-    # celdas en RAM. Para 218k filas la diferencia es ~600MB vs ~11MB peak,
-    # critico en el worker de Fly (2GB) donde Chromium aun corre en paralelo
-    # y la presion de memoria hace que out_wb.save() default tarde 4+ min.
-    canonical_header: tuple | None = None
+    out_wb = xlsxwriter.Workbook(str(output_path), {"constant_memory": True})
+    out_ws = out_wb.add_worksheet()
+    # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
+    # Paul no vea un cambio de presentacion en las columnas de fecha.
+    fmt_datetime = out_wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+    fmt_date = out_wb.add_format({"num_format": "yyyy-mm-dd"})
+
+    def _write_row(r: int, values) -> None:
+        for c, v in enumerate(values):
+            if isinstance(v, dt.datetime):
+                out_ws.write_datetime(r, c, v, fmt_datetime)
+            elif isinstance(v, dt.date):
+                out_ws.write_datetime(r, c, v, fmt_date)
+            else:
+                out_ws.write(r, c, v)
+
+    canonical_header: list | None = None
     cutoff_idx: int | None = None
-    out_wb = Workbook(write_only=True)
-    out_ws = out_wb.create_sheet()
+    out_row = 0
     total_rows = 0
     dropped_future = 0
 
     for path in paths:
-        wb = load_workbook(path, read_only=True)
-        try:
-            ws = wb.active
-            rows_iter = ws.iter_rows(values_only=True)
-            try:
-                header = next(rows_iter)
-            except StopIteration:
-                raise ValueError(f"{path.name}: archivo vacio")
-            if canonical_header is None:
-                canonical_header = header
-                out_ws.append(list(header))
-                if cutoff_column is not None:
-                    try:
-                        cutoff_idx = list(header).index(cutoff_column)
-                    except ValueError:
-                        raise ValueError(
-                            f"cutoff_column {cutoff_column!r} no esta en el "
-                            f"header {header!r}"
-                        )
-            elif header != canonical_header:
-                raise ValueError(
-                    f"{path.name}: header no matchea con el primer chunk "
-                    f"({header!r} vs {canonical_header!r})"
-                )
-            for row in rows_iter:
-                # Power BI inyecta una fila al final de cada export con el
-                # filtro aplicado (ej: "Applied filters: EndDate is on or
-                # after X and is before Y"). La salteamos para que el archivo
-                # final tenga solo data.
-                first = row[0] if row else None
-                if isinstance(first, str) and first.startswith("Applied filters:"):
-                    continue
-                # Snapshot a hoy: descartar accruals con fecha futura.
-                if cutoff_idx is not None:
-                    cell = row[cutoff_idx] if len(row) > cutoff_idx else None
-                    cell_date = (
-                        cell.date() if isinstance(cell, dt.datetime)
-                        else cell if isinstance(cell, dt.date) else None
+        sheet = python_calamine.CalamineWorkbook.from_path(
+            str(path)
+        ).get_sheet_by_index(0)
+        rows = sheet.to_python(skip_empty_area=True)
+        if not rows or not any(c not in (None, "") for c in rows[0]):
+            raise ValueError(f"{path.name}: archivo vacio (sin header)")
+        header = rows[0]
+        if canonical_header is None:
+            canonical_header = header
+            _write_row(out_row, header)
+            out_row += 1
+            if cutoff_column is not None:
+                try:
+                    cutoff_idx = header.index(cutoff_column)
+                except ValueError:
+                    raise ValueError(
+                        f"cutoff_column {cutoff_column!r} no esta en el "
+                        f"header {header!r}"
                     )
-                    if cell_date is not None and cell_date > cutoff_date:
-                        dropped_future += 1
-                        continue
-                out_ws.append(list(row))
-                total_rows += 1
-        finally:
-            wb.close()
+        elif header != canonical_header:
+            raise ValueError(
+                f"{path.name}: header no matchea con el primer chunk "
+                f"({header!r} vs {canonical_header!r})"
+            )
+        for row in rows[1:]:
+            # Power BI inyecta una fila al final de cada export con el filtro
+            # aplicado (ej: "Applied filters: EndDate is on or after X and is
+            # before Y"). La salteamos para que el archivo final tenga solo data.
+            first = row[0] if row else None
+            if isinstance(first, str) and first.startswith("Applied filters:"):
+                continue
+            # Snapshot a hoy: descartar accruals con fecha futura.
+            if cutoff_idx is not None:
+                cell = row[cutoff_idx] if len(row) > cutoff_idx else None
+                cell_date = (
+                    cell.date() if isinstance(cell, dt.datetime)
+                    else cell if isinstance(cell, dt.date) else None
+                )
+                if cell_date is not None and cell_date > cutoff_date:
+                    dropped_future += 1
+                    continue
+            _write_row(out_row, row)
+            out_row += 1
+            total_rows += 1
 
     logger.warning(
         "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols, "
@@ -516,7 +550,7 @@ def _merge_xlsx_files(
         len(canonical_header) if canonical_header else 0,
         dropped_future, cutoff_date if cutoff_column else None,
     )
-    out_wb.save(output_path)
+    out_wb.close()
     return output_path
 
 

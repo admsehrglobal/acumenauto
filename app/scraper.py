@@ -42,22 +42,25 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_reports: list[tuple[str, str, int, dt.date, str | None, bool]] = (),
+    chunked_reports: list[tuple[str, str, int, dt.date, str | None, bool, bool]] = (),
     on_report_ready=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
-    de fechas: (url, button_name, n_chunks, today, tab_name, single_slicer).
-    `tab_name` es el tab a abrir antes de chunkear (None si el reporte no tiene
-    tabs, ej. R1 Vendor Payment Activity). `single_slicer` es True cuando el
-    reporte tiene un solo date range slicer (R1); False cuando tiene dos y hay
-    que identificar el correcto (R3, ver `_identify_accrual_slicer`).
+    de fechas: (url, button_name, n_chunks, today, tab_name, single_slicer,
+    full_range). `tab_name` es el tab a abrir antes de chunkear (None si el
+    reporte no tiene tabs, ej. R1 Vendor Payment Activity). `single_slicer` es
+    True cuando el reporte tiene un solo date range slicer (R1); False cuando
+    tiene dos y hay que identificar el correcto (R3, ver
+    `_identify_accrual_slicer`).
     El rango de fechas se determina asi: start_date = lo mas anterior que
-    permita el PBI (MIN del slicer, leido del aria-label); end_date = `today`
-    (hoy en NJ tz, lo pasa el caller), clamped al MAX del slicer si today va
-    mas alla.
+    permita el PBI (MIN del slicer, leido del aria-label). `full_range` define
+    el end_date: True (R3) usa el MAX del slicer tal cual (incluye accruals
+    programados a futuro); False (R1) lo clampea a `today` (no hay pagos
+    futuros). El MAX se lee del aria-label en cada corrida, asi que sigue al
+    extent real del slicer aunque cambie entre runs.
     `timestamp_label` se appendea al nombre del archivo para que cada run quede
     identificable (ej: '2026-04-27_14h30').
 
@@ -106,7 +109,7 @@ async def download_reports(
 
             for spec in chunked_reports:
                 (url, button_name, n_chunks, today, tab_name,
-                 single_slicer, snapshot_column) = spec
+                 single_slicer, full_range) = spec
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 chunked_items = await _export_chunked_report(
@@ -118,7 +121,7 @@ async def download_reports(
                     today,
                     tab_name=tab_name,
                     single_slicer=single_slicer,
-                    snapshot_column=snapshot_column,
+                    full_range=full_range,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -243,7 +246,7 @@ async def _export_chunked_report(
     *,
     tab_name: str | None = None,
     single_slicer: bool = False,
-    snapshot_column: str | None = None,
+    full_range: bool = False,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -263,7 +266,11 @@ async def _export_chunked_report(
       sucesivos `.last` agarro tanto slicer A como slicer B).
 
     start_date = MIN del slicer (lo mas anterior que permite PBI).
-    end_date = `today` (hoy NJ), clamped al MAX del slicer si fuera necesario.
+    end_date: con `full_range=True` (R3) = MAX del slicer tal cual, para incluir
+    todos los accruals programados hasta el fondo (auths que terminan a futuro);
+    con `full_range=False` (R1) = `today` (hoy NJ), clamped al MAX si fuera
+    necesario. El MAX se lee del aria-label en cada corrida (sigue al extent
+    real del slicer aunque cambie).
 
     Los N chunks se mergean en un unico xlsx al final. Si cualquier chunk
     falla, la excepcion propaga sin mergear (abort-on-fail: el cliente no
@@ -305,14 +312,14 @@ async def _export_chunked_report(
             await _identify_accrual_slicer(date_inputs)
         )
     start_date = slicer_min
-    # R3 (snapshot_column seteado): el slicer que chunkeamos es la PA End Date, no
-    # el Accrual Schedule Date (que es solo una columna, sin slicer). Chunkear su
-    # rango COMPLETO hasta slicer_max para no dejar afuera autorizaciones vigentes
-    # (End Date futura). El "snapshot a hoy" que pide Paul se aplica despues sobre
-    # la columna Accrual Schedule Date en el merge — clampear el slicer aca borraria
-    # PAs enteros (bug confirmado 2026-06-02).
-    # R1 (snapshot_column=None): chunkea date of service; clamp a hoy es correcto.
-    if snapshot_column is not None:
+    # R3 (full_range=True): chunkeamos la PA End Date hasta slicer_max tal cual.
+    # Asi entran TODOS los PAs (incluso los que terminan a futuro) y TODOS sus
+    # accruals, incluidos los programados despues de hoy (Paul los quiere: son
+    # plata agendada real, no proyeccion vacia — confirmado 2026-06-15). slicer_max
+    # se lee del aria-label en cada corrida, asi que el "fondo" sigue al extent real.
+    # R1 (full_range=False): chunkea date of service; clamp a hoy es correcto (no
+    # hay pagos futuros).
+    if full_range:
         end_date = slicer_max
     else:
         end_date = min(today, slicer_max)
@@ -322,8 +329,8 @@ async def _export_chunked_report(
         start_idx, end_idx, slicer_min, slicer_max, date_fmt,
     )
     logger.warning(
-        "[REPORT chunked] Effective range: %s to %s (today=%s, slicer max=%s, snapshot_col=%s)",
-        start_date, end_date, today, slicer_max, snapshot_column,
+        "[REPORT chunked] Effective range: %s to %s (today=%s, slicer max=%s, full_range=%s)",
+        start_date, end_date, today, slicer_max, full_range,
     )
 
     start_input = date_inputs.nth(start_idx)
@@ -397,22 +404,16 @@ async def _export_chunked_report(
         max_parts=_MAX_PARTS,
     )
 
-    # Para R3 el slicer llega hasta slicer_max (2027) pero el contenido se recorta
-    # a hoy en el merge; etiquetamos con `today` para que el nombre refleje el dato.
-    label_end = today if snapshot_column is not None else end_date
     merged_path = output_dir / (
-        f"{slug}_{start_date.isoformat()}_to_{label_end.isoformat()}"
+        f"{slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
         f"_{timestamp_label}.xlsx"
     )
-    _merge_xlsx_files(
-        part_paths, merged_path,
-        cutoff_column=snapshot_column, cutoff_date=today,
-    )
+    _merge_xlsx_files(part_paths, merged_path)
     for p in part_paths:
         p.unlink(missing_ok=True)
 
     display_name = (
-        f"{button_name} ({start_date.isoformat()} to {label_end.isoformat()})"
+        f"{button_name} ({start_date.isoformat()} to {end_date.isoformat()})"
     )
     return [(merged_path, display_name)]
 
@@ -453,22 +454,14 @@ def _validate_chunk_xlsx(path: Path) -> int:
 def _merge_xlsx_files(
     paths: list[Path],
     output_path: Path,
-    *,
-    cutoff_column: str | None = None,
-    cutoff_date: dt.date | None = None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
     El tab 'PA Details and Schedule by Client' devuelve tabla plana (header
     de 1 fila, columnas fijas). Como chunkeamos por PA End Date, cada PA aparece
     en exactamente un chunk (sin overlap). Concat vertical directo; las rows se
-    preservan tal cual.
-
-    `cutoff_column`/`cutoff_date` (R3): descartamos las filas cuya columna
-    `cutoff_column` (Accrual Schedule Date) sea posterior a `cutoff_date` (hoy).
-    Es el "snapshot a hoy" de Paul: el slicer chunkea la End Date en rango
-    completo (para no perder PAs vigentes) y el recorte de accruals futuros se
-    hace aca sobre la columna, no sobre el slicer.
+    preservan tal cual — incluidos los accruals con fecha futura (Paul los quiere:
+    son programados reales hasta el fondo del slicer, no proyeccion vacia).
 
     Validamos que todos los chunks tengan el mismo header (Power BI siempre
     devuelve las mismas columnas para el mismo visual, independiente del
@@ -502,10 +495,8 @@ def _merge_xlsx_files(
                 out_ws.write(r, c, v)
 
     canonical_header: list | None = None
-    cutoff_idx: int | None = None
     out_row = 0
     total_rows = 0
-    dropped_future = 0
 
     for path in paths:
         sheet = python_calamine.CalamineWorkbook.from_path(
@@ -519,14 +510,6 @@ def _merge_xlsx_files(
             canonical_header = header
             _write_row(out_row, header)
             out_row += 1
-            if cutoff_column is not None:
-                try:
-                    cutoff_idx = header.index(cutoff_column)
-                except ValueError:
-                    raise ValueError(
-                        f"cutoff_column {cutoff_column!r} no esta en el "
-                        f"header {header!r}"
-                    )
         elif header != canonical_header:
             raise ValueError(
                 f"{path.name}: header no matchea con el primer chunk "
@@ -539,26 +522,14 @@ def _merge_xlsx_files(
             first = row[0] if row else None
             if isinstance(first, str) and first.startswith("Applied filters:"):
                 continue
-            # Snapshot a hoy: descartar accruals con fecha futura.
-            if cutoff_idx is not None:
-                cell = row[cutoff_idx] if len(row) > cutoff_idx else None
-                cell_date = (
-                    cell.date() if isinstance(cell, dt.datetime)
-                    else cell if isinstance(cell, dt.date) else None
-                )
-                if cell_date is not None and cell_date > cutoff_date:
-                    dropped_future += 1
-                    continue
             _write_row(out_row, row)
             out_row += 1
             total_rows += 1
 
     logger.warning(
-        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols, "
-        "%d future accrual rows dropped by cutoff %s)",
+        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols)",
         len(paths), output_path.name, total_rows,
         len(canonical_header) if canonical_header else 0,
-        dropped_future, cutoff_date if cutoff_column else None,
     )
     out_wb.close()
     # Guard a nivel reporte: sub-rangos vacios individuales son validos (el

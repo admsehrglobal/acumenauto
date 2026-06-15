@@ -1,10 +1,10 @@
-"""QA de la logica del fix de R3 (sin browser):
+"""QA del merge de R3 (sin browser):
 
-1. `_merge_xlsx_files` con cutoff: el snapshot a hoy se hace filtrando las filas
-   con Accrual Schedule Date > hoy (no por slicer), y SIN perder PAs. Tambien
-   debe seguir salteando la fila "Applied filters:" que inyecta Power BI.
-2. `_merge_xlsx_files` sin cutoff (camino R1): no filtra nada.
-3. `_chunk_date_range`: ventanas contiguas que cubren TODO el rango (esto es lo
+1. `_merge_xlsx_files`: concat vertical de los chunks SIN filtrar — los accruals
+   con fecha futura se conservan (Paul los quiere: son programados reales hasta
+   el fondo del slicer). Sigue salteando la fila "Applied filters:" que inyecta
+   Power BI y validando que todos los chunks tengan el mismo header.
+2. `_chunk_date_range`: ventanas contiguas que cubren TODO el rango (esto es lo
    que garantiza "no se saltea ningun PA").
 """
 import datetime as dt
@@ -20,7 +20,6 @@ HEADER = [
     "Client Name", "Client DDDID", "PA Number", "Start Date",
     "End Date", "Accrual Schedule Date", "Accrual Schedule Amount",
 ]
-TODAY = dt.date(2026, 6, 2)
 
 
 def _row(pa, accrual_dt, amount=100):
@@ -42,11 +41,14 @@ def _make_xlsx(path, rows, header=HEADER, applied_filters_row=True):
 
 def _read(path):
     wb = load_workbook(path, read_only=True)
-    rows = list(wb.active.iter_rows(values_only=True))
+    try:
+        rows = list(wb.active.iter_rows(values_only=True))
+    finally:
+        wb.close()  # Windows: sin esto el handle bloquea el cleanup del tmpdir.
     return rows[0], rows[1:]
 
 
-class MergeCutoffTests(unittest.TestCase):
+class MergeTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.d = Path(self._tmp.name)
@@ -54,45 +56,33 @@ class MergeCutoffTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_cutoff_drops_future_keeps_today_and_past(self):
-        """Borde inclusivo: == hoy se queda, > hoy se va; PAs intactos."""
+    def test_keeps_future_accruals_and_all_pas(self):
+        """No se filtra nada: pasados y futuros se conservan; PAs intactos. Se
+        saltea solo la fila 'Applied filters:'."""
         p1 = self.d / "c1.xlsx"
         p2 = self.d / "c2.xlsx"
         _make_xlsx(p1, [
-            _row("PA1", dt.datetime(2025, 8, 1)),    # pasado -> keep
-            _row("PA1", dt.datetime(2026, 6, 2)),    # == hoy  -> keep
-            _row("PA1", dt.datetime(2026, 6, 3)),    # futuro  -> drop
-            _row("PA1", dt.datetime(2026, 12, 1)),   # futuro  -> drop
+            _row("PA1", dt.datetime(2025, 8, 1)),     # pasado
+            _row("PA1", dt.datetime(2026, 6, 2)),     # hoy-ish
+            _row("PA1", dt.datetime(2026, 12, 1)),    # futuro -> se conserva
+            _row("PA1", dt.datetime(2027, 7, 18)),    # futuro lejano -> se conserva
         ])
         _make_xlsx(p2, [
-            _row("PA2", dt.datetime(2025, 9, 1)),    # pasado -> keep
+            _row("PA2", dt.datetime(2025, 9, 1)),
         ])
         out = self.d / "merged.xlsx"
-        _merge_xlsx_files([p1, p2], out,
-                          cutoff_column="Accrual Schedule Date", cutoff_date=TODAY)
+        _merge_xlsx_files([p1, p2], out)
 
         header, data = _read(out)
         self.assertEqual(list(header), HEADER)
-        self.assertEqual(len(data), 3)  # 2 keep de c1 + 1 de c2
-        accrual = [r[5].date() for r in data]
-        self.assertTrue(all(a <= TODAY for a in accrual), accrual)
-        # No se debe perder ningun PA con datos validos.
+        self.assertEqual(len(data), 5)  # 4 de c1 + 1 de c2, ninguna borrada
         self.assertEqual({r[2] for r in data}, {"PA1", "PA2"})
+        # Los accruals futuros estan presentes.
+        accrual = {r[5].date() for r in data}
+        self.assertIn(dt.date(2027, 7, 18), accrual)
         # La fila "Applied filters:" no debe aparecer.
         self.assertFalse(any(isinstance(r[0], str) and r[0].startswith("Applied filters")
                              for r in data))
-
-    def test_no_cutoff_keeps_everything(self):
-        """Camino R1 (sin cutoff): no filtra accruals, solo saltea Applied filters."""
-        p1 = self.d / "c1.xlsx"
-        _make_xlsx(p1, [
-            _row("PA1", dt.datetime(2025, 8, 1)),
-            _row("PA1", dt.datetime(2026, 12, 1)),   # futuro pero NO se filtra
-        ])
-        out = self.d / "merged.xlsx"
-        _merge_xlsx_files([p1], out)  # sin cutoff_column/date
-        _header, data = _read(out)
-        self.assertEqual(len(data), 2)  # ambas filas, ninguna borrada
 
     def test_header_mismatch_raises(self):
         p1 = self.d / "c1.xlsx"
@@ -103,16 +93,6 @@ class MergeCutoffTests(unittest.TestCase):
         out = self.d / "merged.xlsx"
         with self.assertRaises(ValueError):
             _merge_xlsx_files([p1, p2], out)
-
-    def test_cutoff_column_missing_raises(self):
-        p1 = self.d / "c1.xlsx"
-        _make_xlsx(p1, [["Cli", "1", "PA1", None, None, None, 5]],
-                   header=["Client Name", "Client DDDID", "PA Number",
-                           "Start Date", "End Date", "Otra", "Monto"])
-        out = self.d / "merged.xlsx"
-        with self.assertRaises(ValueError):
-            _merge_xlsx_files([p1], out,
-                              cutoff_column="Accrual Schedule Date", cutoff_date=TODAY)
 
     def test_empty_paths_raises(self):
         with self.assertRaises(ValueError):

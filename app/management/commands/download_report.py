@@ -133,8 +133,17 @@ class Command(BaseCommand):
                 # --no-email: dejamos el archivo en output_dir para inspeccion.
                 sent.append(path.name)
                 return
+            # El reporte de accruals (R3) va con subject fijo "Accrual Schedule"
+            # (sin prefijo ni timestamp); el resto mantiene el subject por defecto.
+            subject_override = (
+                "Accrual Schedule"
+                if display_name.startswith(settings.DCI_REPORT_BUTTON_NAME_3)
+                else None
+            )
             try:
-                send_reports_email([(path, display_name)], recipients, subject_label)
+                send_reports_email(
+                    [(path, display_name)], recipients, subject_label, subject_override
+                )
                 sent.append(path.name)
                 logger.warning("[REPORT] Emailed %s", display_name)
             except Exception as exc:

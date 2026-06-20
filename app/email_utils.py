@@ -42,7 +42,10 @@ def _get_brevo_api_instance():
 
 
 def send_reports_email(
-    items: list[tuple[Path, str]], recipients: list[str], subject_label: str
+    items: list[tuple[Path, str]],
+    recipients: list[str],
+    subject_label: str,
+    subject_override: str | None = None,
 ) -> None:
     """Manda un email separado por cada (path, report_name) a los recipients.
 
@@ -51,6 +54,9 @@ def send_reports_email(
 
     `subject_label` es la hora NJ del run (ej: '2026-04-28 14:24 NJ'). Va en el
     subject de cada mail.
+
+    `subject_override`: si se pasa, se usa tal cual como subject (sin prefijo ni
+    timestamp). Ej: el reporte de accruals va con subject fijo 'Accrual Schedule'.
     """
     if not recipients:
         raise ValueError("No recipients configured.")
@@ -74,7 +80,7 @@ def send_reports_email(
                 name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
             ),
             to=[SendSmtpEmailTo(email=r) for r in recipients],
-            subject=f"DCI Report: {report_name} - {subject_label}",
+            subject=subject_override or f"DCI Report: {report_name} - {subject_label}",
             html_content=html_content,
             text_content=text_content,
             attachment=[attachment],

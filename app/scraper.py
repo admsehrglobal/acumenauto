@@ -209,7 +209,11 @@ async def _open_report_iframe(
             )
             if attempt >= attempts:
                 raise
-            await page.reload(wait_until="load")
+            # Reset del estado de PBI antes de re-clickear. domcontentloaded (no
+            # "load"): en esta SPA pesada el evento load puede tardar >60s y hacer
+            # fallar el propio reload (default 60s); el click siguiente ya espera
+            # a que el boton sea accionable. Usamos el mismo budget que el iframe.
+            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
 
 
 async def _export_excel(

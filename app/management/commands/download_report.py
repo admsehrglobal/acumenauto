@@ -153,11 +153,12 @@ class Command(BaseCommand):
                 # El email es el storage definitivo; no persistimos el xlsx.
                 path.unlink(missing_ok=True)
 
+        dci_username, dci_password = config.effective_dci_credentials()
         try:
             items = asyncio.run(
                 download_reports(
-                    username=settings.DCI_USERNAME,
-                    password=settings.DCI_PASSWORD,
+                    username=dci_username,
+                    password=dci_password,
                     reports=reports,
                     output_dir=output_dir,
                     timestamp_label=timestamp_label,

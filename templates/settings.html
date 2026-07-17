@@ -15,6 +15,12 @@
             class="tab-btn py-2 border-b-2 border-transparent text-slate-600 hover:text-slate-900 transition">
       Recipients
     </button>
+    {% if user.is_superuser %}
+    <button type="button" data-tab="credentials"
+            class="tab-btn py-2 border-b-2 border-transparent text-slate-600 hover:text-slate-900 transition">
+      Credentials
+    </button>
+    {% endif %}
   </nav>
 </div>
 
@@ -217,6 +223,81 @@
   </div>
 </section>
 
+{% if user.is_superuser %}
+<section data-tab-panel="credentials" class="hidden">
+  <div class="bg-white rounded-lg shadow border border-slate-200 p-6 max-w-xl space-y-5">
+    <div>
+      <h2 class="text-lg font-medium text-slate-900 mb-1">DCI portal credentials</h2>
+      <p class="text-sm text-slate-600">
+        Used to log into the Acumen (DCI) portal to download the reports. The
+        password is stored <strong>encrypted</strong>. Update these when the
+        portal password changes — no redeploy needed.
+      </p>
+    </div>
+
+    {% if not encryption_available %}
+      <div class="px-3 py-2 rounded border bg-amber-50 border-amber-200 text-amber-800 text-sm">
+        Encryption key not configured (<span class="font-mono">FIELD_ENCRYPTION_KEY</span>).
+        Saving the password is disabled until it's set on the server.
+      </div>
+    {% endif %}
+
+    <form method="post" action="{% url 'dci_credentials_save' %}" class="space-y-4">
+      {% csrf_token %}
+      <div>
+        <label for="id_dci_username" class="block text-sm font-medium text-slate-700 mb-1">Username</label>
+        {{ credentials_form.dci_username }}
+        {% if credentials_form.dci_username.errors %}
+          <p class="text-xs text-red-600 mt-1">{{ credentials_form.dci_username.errors.0 }}</p>
+        {% endif %}
+      </div>
+
+      <div>
+        <label for="id_dci_password" class="block text-sm font-medium text-slate-700 mb-1">Password</label>
+        <div class="flex gap-2 items-start">
+          <div class="flex-1">{{ credentials_form.dci_password }}</div>
+          <button type="button" id="dci-pw-toggle"
+                  class="px-3 py-2 text-sm border border-slate-300 rounded text-slate-600 hover:bg-slate-100 shrink-0">
+            Show
+          </button>
+        </div>
+        <p class="text-xs text-slate-500 mt-1">
+          {% if config.dci_password_encrypted %}
+            A password is currently saved (encrypted). Leave blank to keep it.
+          {% else %}
+            No password saved yet — the scraper falls back to the server env var.
+          {% endif %}
+        </p>
+      </div>
+
+      <button type="submit" {% if not encryption_available %}disabled{% endif %}
+              class="bg-slate-900 text-white px-4 py-2 rounded hover:bg-slate-700 transition {% if not encryption_available %}opacity-50 cursor-not-allowed{% endif %}">
+        Save credentials
+      </button>
+    </form>
+
+    <div class="border-t border-slate-100 pt-4">
+      <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+        <div>
+          <h3 class="text-sm font-medium text-slate-800">Connection test</h3>
+          <p class="text-xs text-slate-500">
+            Logs into the portal with the saved credentials to confirm they work.
+          </p>
+        </div>
+        <form hx-post="{% url 'dci_test' %}" hx-target="#dci-test-status" hx-swap="outerHTML">
+          {% csrf_token %}
+          <button type="submit"
+                  class="bg-sky-600 text-white px-4 py-2 rounded hover:bg-sky-700 transition shrink-0">
+            Test connection
+          </button>
+        </form>
+      </div>
+      {% include "_dci_test_status.html" with config=config polling=credentials_polling %}
+    </div>
+  </div>
+</section>
+{% endif %}
+
 <script>
   (function() {
     // ---- Tabs ----
@@ -239,7 +320,7 @@
     tabs.forEach(t => t.addEventListener("click", () => activate(t.dataset.tab)));
 
     const initial = (window.location.hash || "#reports").slice(1);
-    activate(["reports", "recipients"].includes(initial) ? initial : "reports");
+    activate(["reports", "recipients", "credentials"].includes(initial) ? initial : "reports");
 
     // ---- Schedule chips (factory: pareja chips+select+csv compartiendo la misma UX) ----
     const ET_FORMATTER = new Intl.DateTimeFormat("en-US", {
@@ -352,6 +433,17 @@
       addBtnId: "weekly-add-hour",
       initial: "{{ weekly_current_hours }}",
     });
+
+    // ---- DCI password show/hide ----
+    const pwToggle = document.getElementById("dci-pw-toggle");
+    const pwInput = document.getElementById("id_dci_password");
+    if (pwToggle && pwInput) {
+      pwToggle.addEventListener("click", () => {
+        const show = pwInput.type === "password";
+        pwInput.type = show ? "text" : "password";
+        pwToggle.textContent = show ? "Hide" : "Show";
+      });
+    }
   })();
 </script>
 {% endblock %}

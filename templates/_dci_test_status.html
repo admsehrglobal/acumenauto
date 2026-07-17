@@ -1,0 +1,26 @@
+<div id="dci-test-status" class="text-sm"
+     {% if polling %}hx-get="{% url 'dci_test_status' %}" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+  {% if config.dci_test_status == 'running' %}
+    <span class="inline-flex items-center gap-2 text-slate-600">
+      <svg class="animate-spin h-4 w-4 text-sky-600" viewBox="0 0 24 24" fill="none">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+      </svg>
+      Testing connection…
+    </span>
+  {% elif config.dci_test_status == 'ok' %}
+    <span class="inline-flex items-center gap-1.5 text-green-700 font-medium">
+      <span>✓</span> Connection OK
+      {% if config.dci_test_at %}<span class="text-slate-400 font-normal">· {{ config.dci_test_at|timesince }} ago</span>{% endif %}
+    </span>
+  {% elif config.dci_test_status == 'failed' %}
+    <span class="inline-flex items-start gap-1.5 text-red-700">
+      <span class="font-medium">✗</span>
+      <span>{{ config.dci_test_message|default:"Connection failed" }}
+        {% if config.dci_test_at %}<span class="text-slate-400">· {{ config.dci_test_at|timesince }} ago</span>{% endif %}
+      </span>
+    </span>
+  {% else %}
+    <span class="text-slate-400 italic">Not tested yet</span>
+  {% endif %}
+</div>

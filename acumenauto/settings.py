@@ -38,8 +38,11 @@ CSRF_TRUSTED_ORIGINS = [
 ]
 
 # DCI portal credentials and report config.
-DCI_USERNAME = os.environ["DCI_USERNAME"]
-DCI_PASSWORD = os.environ["DCI_PASSWORD"]
+# Username/password can also be set from /settings (AppConfig, password
+# encrypted) and take precedence; the env stays as the fallback. Hence .get
+# (a missing env var won't crash boot: the DB can be the only source).
+DCI_USERNAME = os.environ.get("DCI_USERNAME", "")
+DCI_PASSWORD = os.environ.get("DCI_PASSWORD", "")
 DCI_REPORT_URL = os.environ["DCI_REPORT_URL"]
 DCI_REPORT_BUTTON_NAME = os.environ["DCI_REPORT_BUTTON_NAME"]
 DCI_REPORT_URL_2 = os.environ["DCI_REPORT_URL_2"]
@@ -52,6 +55,11 @@ DCI_REPORT_URL_3 = os.environ["DCI_REPORT_URL_3"]
 DCI_REPORT_BUTTON_NAME_3 = os.environ["DCI_REPORT_BUTTON_NAME_3"]
 # DCI_REPORT_3_CHUNKS movido a AppConfig (DB-backed) para que Paul lo edite
 # desde el dashboard sin redeploy.
+
+# Dedicated key to encrypt credentials stored in the DB (DCI portal password, via
+# app/crypto.py). Fly secret, separate from SECRET_KEY. .get: if missing,
+# encryption is disabled (the UI warns) but the app still boots.
+FIELD_ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
 
 # Email (Brevo)
 BREVO_API_KEY = os.environ["BREVO_API_KEY"]

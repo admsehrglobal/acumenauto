@@ -29,4 +29,7 @@ urlpatterns = [
     path("settings/recipients/add/", views.recipient_add, name="recipient_add"),
     path("settings/recipients/<int:pk>/delete/", views.recipient_delete, name="recipient_delete"),
     path("settings/recipients/<int:pk>/toggle/", views.recipient_toggle, name="recipient_toggle"),
+    path("settings/credentials/", views.dci_credentials_save, name="dci_credentials_save"),
+    path("settings/credentials/test/", views.dci_test, name="dci_test"),
+    path("settings/credentials/test/status/", views.dci_test_status, name="dci_test_status"),
 ]

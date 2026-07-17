@@ -2,28 +2,37 @@
 
 HTMX se usa solo en run-now para no recargar la pagina entera.
 """
+from datetime import timedelta
+
 from django.conf import settings
-from django.contrib.auth.decorators import login_required
+from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib import messages
 from django.core.paginator import Paginator
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 from django.views.decorators.http import require_POST
 from django_celery_beat.models import PeriodicTask
 
+from app import crypto
 from app.email_utils import send_error_report
 from app.forms import (
     DailyReportsConfigForm,
+    DCICredentialsForm,
     RecipientForm,
     ScheduleForm,
     WeeklyReportConfigForm,
     WeeklyScheduleForm,
 )
 from app.models import AppConfig, Recipient, Run
-from app.tasks import download_dci_reports
+from app.tasks import download_dci_reports, test_dci_login
 
 DAILY_TASK_NAME = "download-dci-reports-daily"
 WEEKLY_TASK_NAME = "download-dci-reports-weekly"
+
+# Portal credentials are sensitive: their views are gated to superusers
+# (user_passes_test respects LOGIN_URL, unlike staff_member_required).
+superuser_required = user_passes_test(lambda u: u.is_superuser)
 
 
 @login_required
@@ -117,6 +126,12 @@ def settings_view(request):
             "report_1_name": settings.DCI_REPORT_BUTTON_NAME,
             "report_2_name": settings.DCI_REPORT_BUTTON_NAME_2,
             "report_3_name": settings.DCI_REPORT_BUTTON_NAME_3,
+            "credentials_form": DCICredentialsForm(instance=config),
+            "config": config,
+            "encryption_available": crypto.is_available(),
+            "credentials_polling": (
+                config.dci_test_status == AppConfig.TestStatus.RUNNING
+            ),
             "active_tab": "reports",
         },
     )
@@ -171,3 +186,66 @@ def recipient_toggle(request, pk: int):
     state = "enabled" if recipient.active else "disabled"
     messages.success(request, f"Recipient {recipient.email} {state}.")
     return redirect("/settings/#recipients")
+
+
+@login_required
+@superuser_required
+@require_POST
+def dci_credentials_save(request):
+    config = AppConfig.load()
+    if not crypto.is_available():
+        messages.error(
+            request,
+            "Encryption key not configured (FIELD_ENCRYPTION_KEY) — cannot store "
+            "the portal password.",
+        )
+        return redirect("/settings/#credentials")
+    form = DCICredentialsForm(request.POST, instance=config)
+    if form.is_valid():
+        form.save()
+        messages.success(request, "DCI credentials saved.")
+    else:
+        first_error = next(iter(form.errors.values()))[0]
+        messages.error(request, first_error)
+    return redirect("/settings/#credentials")
+
+
+@login_required
+@superuser_required
+@require_POST
+def dci_test(request):
+    config = AppConfig.load()
+    config.dci_test_status = AppConfig.TestStatus.RUNNING
+    config.dci_test_message = ""
+    config.dci_test_at = timezone.now()
+    # update_fields: don't rewrite the whole singleton (avoids clobbering a
+    # concurrent credentials save with this stale in-memory copy).
+    config.save(update_fields=["dci_test_status", "dci_test_message", "dci_test_at"])
+    test_dci_login.delay()
+    return render(
+        request, "_dci_test_status.html", {"config": config, "polling": True}
+    )
+
+
+@login_required
+@superuser_required
+def dci_test_status(request):
+    config = AppConfig.load()
+    polling = config.dci_test_status == AppConfig.TestStatus.RUNNING
+    # Failsafe: if it's stuck in "running" but the task never finished (worker
+    # down / dead task), don't poll forever — after 5 min call it timed out.
+    if polling and config.dci_test_at and (
+        timezone.now() - config.dci_test_at > timedelta(minutes=5)
+    ):
+        config.dci_test_status = AppConfig.TestStatus.FAILED
+        config.dci_test_message = (
+            "The test didn't finish in time — is the worker running? Try again."
+        )
+        config.dci_test_at = timezone.now()
+        config.save(
+            update_fields=["dci_test_status", "dci_test_message", "dci_test_at"]
+        )
+        polling = False
+    return render(
+        request, "_dci_test_status.html", {"config": config, "polling": polling}
+    )

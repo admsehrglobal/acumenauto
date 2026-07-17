@@ -176,6 +176,25 @@ async def _xcore_login(page: Page, username: str, password: str) -> None:
     await page.wait_for_url(lambda url: "/Account/Login" not in url)
 
 
+async def test_login(username: str, password: str) -> None:
+    """Credential smoke test: runs the SAME auth chain as a real run (portal login
+    + opening the Advanced Insights popup + xcore SSO if needed), without
+    downloading any report. Raises if anything fails (e.g. wrong credentials -> the
+    'Advanced Insights' link never appears and _login times out); returns nothing
+    on success."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(accept_downloads=True, locale="en-US")
+        context.set_default_timeout(60000)
+        try:
+            page = await context.new_page()
+            await _login(page, username, password)
+            await _open_reports_popup(page, username, password)
+        finally:
+            await context.close()
+            await browser.close()
+
+
 async def _open_report_iframe(
     page: Page,
     button_name: str,

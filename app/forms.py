@@ -98,3 +98,45 @@ class WeeklyReportConfigForm(forms.ModelForm):
         if not 1 <= n <= 20:
             raise forms.ValidationError("Must be between 1 and 20.")
         return n
+
+
+class DCICredentialsForm(forms.ModelForm):
+    """DCI portal credentials. The password field is optional: blank = keep the
+    currently stored one (not re-prompted). When set, the model encrypts it via
+    the `dci_password` property."""
+
+    dci_password = forms.CharField(
+        label="Password",
+        required=False,
+        widget=forms.PasswordInput(
+            attrs={
+                "class": _INPUT_CLASS,
+                "placeholder": "•••••••• (leave blank to keep current)",
+                "autocomplete": "new-password",
+                "id": "id_dci_password",
+            }
+        ),
+        help_text="Leave blank to keep the current password.",
+    )
+
+    class Meta:
+        model = AppConfig
+        fields = ["dci_username"]
+        widgets = {
+            "dci_username": forms.TextInput(
+                attrs={
+                    "class": _INPUT_CLASS,
+                    "autocomplete": "username",
+                    "placeholder": "portal username",
+                }
+            ),
+        }
+
+    def save(self, commit: bool = True) -> AppConfig:
+        obj = super().save(commit=False)
+        raw = self.cleaned_data.get("dci_password")
+        if raw:
+            obj.dci_password = raw  # property setter -> cifra
+        if commit:
+            obj.save()
+        return obj

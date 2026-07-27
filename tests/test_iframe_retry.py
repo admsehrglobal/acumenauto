@@ -50,9 +50,9 @@ class _FakePage:
         self.attempt += 1  # cada click al boton = nuevo intento
         return _FakeLocator(self, "button")
 
-    async def reload(self, wait_until=None):
+    async def reload(self, wait_until=None, timeout=None):
         self.reloads += 1
-        self.calls.append(("reload", wait_until))
+        self.calls.append(("reload", wait_until, timeout))
 
     def _clicks(self):
         return sum(1 for c in self.calls if c == ("click", "button"))
@@ -74,6 +74,15 @@ class IframeRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame, "FRAME-iframe")
         self.assertEqual(page.reloads, 2)
         self.assertEqual(page._clicks(), 3)
+
+    async def test_reload_uses_domcontentloaded_and_the_iframe_budget(self):
+        """El reload de recovery no espera "load" (en esta SPA puede tardar >60s y
+        hacer fallar el propio reload) y usa el mismo budget que el iframe. El stub
+        de reload no aceptaba `timeout` y estos tests quedaron rotos al agregarlo,
+        asi que lo fijamos aca."""
+        page = _FakePage(succeed_on=2)
+        await _open_report_iframe(page, "Report", attempts=3, timeout_ms=1234)
+        self.assertIn(("reload", "domcontentloaded", 1234), page.calls)
 
     async def test_raises_after_exhausting_attempts(self):
         """Nunca monta: levanta el timeout tras agotar intentos, sin recarga extra."""

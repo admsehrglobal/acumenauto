@@ -98,6 +98,21 @@ class MergeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _merge_xlsx_files([], self.d / "x.xlsx")
 
+    def test_merges_into_a_single_file(self):
+        """Un solo adjunto por reporte: no se puede partir en varios mails porque
+        el servicio que consume el inbox los toma como transacciones distintas."""
+        p1 = self.d / "c1.xlsx"
+        p2 = self.d / "c2.xlsx"
+        _make_xlsx(p1, [_row(f"A{i}", dt.datetime(2025, 8, 1)) for i in range(15)])
+        _make_xlsx(p2, [_row(f"B{i}", dt.datetime(2025, 9, 1)) for i in range(15)])
+        out = self.d / "merged.xlsx"
+        self.assertEqual(_merge_xlsx_files([p1, p2], out), out)
+        self.assertEqual(len(list(self.d.glob("merged*.xlsx"))), 1)
+        pas = [r[2] for r in _read(out)[1]]
+        self.assertEqual(
+            pas, [f"A{i}" for i in range(15)] + [f"B{i}" for i in range(15)]
+        )
+
 
 class ChunkRangeTests(unittest.TestCase):
     def test_contiguous_no_gaps_no_overlaps_covers_full_range(self):

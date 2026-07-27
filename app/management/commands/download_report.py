@@ -70,6 +70,10 @@ class Command(BaseCommand):
                     None,  # tab_name: R1 no tiene tabs
                     True,  # single_slicer: un solo date slicer
                     False,  # full_range: R1 clampea end_date a hoy (no hay pagos futuros)
+                    # reset_slicers: el blank de Aging Category (las entries ya
+                    # procesadas) quedo destildado en el portal y el export perdia
+                    # el 98.9% de las filas. Lo limpiamos en cada corrida.
+                    ("Aging Category",),
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.
@@ -92,6 +96,7 @@ class Command(BaseCommand):
                     # tambien los programados a futuro (Paul los quiere — plata
                     # agendada real hasta el fondo del slicer, confirmado 2026-06-15).
                     True,
+                    (),  # reset_slicers: R3 no tiene dropdown slicers que limpiar
                 )
             )
 

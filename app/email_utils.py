@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 BREVO_CONNECT_TIMEOUT = 10
 BREVO_READ_TIMEOUT = 60
 
+# Brevo rechaza el mail entero con MESSAGE_SIZE_EXCEEDED arriba de 20MB, medidos
+# sobre el payload YA codificado en base64 (que infla 4/3, o sea ~15MB de archivo).
+# Restamos un margen para headers + cuerpo. R1 rozo el limite apenas se arreglo el
+# slicer de Aging Category y volvera a rozarlo mientras siga creciendo, asi que
+# chequeamos antes de mandar: el Run queda FAILED con un mensaje que dice que pasa,
+# en vez de un 400 opaco de la API.
+BREVO_MAX_MESSAGE_BYTES = 20 * 1024 * 1024
+BREVO_MESSAGE_OVERHEAD = 100 * 1024
+
 
 def _get_brevo_api_instance():
     config = Configuration()
@@ -63,10 +72,16 @@ def send_reports_email(
 
     api = _get_brevo_api_instance()
     for path, report_name in items:
-        attachment = SendSmtpEmailAttachment(
-            name=path.name,
-            content=base64.b64encode(path.read_bytes()).decode("ascii"),
-        )
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        if len(encoded) > BREVO_MAX_MESSAGE_BYTES - BREVO_MESSAGE_OVERHEAD:
+            raise ValueError(
+                f"{path.name}: el adjunto pesa {len(encoded) / 1048576:.1f}MB ya "
+                f"codificado y Brevo corta en {BREVO_MAX_MESSAGE_BYTES / 1048576:.0f}MB. "
+                f"El reporte crecio: hay que achicar el archivo o cambiar la forma "
+                f"de entregarlo (no se puede partir en varios mails, el servicio "
+                f"que consume el inbox los tomaria como transacciones distintas)."
+            )
+        attachment = SendSmtpEmailAttachment(name=path.name, content=encoded)
         html_content = (
             f"<p>DCI report attached: <strong>{report_name}</strong> "
             f"({subject_label}).</p>"

@@ -82,9 +82,10 @@ def send_reports_email(
             raise ValueError(
                 f"{path.name}: el adjunto pesa {len(encoded) / 1048576:.1f}MB ya "
                 f"codificado y Brevo corta en {BREVO_MAX_MESSAGE_BYTES / 1048576:.0f}MB. "
-                f"El reporte crecio: hay que achicar el archivo o cambiar la forma "
-                f"de entregarlo (no se puede partir en varios mails, el servicio "
-                f"que consume el inbox los tomaria como transacciones distintas)."
+                f"Los reportes chunked se parten solos en varios mails cuando no "
+                f"entran (ver _split_for_email en scraper.py), asi que llegar aca "
+                f"significa que es un reporte sin chunkear o un chunk que ya no se "
+                f"puede subdividir: hay que achicar el archivo."
             )
         attachment = SendSmtpEmailAttachment(name=path.name, content=encoded)
         html_content = (

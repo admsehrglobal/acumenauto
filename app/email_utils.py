@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from pathlib import Path
 
 import urllib3
@@ -55,7 +56,7 @@ def send_reports_email(
     recipients: list[str],
     subject_label: str,
     subject_override: str | None = None,
-) -> None:
+) -> list[tuple[str, str]]:
     """Manda un email separado por cada (path, report_name) a los recipients.
 
     Paul pidio un email por adjunto para que el inbox quede mas legible, asi que
@@ -66,10 +67,14 @@ def send_reports_email(
 
     `subject_override`: si se pasa, se usa tal cual como subject (sin prefijo ni
     timestamp). Ej: el reporte de accruals va con subject fijo 'Accrual Schedule'.
+
+    Devuelve [(report_name, message_id)] por mail aceptado por Brevo. Que la API
+    lo acepte NO significa que haya llegado: para eso esta `verify_delivery`.
     """
     if not recipients:
         raise ValueError("No recipients configured.")
 
+    sent: list[tuple[str, str]] = []
     api = _get_brevo_api_instance()
     for path, report_name in items:
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -101,10 +106,74 @@ def send_reports_email(
             attachment=[attachment],
         )
         response = api.send_transac_email(email)
-        logger.info(
-            "Report email sent (%s). Brevo message_id=%s",
+        logger.warning(
+            "Report email accepted by Brevo (%s). message_id=%s",
             report_name, response.message_id,
         )
+        sent.append((report_name, response.message_id))
+    return sent
+
+
+# Eventos terminales de Brevo. "delivered" es la unica confirmacion real de que el
+# mail entro al buzon; el resto son formas de no llegar. Ojo con `blocked`: Brevo
+# bloquea IPs de VPN/datacenter, que es un modo de falla real de este proyecto.
+DELIVERED_EVENT = "delivered"
+FAILURE_EVENTS = {
+    "hardBounces", "softBounces", "blocked", "spam", "invalid", "error", "deferred",
+}
+
+
+def verify_delivery(
+    sent: list[tuple[str, str]], timeout_s: int = 90, poll_s: int = 10
+) -> list[str]:
+    """Confirma contra Brevo que cada mail de `sent` llego, y devuelve la lista de
+    problemas (vacia = todo entregado).
+
+    Que `send_transac_email` no tire error solo significa que Brevo acepto el
+    mensaje, no que el destinatario lo tenga. Consultamos el event report por
+    message_id hasta ver un evento terminal o agotar `timeout_s` (los eventos
+    tardan segundos en aparecer, por eso el poll).
+    """
+    if not sent:
+        return []
+
+    api = _get_brevo_api_instance()
+    pending = {mid: name for name, mid in sent}
+    problems: list[str] = []
+    deadline = time.monotonic() + timeout_s
+
+    while pending:
+        for message_id in list(pending):
+            name = pending[message_id]
+            try:
+                report = api.get_email_event_report(message_id=message_id, limit=50)
+            except Exception as exc:  # noqa: BLE001 - no rompemos el run por esto
+                logger.warning(
+                    "[email] no pude consultar eventos de %s (%s): %s",
+                    name, message_id, exc,
+                )
+                continue
+            events = {e.event for e in (report.events or [])}
+            if DELIVERED_EVENT in events:
+                logger.warning("[email] %s entregado (message_id=%s)", name, message_id)
+                del pending[message_id]
+            elif events & FAILURE_EVENTS:
+                problems.append(
+                    f"{name}: Brevo lo acepto pero NO llego "
+                    f"({', '.join(sorted(events & FAILURE_EVENTS))}; "
+                    f"message_id={message_id})"
+                )
+                del pending[message_id]
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(poll_s)
+
+    for message_id, name in pending.items():
+        problems.append(
+            f"{name}: sin confirmacion de entrega despues de {timeout_s}s "
+            f"(message_id={message_id}) — revisar en el panel de Brevo"
+        )
+    return problems
 
 
 def send_error_report(run, reporter_username: str) -> None:

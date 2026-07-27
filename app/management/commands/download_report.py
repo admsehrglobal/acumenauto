@@ -7,7 +7,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from app.email_utils import send_reports_email
+from app.email_utils import send_error_report, send_reports_email, verify_delivery
 from app.models import AppConfig, Recipient, Run
 from app.scraper import download_reports
 
@@ -16,6 +16,20 @@ logger = logging.getLogger(__name__)
 # Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
 # que llegan al inbox sean legibles para Paul.
 CLIENT_TZ = ZoneInfo("America/New_York")
+
+
+def _notify_failure(run: Run) -> None:
+    """Avisa a SUPPORT_EMAIL de un run fallido.
+
+    `send_error_report` solo se disparaba a mano, desde un boton del dashboard, asi
+    que un fallo del cron se quedaba esperando a que alguien mirara y mientras tanto
+    Paul simplemente no recibia el reporte. Nunca dejamos que un error mandando el
+    aviso tape el error original del run.
+    """
+    try:
+        send_error_report(run, "scheduled run")
+    except Exception:  # noqa: BLE001 - el fallo real ya quedo en run.error_message
+        logger.exception("[email] no pude avisar del fallo del Run #%s", run.pk)
 
 
 class Command(BaseCommand):
@@ -125,6 +139,7 @@ class Command(BaseCommand):
                 run.error_message = "[email] No active recipients configured."
                 run.finished_at = timezone.now()
                 run.save()
+                _notify_failure(run)
                 raise CommandError("No active recipients configured.")
 
         # Entrega incremental: cada reporte se manda apenas esta listo, NO al
@@ -132,6 +147,9 @@ class Command(BaseCommand):
         # de un reporte se registra pero no aborta los demas.
         sent: list[str] = []
         send_errors: list[str] = []
+        # (report_name, brevo_message_id) por mail aceptado, para confirmar despues
+        # que ademas de aceptado haya llegado.
+        accepted: list[tuple[str, str]] = []
 
         def on_report_ready(path: Path, display_name: str) -> None:
             if no_email:
@@ -146,8 +164,11 @@ class Command(BaseCommand):
                 else None
             )
             try:
-                send_reports_email(
-                    [(path, display_name)], recipients, subject_label, subject_override
+                accepted.extend(
+                    send_reports_email(
+                        [(path, display_name)], recipients, subject_label,
+                        subject_override,
+                    )
                 )
                 sent.append(path.name)
                 logger.warning("[REPORT] Emailed %s", display_name)
@@ -178,16 +199,26 @@ class Command(BaseCommand):
             run.error_message = str(exc)
             run.finished_at = timezone.now()
             run.save()
+            _notify_failure(run)
             raise
 
+        # Que Brevo acepte el mail no es que haya llegado: confirmamos contra sus
+        # eventos antes de dar el run por bueno.
+        delivery_problems = verify_delivery(accepted)
+        for problem in delivery_problems:
+            logger.error("[email] %s", problem)
+
         run.filenames = ";".join(sent)
-        if send_errors:
+        failures = send_errors + delivery_problems
+        if failures:
             run.status = Run.Status.FAILED
-            run.error_message = "[email] " + " | ".join(send_errors)
+            run.error_message = "[email] " + " | ".join(failures)
         else:
             run.status = Run.Status.SUCCESS
         run.finished_at = timezone.now()
         run.save()
+        if failures:
+            _notify_failure(run)
 
         if no_email:
             self.stdout.write(
@@ -197,17 +228,17 @@ class Command(BaseCommand):
                     + "\n".join(f"  - {p}" for p, _ in items)
                 )
             )
-        elif send_errors:
+        elif failures:
             self.stdout.write(
                 self.style.WARNING(
                     f"Run #{run.pk}: enviados {len(sent)}, "
-                    f"{len(send_errors)} fallaron: {send_errors}"
+                    f"{len(failures)} con problemas: {failures}"
                 )
             )
         else:
             self.stdout.write(
                 self.style.SUCCESS(
                     f"Emailed {len(sent)} report(s) to "
-                    f"{', '.join(recipients)} (Run #{run.pk})."
+                    f"{', '.join(recipients)} (Run #{run.pk}), entrega confirmada."
                 )
             )

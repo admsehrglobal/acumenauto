@@ -42,7 +42,9 @@ async def download_reports(
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_reports: list[tuple[str, str, int, dt.date, str | None, bool, bool]] = (),
+    chunked_reports: list[
+        tuple[str, str, int, dt.date, str | None, bool, bool, tuple[str, ...]]
+    ] = (),
     on_report_ready=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
@@ -50,11 +52,13 @@ async def download_reports(
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
     de fechas: (url, button_name, n_chunks, today, tab_name, single_slicer,
-    full_range). `tab_name` es el tab a abrir antes de chunkear (None si el
-    reporte no tiene tabs, ej. R1 Vendor Payment Activity). `single_slicer` es
-    True cuando el reporte tiene un solo date range slicer (R1); False cuando
-    tiene dos y hay que identificar el correcto (R3, ver
-    `_identify_accrual_slicer`).
+    full_range, reset_slicers). `tab_name` es el tab a abrir antes de chunkear
+    (None si el reporte no tiene tabs, ej. R1 Vendor Payment Activity).
+    `single_slicer` es True cuando el reporte tiene un solo date range slicer
+    (R1); False cuando tiene dos y hay que identificar el correcto (R3, ver
+    `_identify_accrual_slicer`). `reset_slicers` son los aria-labels de los
+    dropdown slicers que hay que dejar sin filtro antes de exportar (ver
+    `_clear_slicer_filter`).
     El rango de fechas se determina asi: start_date = lo mas anterior que
     permita el PBI (MIN del slicer, leido del aria-label). `full_range` define
     el end_date: True (R3) usa el MAX del slicer tal cual (incluye accruals
@@ -109,7 +113,7 @@ async def download_reports(
 
             for spec in chunked_reports:
                 (url, button_name, n_chunks, today, tab_name,
-                 single_slicer, full_range) = spec
+                 single_slicer, full_range, reset_slicers) = spec
                 await report_page.goto(url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 chunked_items = await _export_chunked_report(
@@ -122,6 +126,7 @@ async def download_reports(
                     tab_name=tab_name,
                     single_slicer=single_slicer,
                     full_range=full_range,
+                    reset_slicers=reset_slicers,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -270,6 +275,7 @@ async def _export_chunked_report(
     tab_name: str | None = None,
     single_slicer: bool = False,
     full_range: bool = False,
+    reset_slicers: tuple[str, ...] = (),
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -306,6 +312,11 @@ async def _export_chunked_report(
     # tabs (tab_name=None) → se saltea.
     if tab_name is not None:
         await iframe.get_by_role("tab", name=tab_name).click()
+
+    # Los dropdown slicers arrastran la seleccion que dejo el ultimo humano en el
+    # portal; los limpiamos antes de exportar (ver _clear_slicer_filter).
+    for slicer_label in reset_slicers:
+        await _clear_slicer_filter(page, iframe, slicer_label)
 
     # Esperamos a que carguen todos los date inputs antes de leer el slicer.
     # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
@@ -490,71 +501,58 @@ def _merge_xlsx_files(
     devuelve las mismas columnas para el mismo visual, independiente del
     filtro de fechas).
 
-    Motor: calamine (Rust) para leer + xlsxwriter `constant_memory` para
-    escribir. Antes era openpyxl (read_only + write_only): correcto pero ~3x
-    mas lento en CPU; en el worker shared-cpu de Fly un merge de 157k filas
-    tardaba ~9 min y chocaba con el time limit de Celery (25 min). calamine lee
-    ~10x mas rapido y xlsxwriter escribe ~2x mas rapido, manteniendo la RAM baja
-    (~140MB peak, sigue siendo seguro con Chromium corriendo en el worker 2GB).
-    Benchmark 157k filas: 108s -> 38s.
+    Motor: calamine (Rust) para leer + xlsxwriter para escribir. Antes era
+    openpyxl (read_only + write_only): correcto pero ~3x mas lento en CPU; en el
+    worker shared-cpu de Fly un merge de 157k filas tardaba ~9 min y chocaba con
+    el time limit de Celery. calamine lee ~10x mas rapido y xlsxwriter escribe
+    ~2x mas rapido. Benchmark 157k filas: 108s -> 38s.
+
+    Escribimos CON shared strings (o sea, sin `constant_memory`): al arreglarse el
+    slicer de Aging Category R1 paso de 2.5k a 210k filas, y con los strings
+    inline el archivo daba 15.09MB -> 20.12MB en base64, arriba del cap de 20MB
+    de Brevo (MESSAGE_SIZE_EXCEEDED, verificado 2026-07-26). Las shared strings
+    dedupean los valores repetidos (client name, service code, status se repiten
+    210k veces) y lo dejan en 12.34MB -> 16.45MB en base64. No podemos partir el
+    reporte en varios mails: el servicio que consume el inbox tomaria cada uno
+    como una transaccion distinta. Cuesta RAM (pico ~650MB vs ~330MB, medido con
+    210k filas) pero no tiempo (33.5s vs 35.8s).
     """
     if not paths:
         raise ValueError("No paths to merge")
 
-    out_wb = xlsxwriter.Workbook(str(output_path), {"constant_memory": True})
-    out_ws = out_wb.add_worksheet()
-    # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
-    # Paul no vea un cambio de presentacion en las columnas de fecha.
-    fmt_datetime = out_wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
-    fmt_date = out_wb.add_format({"num_format": "yyyy-mm-dd"})
-
-    def _write_row(r: int, values) -> None:
-        for c, v in enumerate(values):
-            if isinstance(v, dt.datetime):
-                out_ws.write_datetime(r, c, v, fmt_datetime)
-            elif isinstance(v, dt.date):
-                out_ws.write_datetime(r, c, v, fmt_date)
-            else:
-                out_ws.write(r, c, v)
-
-    canonical_header: list | None = None
-    out_row = 0
-    total_rows = 0
-
-    for path in paths:
-        sheet = python_calamine.CalamineWorkbook.from_path(
+    def _read(path: Path) -> list:
+        return python_calamine.CalamineWorkbook.from_path(
             str(path)
-        ).get_sheet_by_index(0)
-        rows = sheet.to_python(skip_empty_area=True)
-        if not rows or not any(c not in (None, "") for c in rows[0]):
-            raise ValueError(f"{path.name}: archivo vacio (sin header)")
-        header = rows[0]
-        if canonical_header is None:
-            canonical_header = header
-            _write_row(out_row, header)
-            out_row += 1
-        elif header != canonical_header:
-            raise ValueError(
-                f"{path.name}: header no matchea con el primer chunk "
-                f"({header!r} vs {canonical_header!r})"
-            )
+        ).get_sheet_by_index(0).to_python(skip_empty_area=True)
+
+    def _data_rows(rows: list):
+        """Las filas que el merge escribe: todo menos el header y la fila que
+        Power BI inyecta al final de cada export con el filtro aplicado (ej:
+        "Applied filters: EndDate is on or after X and is before Y")."""
         for row in rows[1:]:
-            # Power BI inyecta una fila al final de cada export con el filtro
-            # aplicado (ej: "Applied filters: EndDate is on or after X and is
-            # before Y"). La salteamos para que el archivo final tenga solo data.
             first = row[0] if row else None
             if isinstance(first, str) and first.startswith("Applied filters:"):
                 continue
-            _write_row(out_row, row)
-            out_row += 1
-            total_rows += 1
+            yield row
 
-    logger.warning(
-        "[REPORT chunked] Merged %d files -> %s (%d data rows, %d cols)",
-        len(paths), output_path.name, total_rows,
-        len(canonical_header) if canonical_header else 0,
-    )
-    out_wb.close()
+    # Primera pasada: validamos los chunks y contamos, para saber en cuantos
+    # archivos hay que partir antes de empezar a escribir (asi los nombramos
+    # "part i of N" de una y cortamos parejo).
+    canonical_header: list | None = None
+    total_rows = 0
+    for path in paths:
+        rows = _read(path)
+        if not rows or not any(c not in (None, "") for c in rows[0]):
+            raise ValueError(f"{path.name}: archivo vacio (sin header)")
+        if canonical_header is None:
+            canonical_header = rows[0]
+        elif rows[0] != canonical_header:
+            raise ValueError(
+                f"{path.name}: header no matchea con el primer chunk "
+                f"({rows[0]!r} vs {canonical_header!r})"
+            )
+        total_rows += sum(1 for _ in _data_rows(rows))
+
     # Guard a nivel reporte: sub-rangos vacios individuales son validos (el
     # chunking adaptativo puede generarlos), pero un merge con 0 filas en TOTAL
     # significa que el reporte salio vacio (filtro no aplicado / sesion caida).
@@ -562,6 +560,37 @@ def _merge_xlsx_files(
         raise ValueError(
             f"{output_path.name}: merge produjo 0 data rows — reporte vacio"
         )
+
+    out_wb = xlsxwriter.Workbook(str(output_path))
+    out_ws = out_wb.add_worksheet()
+    # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
+    # Paul no vea un cambio de presentacion en las columnas de fecha.
+    fmt_datetime = out_wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+    fmt_date = out_wb.add_format({"num_format": "yyyy-mm-dd"})
+    out_row = 0
+
+    def _write_row(values) -> None:
+        nonlocal out_row
+        for c, v in enumerate(values):
+            if isinstance(v, dt.datetime):
+                out_ws.write_datetime(out_row, c, v, fmt_datetime)
+            elif isinstance(v, dt.date):
+                out_ws.write_datetime(out_row, c, v, fmt_date)
+            else:
+                out_ws.write(out_row, c, v)
+        out_row += 1
+
+    _write_row(canonical_header)
+    for path in paths:
+        for row in _data_rows(_read(path)):
+            _write_row(row)
+    out_wb.close()
+
+    logger.warning(
+        "[REPORT chunked] Merged %d chunks -> %s (%d data rows, %d cols, %.1fMB)",
+        len(paths), output_path.name, total_rows, len(canonical_header),
+        output_path.stat().st_size / 1048576,
+    )
     return output_path
 
 
@@ -684,6 +713,52 @@ async def _set_date_filter(
     # listo". Esperar un poco evita exportar mientras el visual aun esta
     # re-rendereando con los datos viejos.
     await asyncio.sleep(3)
+
+
+async def _clear_slicer_filter(page: Page, iframe, slicer_label: str) -> None:
+    """Leave a dropdown slicer applying no filter, so the export can't inherit a
+    selection somebody left behind in the portal.
+
+    Power BI persists slicer selections per user, and the scraper signs in as the
+    same DCI account a human browses with. On R1 the blank Aging Category value
+    (the entries that carry no aging: Paid / Rejected / Approved / Canceled) was
+    left unchecked, and the export silently lost 98.9% of its rows — 1,084
+    instead of 99,708 for the same date window. The only trace was an
+    "Aging Category is not " line in the export's applied-filters row.
+
+    The slicer restates as "All" whenever it applies no filter, both when every
+    value is checked and when none is; from a partial selection a single click on
+    "Select all" (the first popup entry) clears them all, which lands on that
+    same unfiltered state (measured against the live report 2026-07-26). We
+    assert the restatement afterwards because a wrong state here is silent: the
+    file still looks well-formed, only much shorter.
+    """
+    menu = iframe.locator(f'.slicer-dropdown-menu[aria-label="{slicer_label}"]')
+    restatement = (await menu.inner_text()).strip()
+    if restatement == "All":
+        return
+
+    logger.warning(
+        "[REPORT] Slicer %r came up as %r — clearing it before exporting",
+        slicer_label, restatement,
+    )
+    await menu.click(force=True)
+    await asyncio.sleep(2)
+    await iframe.locator(
+        ".slicer-dropdown-popup:visible .slicerItemContainer"
+    ).first.click(force=True)
+    await asyncio.sleep(5)
+    # Close the popup so it can't sit on top of the visual we export next.
+    await page.keyboard.press("Escape")
+    await asyncio.sleep(1)
+
+    final = (await menu.inner_text()).strip()
+    if final != "All":
+        raise ValueError(
+            f"Slicer {slicer_label!r} still filters the report ({final!r}) — "
+            f"aborting rather than exporting a silently truncated file"
+        )
+    logger.warning("[REPORT] Slicer %r cleared (now 'All')", slicer_label)
 
 
 _LABEL_RANGE_RE = re.compile(r"Available input range (\S+) to (\S+)$")

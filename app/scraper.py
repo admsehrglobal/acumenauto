@@ -8,8 +8,8 @@ del reporte -> exporta el iframe de Power BI a Excel.
 El reporte 3 (Vendor Authorization Accrual Balances) excede 150k filas/export
 asi que se baja en N chunks: click una sola vez al boton, despues loop
 seteando el date filter (textbox Angular Material) y exportando cada rango.
-Los N chunks se mergean en un unico xlsx antes de devolver, para que el
-cliente reciba un solo adjunto en lugar de N emails separados.
+The N chunks are merged into a single xlsx before returning. If that file is
+too big for one email, it is rebuilt as several files (see `_split_for_email`).
 
 Selectores relevados con `playwright codegen` (reporte 1: 2026-04-24,
 reporte 2: 2026-04-27, reporte 3: 2026-05-10).
@@ -30,6 +30,8 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
+
+from app.email_utils import BREVO_MAX_MESSAGE_BYTES, BREVO_MESSAGE_OVERHEAD
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +374,11 @@ async def _export_chunked_report(
 
     slug = "_".join(button_name.lower().split())
 
+    # (start, end, data_rows) per exported part. `_split_for_email` needs it to
+    # group parts into files that fit an email and to label each file with its
+    # own date range. Parts the adaptive driver discards stay here unused.
+    part_meta: dict[Path, tuple[dt.date, dt.date, int]] = {}
+
     async def _export_one_range(chunk_start, chunk_end, seq):
         """Setea el filtro de fechas, exporta el visual a xlsx y devuelve
         (path, data_rows). Lo llama el driver adaptativo."""
@@ -424,6 +431,7 @@ async def _export_chunked_report(
         )
         await download.save_as(part_path)
         rows = _validate_chunk_xlsx(part_path)
+        part_meta[part_path] = (chunk_start, chunk_end, rows)
         logger.warning(
             "[REPORT chunked] Part %d (%s) OK (%d data rows)", seq, label, rows
         )
@@ -443,13 +451,22 @@ async def _export_chunked_report(
         f"_{timestamp_label}.xlsx"
     )
     _merge_xlsx_files(part_paths, merged_path)
+    outputs = _split_for_email(
+        merged_path,
+        part_paths,
+        part_meta,
+        (start_date, end_date),
+        output_dir,
+        slug,
+        timestamp_label,
+    )
     for p in part_paths:
         p.unlink(missing_ok=True)
 
-    display_name = (
-        f"{button_name} ({start_date.isoformat()} to {end_date.isoformat()})"
-    )
-    return [(merged_path, display_name)]
+    return [
+        (path, f"{button_name} ({first.isoformat()} to {last.isoformat()})")
+        for path, first, last in outputs
+    ]
 
 
 def _validate_chunk_xlsx(path: Path) -> int:
@@ -512,10 +529,10 @@ def _merge_xlsx_files(
     inline el archivo daba 15.09MB -> 20.12MB en base64, arriba del cap de 20MB
     de Brevo (MESSAGE_SIZE_EXCEEDED, verificado 2026-07-26). Las shared strings
     dedupean los valores repetidos (client name, service code, status se repiten
-    210k veces) y lo dejan en 12.34MB -> 16.45MB en base64. No podemos partir el
-    reporte en varios mails: el servicio que consume el inbox tomaria cada uno
-    como una transaccion distinta. Cuesta RAM (pico ~650MB vs ~330MB, medido con
-    210k filas) pero no tiempo (33.5s vs 35.8s).
+    210k veces) y lo dejan en 12.34MB -> 16.45MB en base64. Cuesta RAM (pico
+    ~650MB vs ~330MB, medido con 210k filas) pero no tiempo (33.5s vs 35.8s).
+    Once even that does not fit, `_split_for_email` rebuilds the report as
+    several files.
     """
     if not paths:
         raise ValueError("No paths to merge")
@@ -535,9 +552,8 @@ def _merge_xlsx_files(
                 continue
             yield row
 
-    # Primera pasada: validamos los chunks y contamos, para saber en cuantos
-    # archivos hay que partir antes de empezar a escribir (asi los nombramos
-    # "part i of N" de una y cortamos parejo).
+    # First pass: validate every chunk and count rows before writing anything,
+    # so a bad chunk aborts before we produce a half-written file.
     canonical_header: list | None = None
     total_rows = 0
     for path in paths:
@@ -592,6 +608,99 @@ def _merge_xlsx_files(
         output_path.stat().st_size / 1048576,
     )
     return output_path
+
+
+# Brevo rejects the whole message above 20MB measured on the base64 payload,
+# which inflates 4/3 — so this is what the attachment may weigh on disk.
+_ATTACHMENT_MAX_BYTES = (BREVO_MAX_MESSAGE_BYTES - BREVO_MESSAGE_OVERHEAD) * 3 // 4
+# When splitting we aim lower than the ceiling: the share of each chunk is an
+# estimate, and every output file repeats the shared-strings table instead of
+# amortizing it over the whole report.
+_ATTACHMENT_TARGET_BYTES = _ATTACHMENT_MAX_BYTES * 85 // 100
+
+
+def _split_for_email(
+    merged_path: Path,
+    parts: list[Path],
+    part_meta: dict[Path, tuple[dt.date, dt.date, int]],
+    report_range: tuple[dt.date, dt.date],
+    output_dir: Path,
+    slug: str,
+    timestamp_label: str,
+) -> list[tuple[Path, dt.date, dt.date]]:
+    """Return the files to email as [(path, range_start, range_end)].
+
+    While the merged report fits in one email it is returned untouched — one
+    report, one attachment, same subject as always. When it does not fit, the
+    chunks are packed into groups of consecutive date ranges and each group is
+    merged into its own file, so every email carries a contiguous slice of the
+    report and no row is lost. Paul confirmed on 2026-07-27 that the service
+    reading the inbox accepts several separate emails.
+
+    Splitting by chunk (not by row) is what keeps each file self-describing:
+    its date range goes into the filename and into the email subject, exactly
+    in the format a single-file run already uses.
+
+    Costs a second merge pass over the data (~2x the merge time), which only
+    happens on the runs that would otherwise be rejected by Brevo outright.
+    """
+    first_start, last_end = report_range
+    size = merged_path.stat().st_size
+    if size <= _ATTACHMENT_MAX_BYTES:
+        return [(merged_path, first_start, last_end)]
+
+    # Rows are the honest proxy for weight: every chunk has the same columns,
+    # so bytes scale with rows and we can size the groups off the merged file
+    # we just measured.
+    total_rows = max(sum(part_meta[p][2] for p in parts), 1)
+    rows_budget = max(int(_ATTACHMENT_TARGET_BYTES / (size / total_rows)), 1)
+
+    groups: list[list[Path]] = []
+    current: list[Path] = []
+    current_rows = 0
+    for path in parts:
+        rows = part_meta[path][2]
+        # Only a chunk that carries rows may close a group, and only over a
+        # group that already has some: adaptive chunking can produce empty
+        # sub-ranges, and a group of nothing but those would abort the merge.
+        if current and current_rows and rows and current_rows + rows > rows_budget:
+            groups.append(current)
+            current, current_rows = [], 0
+        current.append(path)
+        current_rows += rows
+
+    groups.append(current)
+
+    if len(groups) == 1:
+        # Everything lives in one chunk: there is nothing to regroup at this
+        # granularity. Let it go out as is — the guard in send_reports_email
+        # fails that one email with the reason instead of aborting the report.
+        logger.warning(
+            "[REPORT chunked] %s pesa %.1fMB (max %.1fMB) pero las filas estan "
+            "en un solo chunk: no se puede partir mas a esta granularidad",
+            merged_path.name, size / 1048576, _ATTACHMENT_MAX_BYTES / 1048576,
+        )
+        return [(merged_path, first_start, last_end)]
+
+    logger.warning(
+        "[REPORT chunked] %s pesa %.1fMB (max %.1fMB por mail): partiendo en %d "
+        "archivos de <= %d filas",
+        merged_path.name, size / 1048576, _ATTACHMENT_MAX_BYTES / 1048576,
+        len(groups), rows_budget,
+    )
+
+    outputs: list[tuple[Path, dt.date, dt.date]] = []
+    for group in groups:
+        group_start = part_meta[group[0]][0]
+        group_end = part_meta[group[-1]][1]
+        out_path = output_dir / (
+            f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
+            f"_{timestamp_label}.xlsx"
+        )
+        _merge_xlsx_files(group, out_path)
+        outputs.append((out_path, group_start, group_end))
+    merged_path.unlink(missing_ok=True)
+    return outputs
 
 
 # Power BI "Data with current layout" trunca SILENCIOSAMENTE a 150k filas. Si un

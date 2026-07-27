@@ -99,8 +99,9 @@ class MergeTests(unittest.TestCase):
             _merge_xlsx_files([], self.d / "x.xlsx")
 
     def test_merges_into_a_single_file(self):
-        """Un solo adjunto por reporte: no se puede partir en varios mails porque
-        el servicio que consume el inbox los toma como transacciones distintas."""
+        """El merge siempre escribe UN archivo con todos los chunks. Partirlo en
+        varios mails cuando no entra en uno es cosa de `_split_for_email`
+        (ver tests/test_attachment_split.py)."""
         p1 = self.d / "c1.xlsx"
         p2 = self.d / "c2.xlsx"
         _make_xlsx(p1, [_row(f"A{i}", dt.datetime(2025, 8, 1)) for i in range(15)])

@@ -37,8 +37,11 @@ class _FakeLocator:
 class _FakePage:
     """Stub minimo de playwright Page para ejercitar el retry sin browser."""
 
-    def __init__(self, succeed_on):
+    def __init__(self, succeed_on, reload_raises_until=0):
         self.succeed_on = succeed_on  # primer intento (1-based) en que monta el iframe
+        # Reload attempts (1-based) that time out, as they do in prod when the page
+        # is too wedged to reload. 0 = reload always succeeds.
+        self.reload_raises_until = reload_raises_until
         self.attempt = 0
         self.reloads = 0
         self.calls = []
@@ -53,6 +56,8 @@ class _FakePage:
     async def reload(self, wait_until=None, timeout=None):
         self.reloads += 1
         self.calls.append(("reload", wait_until, timeout))
+        if self.reloads <= self.reload_raises_until:
+            raise PlaywrightTimeoutError(f"Page.reload: Timeout {timeout}ms exceeded")
 
     def _clicks(self):
         return sum(1 for c in self.calls if c == ("click", "button"))
@@ -83,6 +88,27 @@ class IframeRetryTests(unittest.IsolatedAsyncioTestCase):
         page = _FakePage(succeed_on=2)
         await _open_report_iframe(page, "Report", attempts=3, timeout_ms=1234)
         self.assertIn(("reload", "domcontentloaded", 1234), page.calls)
+
+    async def test_a_timing_out_reload_does_not_kill_the_run(self):
+        """Regression (prod, jul 2026): a page too wedged to mount the iframe is
+        usually too wedged to reload, so the recovery reload timed out too and its
+        error escaped the helper — the run died on attempt 1 and the retry was void
+        exactly when it was needed (~12% of runs). A slow reload must burn one
+        attempt, not the whole run."""
+        page = _FakePage(succeed_on=3, reload_raises_until=99)
+        frame = await _open_report_iframe(page, "Report", attempts=3, timeout_ms=10)
+        self.assertEqual(frame, "FRAME-iframe")
+        self.assertEqual(page.reloads, 2)
+        self.assertEqual(page._clicks(), 3)
+
+    async def test_reload_failures_still_end_in_the_iframe_timeout(self):
+        """Swallowing the reload timeout must not swallow the terminal failure:
+        with every reload timing out and the iframe never mounting, the helper
+        still raises after the last attempt."""
+        page = _FakePage(succeed_on=99, reload_raises_until=99)
+        with self.assertRaises(PlaywrightTimeoutError):
+            await _open_report_iframe(page, "Report", attempts=3, timeout_ms=10)
+        self.assertEqual(page._clicks(), 3)
 
     async def test_raises_after_exhausting_attempts(self):
         """Nunca monta: levanta el timeout tras agotar intentos, sin recarga extra."""

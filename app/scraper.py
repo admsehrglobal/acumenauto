@@ -239,7 +239,18 @@ async def _open_report_iframe(
             # "load"): en esta SPA pesada el evento load puede tardar >60s y hacer
             # fallar el propio reload (default 60s); el click siguiente ya espera
             # a que el boton sea accionable. Usamos el mismo budget que el iframe.
-            await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+            except PlaywrightTimeoutError:
+                # A page too wedged to mount the PBI iframe is often too wedged to
+                # reload either, so both timeouts fire together. Letting the reload
+                # error escape would kill the run on attempt 1 and void the retry.
+                # Burn the attempt and re-click anyway.
+                logger.warning(
+                    "[REPORT] recovery reload timed out after %ds, "
+                    "re-clicking anyway (attempt %d/%d)",
+                    timeout_ms // 1000, attempt, attempts,
+                )
 
 
 async def _export_excel(

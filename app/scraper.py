@@ -143,7 +143,15 @@ async def download_reports(
 
 
 async def _login(page: Page, username: str, password: str) -> None:
-    await page.goto(PORTAL_URL)
+    response = await page.goto(PORTAL_URL)
+    # goto() does not raise on a 4xx/5xx or on a WAF challenge page, so without
+    # this line the only symptom of "the portal served something else" is a 60s
+    # timeout further down, with no record of what was on screen. Logged on every
+    # run, so a healthy login also leaves a baseline to compare against.
+    logger.warning(
+        "[LOGIN] status=%s url=%s title=%r",
+        response.status if response else None, page.url, await page.title(),
+    )
 
     # Modal opcional que aparece a veces pre-login.
     try:
@@ -151,8 +159,27 @@ async def _login(page: Page, username: str, password: str) -> None:
     except PlaywrightTimeoutError:
         pass
 
-    await page.get_by_role("textbox", name="Username*").fill(username)
-    await page.get_by_role("textbox", name="Password*").fill(password)
+    # Match the field names WITHOUT the trailing "*": the portal renders that
+    # asterisk from the label's CSS ::after, so it only reaches the accessibility
+    # tree while the stylesheet applies. Asking for "Username*" made login depend
+    # on a stylesheet loading — when it does not, the field is on screen and
+    # visible but the locator resolves to nothing, and fill() waits out the full
+    # 60s (runs #683/#685/#688, 2026-08-16). Playwright matches accessible names
+    # by substring, so dropping the "*" finds the field either way.
+    username_box = page.get_by_role("textbox", name="Username")
+    try:
+        await username_box.wait_for()
+    except PlaywrightTimeoutError as exc:
+        # run.error_message is stored untruncated and is pasted into the failure
+        # email, so naming the page in the exception is the only way this datum
+        # reaches us without Fly access: the /tmp/acumen dump is overwritten by
+        # the next failing run and dies with the machine.
+        raise RuntimeError(
+            f"Login page has no Username field. url={page.url} "
+            f"title={await page.title()!r}"
+        ) from exc
+    await username_box.fill(username)
+    await page.get_by_role("textbox", name="Password").fill(password)
     await page.get_by_role("button", name="Sign In").click()
 
     await page.get_by_role("link", name="Advanced Insights").wait_for()

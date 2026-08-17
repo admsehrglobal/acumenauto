@@ -26,14 +26,19 @@ logger = logging.getLogger(__name__)
 BREVO_CONNECT_TIMEOUT = 10
 BREVO_READ_TIMEOUT = 60
 
-# Brevo rechaza el mail entero con MESSAGE_SIZE_EXCEEDED arriba de 20MB, medidos
-# sobre el payload YA codificado en base64 (que infla 4/3, o sea ~15MB de archivo).
-# Restamos un margen para headers + cuerpo. R1 rozo el limite apenas se arreglo el
-# slicer de Aging Category y volvera a rozarlo mientras siga creciendo, asi que
-# chequeamos antes de mandar: el Run queda FAILED con un mensaje que dice que pasa,
-# en vez de un 400 opaco de la API.
-BREVO_MAX_MESSAGE_BYTES = 20 * 1024 * 1024
-BREVO_MESSAGE_OVERHEAD = 100 * 1024
+# Brevo rejects the whole message with MESSAGE_SIZE_EXCEEDED above "20MB", but it
+# documents neither the unit nor what it measures: the limit shows up only in a
+# help-center article ("including the attachments and email content"), never in the
+# API reference. Run #687 (2026-08-16) was rejected while sitting UNDER the old
+# threshold of 20,869,120 base64 bytes, so we now take the most pessimistic
+# reading: 20,000,000 decimal bytes on the assembled MIME message, whose base64
+# body is wrapped at 76 chars (RFC 2045, +2.63% with CRLF).
+# The reserve is no longer just headers + body: it has to absorb that wrapping,
+# which grows with the attachment instead of being a fixed cost — at the threshold
+# below the wrapping alone is worth ~500KB, where the old 100KB reserve covered
+# under a fifth of it.
+BREVO_MAX_MESSAGE_BYTES = 20_000_000
+BREVO_MESSAGE_OVERHEAD = 1_000_000
 
 
 def _get_brevo_api_instance():
@@ -81,7 +86,8 @@ def send_reports_email(
         if len(encoded) > BREVO_MAX_MESSAGE_BYTES - BREVO_MESSAGE_OVERHEAD:
             raise ValueError(
                 f"{path.name}: el adjunto pesa {len(encoded) / 1048576:.1f}MB ya "
-                f"codificado y Brevo corta en {BREVO_MAX_MESSAGE_BYTES / 1048576:.0f}MB. "
+                f"codificado y el techo seguro para Brevo es "
+                f"{(BREVO_MAX_MESSAGE_BYTES - BREVO_MESSAGE_OVERHEAD) / 1048576:.1f}MB. "
                 f"Los reportes chunked se parten solos en varios mails cuando no "
                 f"entran (ver _split_for_email en scraper.py), asi que llegar aca "
                 f"significa que es un reporte sin chunkear o un chunk que ya no se "
@@ -108,8 +114,8 @@ def send_reports_email(
         )
         response = api.send_transac_email(email)
         logger.warning(
-            "Report email accepted by Brevo (%s). message_id=%s",
-            report_name, response.message_id,
+            "Report email accepted by Brevo (%s, %.1fMB base64). message_id=%s",
+            report_name, len(encoded) / 1048576, response.message_id,
         )
         sent.append((report_name, response.message_id))
     return sent

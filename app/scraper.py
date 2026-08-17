@@ -31,8 +31,6 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from app.email_utils import BREVO_MAX_MESSAGE_BYTES, BREVO_MESSAGE_OVERHEAD
-
 logger = logging.getLogger(__name__)
 
 PORTAL_URL = "https://acumen.dcisoftware.com/"
@@ -648,9 +646,15 @@ def _merge_xlsx_files(
     return output_path
 
 
-# Brevo rejects the whole message above 20MB measured on the base64 payload,
-# which inflates 4/3 — so this is what the attachment may weigh on disk.
-_ATTACHMENT_MAX_BYTES = (BREVO_MAX_MESSAGE_BYTES - BREVO_MESSAGE_OVERHEAD) * 3 // 4
+# Largest merged report we email as a single attachment. Deliberately NOT derived
+# from the send guard in email_utils: while both were the same point, a file that
+# skipped splitting was by construction a file the guard also waved through, so the
+# guard protected nothing — that is how run #687 (2026-08-16) reached Brevo and was
+# rejected. This number is anchored to evidence instead: 13,000,000 on disk ->
+# 17,333,336 base64 -> 17,789,478 once MIME wraps it, still under the 18,151,406
+# byte message Brevo accepted on 2026-07-26. We never ship a size that has not
+# already worked, and the gap to the guard leaves it something to catch.
+_ATTACHMENT_MAX_BYTES = 13_000_000
 # When splitting we aim lower than the ceiling: the share of each chunk is an
 # estimate, and every output file repeats the shared-strings table instead of
 # amortizing it over the whole report.

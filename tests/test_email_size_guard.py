@@ -7,6 +7,7 @@ reporte crezca. Chequeamos antes de llamar a la API para que el Run falle con un
 mensaje que explica el problema en vez de un 400 opaco.
 """
 import base64
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,23 @@ class AttachmentSizeGuardTests(unittest.TestCase):
                 send_reports_email([(path, "R1")], ["a@b.com"], "label")
             api.return_value.send_transac_email.assert_not_called()
         self.assertIn("Brevo", str(ctx.exception))
+
+    def test_the_split_ceiling_stays_under_the_send_guard(self):
+        """Run #687 (2026-08-16): the split ceiling and this guard sat on the same
+        byte, so a file that skipped splitting could never be caught here and went
+        straight to Brevo, which rejected it. The biggest file we can ever send
+        must stay under the guard, and under 20,000,000 once MIME wraps its base64
+        at 76 chars (RFC 2045)."""
+        from app.scraper import _ATTACHMENT_MAX_BYTES
+
+        # base64 length is 4*ceil(n/3) exactly, not the n*4/3 approximation.
+        encoded = 4 * math.ceil(_ATTACHMENT_MAX_BYTES / 3)
+        self.assertLess(
+            encoded,
+            email_utils.BREVO_MAX_MESSAGE_BYTES - email_utils.BREVO_MESSAGE_OVERHEAD,
+        )
+        wrapped = encoded + 2 * math.ceil(encoded / 76)
+        self.assertLessEqual(wrapped, 20_000_000)
 
     def test_sends_when_it_fits(self):
         path = self._file(1024)

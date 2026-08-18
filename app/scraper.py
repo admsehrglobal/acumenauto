@@ -35,6 +35,22 @@ logger = logging.getLogger(__name__)
 
 PORTAL_URL = "https://acumen.dcisoftware.com/"
 
+# The portal's gateway answers 5xx on its own from time to time: runs #693, #695
+# and #696 (2026-08-17 19:00 through 2026-08-18 00:00 UTC) each got a 504 with a
+# 'Service unavailable' error page, while the same task replayed by hand at 19:52
+# logged in fine and direct probes from this worker answered 200 in under half a
+# second. So the portal is not down, it fails briefly and recovers — and without a
+# retry each of those blips costs a whole run and mails the client a failure.
+#
+# Five tries cap the added wait at ~2 minutes. That is nothing against the 40 min
+# Celery hard limit, and it is deliberately more than the blip we can prove: we
+# have never measured how long one of these 5xx windows lasts, only that the
+# portal was healthy 52 minutes after the first one. If a run still fails after
+# two minutes of retrying, that is a real outage and the failure mail is earned.
+# The `attempt=N/M` in the log line is what will let us measure it.
+LOGIN_5XX_ATTEMPTS = 5
+LOGIN_5XX_BACKOFF_S = 30
+
 
 async def download_reports(
     username: str,
@@ -141,15 +157,28 @@ async def download_reports(
 
 
 async def _login(page: Page, username: str, password: str) -> None:
-    response = await page.goto(PORTAL_URL)
-    # goto() does not raise on a 4xx/5xx or on a WAF challenge page, so without
-    # this line the only symptom of "the portal served something else" is a 60s
-    # timeout further down, with no record of what was on screen. Logged on every
-    # run, so a healthy login also leaves a baseline to compare against.
-    logger.warning(
-        "[LOGIN] status=%s url=%s title=%r",
-        response.status if response else None, page.url, await page.title(),
-    )
+    for attempt in range(1, LOGIN_5XX_ATTEMPTS + 1):
+        response = await page.goto(PORTAL_URL)
+        # goto() does not raise on a 4xx/5xx or on a WAF challenge page, so
+        # without this line the only symptom of "the portal served something
+        # else" is a 60s timeout further down, with no record of what was on
+        # screen. Logged on every run, so a healthy login also leaves a baseline
+        # to compare against.
+        status = response.status if response else None
+        logger.warning(
+            "[LOGIN] status=%s url=%s title=%r attempt=%d/%d",
+            status, page.url, await page.title(), attempt, LOGIN_5XX_ATTEMPTS,
+        )
+        # Only 5xx is worth retrying: it means the portal itself failed to serve
+        # the page. A 4xx (WAF challenge, blocked IP) would answer the same way
+        # every time, and falling through gives the descriptive error below.
+        if status is None or status < 500 or attempt == LOGIN_5XX_ATTEMPTS:
+            break
+        logger.warning(
+            "[LOGIN] portal returned %s, retrying in %ds", status,
+            LOGIN_5XX_BACKOFF_S,
+        )
+        await asyncio.sleep(LOGIN_5XX_BACKOFF_S)
 
     # Modal opcional que aparece a veces pre-login.
     try:

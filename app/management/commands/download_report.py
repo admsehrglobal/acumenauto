@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -9,13 +10,27 @@ from django.utils import timezone
 
 from app.email_utils import send_error_report, send_reports_email, verify_delivery
 from app.models import AppConfig, Recipient, Run
-from app.scraper import download_reports
+from app.invoice_split import PILE_PAYABLE, subject_override_for
+from app.scraper import ChunkedReport, download_reports
 
 logger = logging.getLogger(__name__)
 
 # Cliente americano (TCG) — timestamp en ET para que los nombres de archivo
 # que llegan al inbox sean legibles para Paul.
 CLIENT_TZ = ZoneInfo("America/New_York")
+
+# Gap between the rejected pile and the payable one. Paul loads the rejections
+# first so an invoice resubmitted to Acumen ends up with the right final status
+# in ZipRide; Juan asked for 20 minutes on 2026-08-27 (he had been offered 5).
+#
+# The wait sits in this command, after Playwright has closed and inside the try,
+# which is what keeps it honest: a run that overruns is marked FAILED by Celery's
+# soft limit instead of leaving a zombie holding the worker. It fits — the daily
+# run measured between 48s and 567s over the last month, so the worst case is
+# about 29.5 minutes against a 38 minute soft limit. The margin is 8.5 minutes
+# rather than the 28 we had, and a deploy landing inside the window costs the
+# payable pile for that run.
+INVOICE_PILE_GAP_S = 20 * 60
 
 
 def _notify_failure(run: Run) -> None:
@@ -76,18 +91,20 @@ class Command(BaseCommand):
         # date range slicer, sin tabs.
         if config.report_1_enabled and 1 in filter_ids:
             chunked_reports.append(
-                (
-                    settings.DCI_REPORT_URL,
-                    settings.DCI_REPORT_BUTTON_NAME,
-                    config.date_range_chunks,
-                    nj_started.date(),
-                    None,  # tab_name: R1 no tiene tabs
-                    True,  # single_slicer: un solo date slicer
-                    False,  # full_range: R1 clampea end_date a hoy (no hay pagos futuros)
-                    # reset_slicers: el blank de Aging Category (las entries ya
-                    # procesadas) quedo destildado en el portal y el export perdia
-                    # el 98.9% de las filas. Lo limpiamos en cada corrida.
-                    ("Aging Category",),
+                ChunkedReport(
+                    url=settings.DCI_REPORT_URL,
+                    button_name=settings.DCI_REPORT_BUTTON_NAME,
+                    n_chunks=config.date_range_chunks,
+                    today=nj_started.date(),
+                    tab_name=None,  # R1 no tiene tabs
+                    single_slicer=True,  # un solo date slicer
+                    full_range=False,  # clampea end_date a hoy (no hay pagos futuros)
+                    # el blank de Aging Category (las entries ya procesadas) quedo
+                    # destildado en el portal y el export perdia el 98.9% de las
+                    # filas. Lo limpiamos en cada corrida.
+                    reset_slicers=("Aging Category",),
+                    # R1 es el invoice file: sale como dos entregas.
+                    invoice_split=True,
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.
@@ -98,19 +115,21 @@ class Command(BaseCommand):
         # R3 (Vendor Auth Accrual): tab con detalle PA + 2 date slicers.
         if config.report_3_enabled and 3 in filter_ids:
             chunked_reports.append(
-                (
-                    settings.DCI_REPORT_URL_3,
-                    settings.DCI_REPORT_BUTTON_NAME_3,
-                    config.date_range_chunks,
-                    nj_started.date(),
-                    "PA Details and Schedule by",  # tab_name
-                    False,  # single_slicer: 2 slicers, identificar el correcto
-                    # full_range: chunkeamos la PA End Date hasta el MAX del slicer
-                    # (no perder PAs vigentes) e incluimos TODOS los accruals,
-                    # tambien los programados a futuro (Paul los quiere — plata
-                    # agendada real hasta el fondo del slicer, confirmado 2026-06-15).
-                    True,
-                    (),  # reset_slicers: R3 no tiene dropdown slicers que limpiar
+                ChunkedReport(
+                    url=settings.DCI_REPORT_URL_3,
+                    button_name=settings.DCI_REPORT_BUTTON_NAME_3,
+                    n_chunks=config.date_range_chunks,
+                    today=nj_started.date(),
+                    tab_name="PA Details and Schedule by",
+                    single_slicer=False,  # 2 slicers, identificar el correcto
+                    # chunkeamos la PA End Date hasta el MAX del slicer (no perder
+                    # PAs vigentes) e incluimos TODOS los accruals, tambien los
+                    # programados a futuro (Paul los quiere — plata agendada real
+                    # hasta el fondo del slicer, confirmado 2026-06-15).
+                    full_range=True,
+                    reset_slicers=(),  # R3 no tiene dropdown slicers que limpiar
+                    # R3 no tiene columna Status: un split lo dejaria en cero filas.
+                    invoice_split=False,
                 )
             )
 
@@ -151,17 +170,14 @@ class Command(BaseCommand):
         # que ademas de aceptado haya llegado.
         accepted: list[tuple[str, str]] = []
 
-        def on_report_ready(path: Path, display_name: str) -> None:
-            if no_email:
-                # --no-email: dejamos el archivo en output_dir para inspeccion.
-                sent.append(path.name)
-                return
-            # El reporte de accruals (R3) va con subject fijo "Accrual Schedule"
-            # (sin prefijo ni timestamp); el resto mantiene el subject por defecto.
-            subject_override = (
-                "Accrual Schedule"
-                if display_name.startswith(settings.DCI_REPORT_BUTTON_NAME_3)
-                else None
+        # The payable pile does not go out with the others: it waits for the
+        # rejections to have been loaded. Collected here and sent once the browser
+        # is closed, so the wait costs a sleeping worker and not a live session.
+        deferred: list[tuple[Path, str]] = []
+
+        def _send(path: Path, display_name: str) -> None:
+            subject_override = subject_override_for(
+                display_name, subject_label, settings.DCI_REPORT_BUTTON_NAME_3
             )
             try:
                 accepted.extend(
@@ -179,6 +195,16 @@ class Command(BaseCommand):
                 # El email es el storage definitivo; no persistimos el xlsx.
                 path.unlink(missing_ok=True)
 
+        def on_report_ready(path: Path, display_name: str) -> None:
+            if no_email:
+                # --no-email: dejamos el archivo en output_dir para inspeccion.
+                sent.append(path.name)
+                return
+            if PILE_PAYABLE in display_name:
+                deferred.append((path, display_name))
+                return
+            _send(path, display_name)
+
         dci_username, dci_password = config.effective_dci_credentials()
         try:
             items = asyncio.run(
@@ -192,15 +218,41 @@ class Command(BaseCommand):
                     on_report_ready=on_report_ready,
                 )
             )
+            if deferred:
+                logger.warning(
+                    "[INVOICE SPLIT] rechazados enviados; esperando %d min antes "
+                    "de mandar los pagables", INVOICE_PILE_GAP_S // 60,
+                )
+                time.sleep(INVOICE_PILE_GAP_S)
+                # Pop as we go: whatever is still in `deferred` below is exactly
+                # what never went out, which is what the failure has to report.
+                while deferred:
+                    _send(*deferred.pop(0))
         except Exception as exc:
             # Algunos reportes pueden haberse entregado antes del fallo.
             run.status = Run.Status.FAILED
             run.filenames = ";".join(sent)
-            run.error_message = str(exc)
+            messages = [str(exc)]
+            if deferred:
+                # The payable pile is a delivery of its own. Losing it to a later
+                # failure — R3 timing out, or the soft limit landing inside the
+                # 20 minute wait — leaves the client holding rejections with no
+                # payables, and that has to be said out loud rather than hidden
+                # behind whatever raised.
+                messages.append(
+                    "[INVOICE SPLIT] no se envio la pila de pagables: "
+                    + ", ".join(name for _, name in deferred)
+                )
+            run.error_message = " | ".join(messages)
             run.finished_at = timezone.now()
             run.save()
             _notify_failure(run)
             raise
+        finally:
+            # Sent files are unlinked by `_send`; anything still deferred never
+            # got that far and would otherwise pile up in --output-dir.
+            for path, _ in deferred:
+                path.unlink(missing_ok=True)
 
         # Que Brevo acepte el mail no es que haya llegado: confirmamos contra sus
         # eventos antes de dar el run por bueno.

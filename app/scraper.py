@@ -21,6 +21,7 @@ import datetime as dt
 import logging
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import python_calamine
 import xlsxwriter
@@ -29,6 +30,13 @@ from playwright.async_api import (
     Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
+)
+
+from app.invoice_split import (
+    PILE_PAYABLE,
+    PILE_REJECTED,
+    classify,
+    resolve_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,23 +60,48 @@ LOGIN_5XX_ATTEMPTS = 5
 LOGIN_5XX_BACKOFF_S = 30
 
 
+class ChunkedReport(NamedTuple):
+    """One report downloaded in N date-range chunks.
+
+    Was an 8-field positional tuple unpacked at the call site, which is the kind
+    of thing that silently shifts a flag onto the wrong parameter the moment a
+    field is added — and `invoice_split` is exactly such an addition. R3 has no
+    `Status` column, so a split leaking onto it would filter every row away and
+    kill the report on the zero-row guard.
+    """
+
+    url: str
+    button_name: str
+    n_chunks: int
+    today: dt.date
+    tab_name: str | None
+    single_slicer: bool
+    full_range: bool
+    reset_slicers: tuple[str, ...] = ()
+    invoice_split: bool = False
+
+
+# R1 goes out as two files: the rejections first, the payable entries 20 minutes
+# later, so an invoice resubmitted to Acumen lands in ZipRide with the right final
+# status (Paul, 2026-08-25). `PILE_REJECTED` / `PILE_PAYABLE` travel in the display
+# name and are what the caller matches on to pick the subject and to hold the
+# payable pile back; they live in `invoice_split` with the rest of that contract.
+
+
 async def download_reports(
     username: str,
     password: str,
     reports: list[tuple[str, str]],
     output_dir: Path,
     timestamp_label: str,
-    chunked_reports: list[
-        tuple[str, str, int, dt.date, str | None, bool, bool, tuple[str, ...]]
-    ] = (),
+    chunked_reports: list["ChunkedReport"] = (),
     on_report_ready=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
-    de fechas: (url, button_name, n_chunks, today, tab_name, single_slicer,
-    full_range, reset_slicers). `tab_name` es el tab a abrir antes de chunkear
+    de fechas, cada uno un `ChunkedReport`. `tab_name` es el tab a abrir antes de chunkear
     (None si el reporte no tiene tabs, ej. R1 Vendor Payment Activity).
     `single_slicer` es True cuando el reporte tiene un solo date range slicer
     (R1); False cuando tiene dos y hay que identificar el correcto (R3, ver
@@ -128,21 +161,20 @@ async def download_reports(
                 await _ready(item)
 
             for spec in chunked_reports:
-                (url, button_name, n_chunks, today, tab_name,
-                 single_slicer, full_range, reset_slicers) = spec
-                await report_page.goto(url)
+                await report_page.goto(spec.url)
                 logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
                 chunked_items = await _export_chunked_report(
                     report_page,
-                    button_name,
-                    n_chunks,
+                    spec.button_name,
+                    spec.n_chunks,
                     output_dir,
                     timestamp_label,
-                    today,
-                    tab_name=tab_name,
-                    single_slicer=single_slicer,
-                    full_range=full_range,
-                    reset_slicers=reset_slicers,
+                    spec.today,
+                    tab_name=spec.tab_name,
+                    single_slicer=spec.single_slicer,
+                    full_range=spec.full_range,
+                    reset_slicers=spec.reset_slicers,
+                    invoice_split=spec.invoice_split,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -343,6 +375,7 @@ async def _export_chunked_report(
     single_slicer: bool = False,
     full_range: bool = False,
     reset_slicers: tuple[str, ...] = (),
+    invoice_split: bool = False,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -511,27 +544,49 @@ async def _export_chunked_report(
         max_parts=_MAX_PARTS,
     )
 
-    merged_path = output_dir / (
-        f"{slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
-        f"_{timestamp_label}.xlsx"
-    )
-    _merge_xlsx_files(part_paths, merged_path)
-    outputs = _split_for_email(
-        merged_path,
-        part_paths,
-        part_meta,
-        (start_date, end_date),
-        output_dir,
-        slug,
-        timestamp_label,
-    )
+    # One pile for a plain chunked report (R3), two for the invoice file (R1).
+    # The pile goes into the slug: both piles cover the same date range, so
+    # sharing a slug would give them the same filename and the second merge
+    # would overwrite the first.
+    if invoice_split:
+        split, rejected_meta, payable_meta = _classify_invoice_piles(
+            part_paths, part_meta
+        )
+        piles = [
+            (split.rejected, f"{slug}_rejected",
+             f"{button_name} - {PILE_REJECTED}", rejected_meta),
+            (split.payable, f"{slug}_payable",
+             f"{button_name} - {PILE_PAYABLE}", payable_meta),
+        ]
+    else:
+        piles = [(None, slug, button_name, part_meta)]
+
+    items: list[tuple[Path, str]] = []
+    for keep_entry_ids, pile_slug, pile_name, pile_meta in piles:
+        merged_path = output_dir / (
+            f"{pile_slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
+            f"_{timestamp_label}.xlsx"
+        )
+        _merge_xlsx_files(part_paths, merged_path, keep_entry_ids)
+        outputs = _split_for_email(
+            merged_path,
+            part_paths,
+            pile_meta,
+            (start_date, end_date),
+            output_dir,
+            pile_slug,
+            timestamp_label,
+            keep_entry_ids,
+        )
+        items.extend(
+            (path, f"{pile_name} ({first.isoformat()} to {last.isoformat()})")
+            for path, first, last in outputs
+        )
+
     for p in part_paths:
         p.unlink(missing_ok=True)
 
-    return [
-        (path, f"{button_name} ({first.isoformat()} to {last.isoformat()})")
-        for path, first, last in outputs
-    ]
+    return items
 
 
 def _validate_chunk_xlsx(path: Path) -> int:
@@ -567,9 +622,81 @@ def _validate_chunk_xlsx(path: Path) -> int:
     return data_rows
 
 
+def _read(path: Path) -> list:
+    return python_calamine.CalamineWorkbook.from_path(
+        str(path)
+    ).get_sheet_by_index(0).to_python(skip_empty_area=True)
+
+
+def _data_rows(rows: list):
+    """Las filas que el merge escribe: todo menos el header y la fila que
+    Power BI inyecta al final de cada export con el filtro aplicado (ej:
+    "Applied filters: EndDate is on or after X and is before Y").
+
+    Module level so the invoice split classifies exactly the rows the merge
+    would write. If the two ever disagreed, a row could be classified into a
+    pile and then not written, or written without ever being classified.
+    """
+    for row in rows[1:]:
+        first = row[0] if row else None
+        if isinstance(first, str) and first.startswith("Applied filters:"):
+            continue
+        yield row
+
+
+def _classify_invoice_piles(
+    paths: list[Path],
+    part_meta: dict[Path, tuple[dt.date, dt.date, int]],
+) -> tuple[object, dict[Path, tuple[dt.date, dt.date, int]], dict[Path, tuple[dt.date, dt.date, int]]]:
+    """Split the whole export into the rejected and payable piles.
+
+    Classifies over every chunk at once, never chunk by chunk: R1 is downloaded
+    in date-of-service ranges and one invoice number's rows straddle them, so a
+    per-chunk decision would put the same invoice in both piles.
+
+    Also returns a rebuilt `part_meta` per pile. `_split_for_email` sizes its
+    groups off those row counts, and after filtering a chunk carries far fewer
+    rows than it did — feeding it the unfiltered counts would split files that
+    comfortably fit.
+
+    Power BI's `Total` and blank rows fall out here for free: they carry no
+    invoice number and no status, so they belong to neither pile. That is the
+    junk Juan Pablo has been receiving mixed into the data.
+    """
+    header: list | None = None
+    all_rows: list = []
+    rows_by_part: dict[Path, list] = {}
+    for path in paths:
+        raw = _read(path)
+        if header is None:
+            header = raw[0]
+        rows = list(_data_rows(raw))
+        rows_by_part[path] = rows
+        all_rows.extend(rows)
+
+    split = classify(header, all_rows)
+    cols = resolve_columns(header)
+
+    def _meta_for(keep: frozenset) -> dict:
+        meta = {}
+        for path, rows in rows_by_part.items():
+            start, end, _ = part_meta[path]
+            kept = sum(1 for r in rows if r[cols.entry_id] in keep)
+            meta[path] = (start, end, kept)
+        return meta
+
+    logger.warning(
+        "[INVOICE SPLIT] %d filas -> rechazados %d, pagables %d, descartadas %d",
+        len(all_rows), len(split.rejected), len(split.payable),
+        len(all_rows) - len(split.rejected) - len(split.payable),
+    )
+    return split, _meta_for(split.rejected), _meta_for(split.payable)
+
+
 def _merge_xlsx_files(
     paths: list[Path],
     output_path: Path,
+    keep_entry_ids: frozenset | None = None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
@@ -598,24 +725,18 @@ def _merge_xlsx_files(
     ~650MB vs ~330MB, medido con 210k filas) pero no tiempo (33.5s vs 35.8s).
     Once even that does not fit, `_split_for_email` rebuilds the report as
     several files.
+
+    `keep_entry_ids` (optional) writes only the rows whose `Entry ID` is in the
+    set, which is how R1 is cut into its two piles without a second download and
+    without this function growing a second code path: passing None leaves every
+    line below identical to what R3 has always run. A filter that matches nothing
+    writes a header-only file rather than failing — a day with no rejected-only
+    invoices is a legitimate empty pile, not a broken report, and the zero-row
+    guard below still fires on the case it was written for, which is the export
+    itself coming back empty.
     """
     if not paths:
         raise ValueError("No paths to merge")
-
-    def _read(path: Path) -> list:
-        return python_calamine.CalamineWorkbook.from_path(
-            str(path)
-        ).get_sheet_by_index(0).to_python(skip_empty_area=True)
-
-    def _data_rows(rows: list):
-        """Las filas que el merge escribe: todo menos el header y la fila que
-        Power BI inyecta al final de cada export con el filtro aplicado (ej:
-        "Applied filters: EndDate is on or after X and is before Y")."""
-        for row in rows[1:]:
-            first = row[0] if row else None
-            if isinstance(first, str) and first.startswith("Applied filters:"):
-                continue
-            yield row
 
     # First pass: validate every chunk and count rows before writing anything,
     # so a bad chunk aborts before we produce a half-written file.
@@ -642,6 +763,14 @@ def _merge_xlsx_files(
             f"{output_path.name}: merge produjo 0 data rows — reporte vacio"
         )
 
+    # Resolved by header name from the merged header, so the split follows the
+    # export's column drift (13 columns in May, 14 in August) for free.
+    entry_id_col = (
+        resolve_columns(canonical_header).entry_id
+        if keep_entry_ids is not None
+        else None
+    )
+
     out_wb = xlsxwriter.Workbook(str(output_path))
     out_ws = out_wb.add_worksheet()
     # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
@@ -662,16 +791,25 @@ def _merge_xlsx_files(
         out_row += 1
 
     _write_row(canonical_header)
+    written = 0
     for path in paths:
         for row in _data_rows(_read(path)):
+            if entry_id_col is not None and row[entry_id_col] not in keep_entry_ids:
+                continue
             _write_row(row)
+            written += 1
     out_wb.close()
 
     logger.warning(
         "[REPORT chunked] Merged %d chunks -> %s (%d data rows, %d cols, %.1fMB)",
-        len(paths), output_path.name, total_rows, len(canonical_header),
+        len(paths), output_path.name, written, len(canonical_header),
         output_path.stat().st_size / 1048576,
     )
+    if entry_id_col is not None and written == 0:
+        logger.warning(
+            "[REPORT chunked] %s quedo solo con el header: ninguna de las %d filas "
+            "del export cayo en esta pila", output_path.name, total_rows,
+        )
     return output_path
 
 
@@ -698,6 +836,7 @@ def _split_for_email(
     output_dir: Path,
     slug: str,
     timestamp_label: str,
+    keep_entry_ids: frozenset | None = None,
 ) -> list[tuple[Path, dt.date, dt.date]]:
     """Return the files to email as [(path, range_start, range_end)].
 
@@ -768,7 +907,7 @@ def _split_for_email(
             f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(group, out_path)
+        _merge_xlsx_files(group, out_path, keep_entry_ids)
         outputs.append((out_path, group_start, group_end))
     merged_path.unlink(missing_ok=True)
     return outputs

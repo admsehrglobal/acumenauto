@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from app.models import Recipient, Run
+from app.models import FileException, Recipient, Run
 
 
 @admin.register(Recipient)
@@ -27,4 +27,20 @@ class RunAdmin(admin.ModelAdmin):
         "filenames",
         "error_message",
         "attempt_number",
+        "exceptions_summary",
     )
+
+
+@admin.register(FileException)
+class FileExceptionAdmin(admin.ModelAdmin):
+    list_display = (
+        "report",
+        "key_1",
+        "key_2",
+        "created_by",
+        "created_at",
+        "removed_by",
+        "removed_at",
+    )
+    list_filter = ("report",)
+    search_fields = ("key_1", "key_2")

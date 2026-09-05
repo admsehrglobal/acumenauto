@@ -1,4 +1,7 @@
 from django.db import models
+from django.utils import timezone
+
+from app.file_exceptions import REPORTS
 
 
 class Recipient(models.Model):
@@ -28,6 +31,10 @@ class Run(models.Model):
     filenames = models.TextField(blank=True, default="")
     error_message = models.TextField(blank=True)
     attempt_number = models.PositiveIntegerField(default=1)
+    # What the File Exceptions lists removed from the emailed files, e.g.
+    # "Invoices: 12 rows dropped (3 of 40 keys matched)". Empty when no list
+    # applied to the files of this run.
+    exceptions_summary = models.TextField(blank=True, default="")
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"
@@ -121,3 +128,53 @@ class AppConfig(models.Model):
     def save(self, *args, **kwargs) -> None:
         self.pk = 1  # enforce singleton
         super().save(*args, **kwargs)
+
+
+class FileException(models.Model):
+    """One key the run drops from an emailed file (Paul, 2026-08-31 / 09-02).
+
+    `report` says which file; `key_1`/`key_2` hold the key parts in the order of
+    `app.file_exceptions.REPORTS[report].columns` (invoices use only key_1).
+    Keys are stored already normalised, so the unique constraint and the match
+    at run time agree on what "the same key" is.
+
+    A removed entry is not deleted: it keeps its row with `removed_at`/
+    `removed_by` set. That is the record of changes Rob asked for, and it is
+    what lets a removal be undone ("Restore"). Adding a key that was removed
+    earlier restores that row.
+    """
+
+    report = models.CharField(
+        max_length=20, choices=[(s.slug, s.label) for s in REPORTS.values()]
+    )
+    key_1 = models.CharField(max_length=100)
+    key_2 = models.CharField(max_length=100, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    created_by = models.CharField(max_length=150, blank=True, default="")
+    removed_at = models.DateTimeField(null=True, blank=True)
+    removed_by = models.CharField(max_length=150, blank=True, default="")
+    # What the last run that read this file did with this entry. Both are
+    # needed: without `last_checked_at` there is no telling "matched nothing"
+    # apart from "no run has opened that file since you added it". A key that
+    # is checked and never matches is a typo, and until now nothing said so.
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    last_matched_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "key_1", "key_2"], name="uniq_file_exception_key"
+            )
+        ]
+        ordering = ["key_1", "key_2"]
+
+    def __str__(self) -> str:
+        return f"{self.report}: {self.key_display}"
+
+    @property
+    def active(self) -> bool:
+        return self.removed_at is None
+
+    @property
+    def key_display(self) -> str:
+        return f"{self.key_1} / {self.key_2}" if self.key_2 else self.key_1

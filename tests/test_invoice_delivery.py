@@ -91,6 +91,13 @@ class DeliveryOrderTests(unittest.TestCase):
                                           mock.Mock(objects=recipients)).stop)
         mock.patch.object(cmd, "Recipient", mock.Mock(objects=recipients)).start()
 
+        # No File Exceptions: every list empty, so the piles go out untouched.
+        exceptions = mock.Mock()
+        exceptions.filter.return_value.values_list.return_value = []
+        self.addCleanup(mock.patch.object(cmd, "FileException",
+                                          mock.Mock(objects=exceptions)).stop)
+        mock.patch.object(cmd, "FileException", mock.Mock(objects=exceptions)).start()
+
     def _piles(self):
         rejected = self.tmp / "rejected.xlsx"
         payable = self.tmp / "payable.xlsx"
@@ -125,8 +132,12 @@ class DeliveryOrderTests(unittest.TestCase):
         self.assertEqual(kinds[2][0], "sent")
         self.assertIn(PILE_PAYABLE, kinds[2][1])
 
-    def test_the_gap_is_the_twenty_minutes_juan_asked_for(self):
-        self.assertEqual(cmd.INVOICE_PILE_GAP_S, 20 * 60)
+    def test_the_gap_is_the_five_minutes_paul_asked_for(self):
+        self.assertEqual(cmd.INVOICE_PILE_GAP_S, 5 * 60)
+
+    def test_empty_exception_lists_leave_the_run_record_blank(self):
+        self._run_command()
+        self.assertEqual(self.run.exceptions_summary, "")
 
     def test_each_pile_carries_the_subject_the_consumer_matches_on(self):
         self._run_command()

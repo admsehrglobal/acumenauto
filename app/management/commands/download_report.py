@@ -9,7 +9,14 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from app.email_utils import send_error_report, send_reports_email, verify_delivery
-from app.models import AppConfig, Recipient, Run
+from app.file_exceptions import (
+    REPORTS,
+    DropSpec,
+    fold_key,
+    make_drop_spec,
+    summarize,
+)
+from app.models import AppConfig, FileException, Recipient, Run
 from app.invoice_split import PILE_PAYABLE, subject_override_for
 from app.scraper import ChunkedReport, download_reports
 
@@ -48,6 +55,56 @@ def _notify_failure(run: Run) -> None:
         logger.exception("[email] no pude avisar del fallo del Run #%s", run.pk)
 
 
+def _load_exceptions() -> dict[str, DropSpec | None]:
+    """The File Exceptions lists, one spec per file (None when the list is empty).
+
+    Read once here, in the main thread, like AppConfig and the recipients: the
+    scraper stays Django-free and `on_report_ready` runs in a worker thread.
+    """
+    specs: dict[str, DropSpec | None] = {}
+    for slug in REPORTS:
+        rows = FileException.objects.filter(
+            report=slug, removed_at__isnull=True
+        ).values_list("key_1", "key_2")
+        specs[slug] = make_drop_spec(slug, rows)
+    return specs
+
+
+def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
+    """Record, per entry, that this run read its file and whether it matched.
+
+    Only for the files this run actually wrote: the daily invocation is
+    `--reports=1,2` and the long one `--reports=3`, so stamping unconditionally
+    would mark the accruals entries "checked" on a run that never opened that
+    export. `DropSpec.stats` is empty exactly when no file was written, which
+    is the same guard `summarize` uses.
+    """
+    for slug, spec in exceptions.items():
+        if spec is None or not spec.stats:
+            continue
+        matched: set = set()
+        for _, keys in spec.stats.values():
+            matched |= keys
+        # `matched` holds keys at the report's width, so a one-part key is a
+        # 1-tuple there and has to be built the same way from the entry.
+        width = len(spec.columns)
+        entries = FileException.objects.filter(report=slug, removed_at__isnull=True)
+        hit = [
+            e.pk for e in entries
+            if fold_key((e.key_1, e.key_2)[:width]) in matched
+        ]
+        entries.update(last_checked_at=when)
+        FileException.objects.filter(pk__in=hit).update(last_matched_at=when)
+
+
+def _stamp_matches_safely(exceptions: dict[str, DropSpec | None]) -> None:
+    """Bookkeeping, not delivery: never let it fail a run whose files are out."""
+    try:
+        _stamp_matches(exceptions, timezone.now())
+    except Exception:  # noqa: BLE001 - the run's own outcome is already decided
+        logger.exception("[exceptions] no pude sellar las entradas")
+
+
 class Command(BaseCommand):
     help = "Download the DCI Excel reports and email them to active recipients."
 
@@ -81,6 +138,7 @@ class Command(BaseCommand):
         subject_label = nj_started.strftime("%Y-%m-%d %H:%M NJ")
 
         config = AppConfig.load()
+        exceptions = _load_exceptions()
         if options["reports"]:
             filter_ids = {int(s) for s in options["reports"].split(",") if s.strip()}
         else:
@@ -106,6 +164,7 @@ class Command(BaseCommand):
                     reset_slicers=("Aging Category",),
                     # R1 es el invoice file: sale como dos entregas.
                     invoice_split=True,
+                    exceptions=exceptions["invoices"],
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.
@@ -131,6 +190,7 @@ class Command(BaseCommand):
                     reset_slicers=(),  # R3 no tiene dropdown slicers que limpiar
                     # R3 no tiene columna Status: un split lo dejaria en cero filas.
                     invoice_split=False,
+                    exceptions=exceptions["accruals"],
                 )
             )
 
@@ -217,6 +277,9 @@ class Command(BaseCommand):
                     timestamp_label=timestamp_label,
                     chunked_reports=chunked_reports,
                     on_report_ready=on_report_ready,
+                    simple_exceptions={
+                        settings.DCI_REPORT_BUTTON_NAME_2: exceptions["auths"]
+                    },
                 )
             )
             if deferred:
@@ -237,7 +300,7 @@ class Command(BaseCommand):
             if deferred:
                 # The payable pile is a delivery of its own. Losing it to a later
                 # failure — R3 timing out, or the soft limit landing inside the
-                # 20 minute wait — leaves the client holding rejections with no
+                # wait above — leaves the client holding rejections with no
                 # payables, and that has to be said out loud rather than hidden
                 # behind whatever raised.
                 messages.append(
@@ -245,6 +308,8 @@ class Command(BaseCommand):
                     + ", ".join(name for _, name in deferred)
                 )
             run.error_message = " | ".join(messages)
+            run.exceptions_summary = summarize(exceptions.values())
+            _stamp_matches_safely(exceptions)
             run.finished_at = timezone.now()
             run.save()
             _notify_failure(run)
@@ -262,6 +327,8 @@ class Command(BaseCommand):
             logger.error("[email] %s", problem)
 
         run.filenames = ";".join(sent)
+        run.exceptions_summary = summarize(exceptions.values())
+        _stamp_matches_safely(exceptions)
         failures = send_errors + delivery_problems
         if failures:
             run.status = Run.Status.FAILED

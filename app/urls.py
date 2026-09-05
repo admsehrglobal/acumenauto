@@ -32,4 +32,15 @@ urlpatterns = [
     path("settings/credentials/", views.dci_credentials_save, name="dci_credentials_save"),
     path("settings/credentials/test/", views.dci_test, name="dci_test"),
     path("settings/credentials/test/status/", views.dci_test_status, name="dci_test_status"),
+    path("exceptions/", views.exceptions_home, name="exceptions"),
+    path("exceptions/<slug:report>/", views.exceptions_list, name="exceptions_list"),
+    path("exceptions/<slug:report>/add/", views.exception_add, name="exception_add"),
+    path("exceptions/<slug:report>/upload/", views.exception_upload, name="exception_upload"),
+    path(
+        "exceptions/<slug:report>/upload/confirm/",
+        views.exception_upload_confirm,
+        name="exception_upload_confirm",
+    ),
+    path("exceptions/<slug:report>/<int:pk>/remove/", views.exception_remove, name="exception_remove"),
+    path("exceptions/<slug:report>/<int:pk>/restore/", views.exception_restore, name="exception_restore"),
 ]

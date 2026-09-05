@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -32,6 +33,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from app.file_exceptions import DropSpec, RowFilter
 from app.invoice_split import (
     PILE_PAYABLE,
     PILE_REJECTED,
@@ -79,9 +81,13 @@ class ChunkedReport(NamedTuple):
     full_range: bool
     reset_slicers: tuple[str, ...] = ()
     invoice_split: bool = False
+    # The report's File Exceptions list (see app.file_exceptions), applied while
+    # the merged file is written. None = nothing to drop, every line runs as
+    # before the feature existed.
+    exceptions: DropSpec | None = None
 
 
-# R1 goes out as two files: the rejections first, the payable entries 20 minutes
+# R1 goes out as two files: the rejections first, the payable entries 5 minutes
 # later, so an invoice resubmitted to Acumen lands in ZipRide with the right final
 # status (Paul, 2026-08-25). `PILE_REJECTED` / `PILE_PAYABLE` travel in the display
 # name and are what the caller matches on to pick the subject and to hold the
@@ -96,8 +102,14 @@ async def download_reports(
     timestamp_label: str,
     chunked_reports: list["ChunkedReport"] = (),
     on_report_ready=None,
+    simple_exceptions: dict[str, DropSpec] | None = None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
+
+    `simple_exceptions` maps a simple report's button_name to its File
+    Exceptions list; the raw download is rewritten in place without those rows
+    before `on_report_ready` sees it. Chunked reports carry theirs in
+    `ChunkedReport.exceptions`.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
@@ -156,6 +168,9 @@ async def download_reports(
                 path = await _export_excel(
                     report_page, button_name, output_dir, timestamp_label
                 )
+                drop = (simple_exceptions or {}).get(button_name)
+                if drop is not None:
+                    await asyncio.to_thread(_apply_exceptions_in_place, path, drop)
                 item = (path, button_name)
                 results.append(item)
                 await _ready(item)
@@ -175,6 +190,7 @@ async def download_reports(
                     full_range=spec.full_range,
                     reset_slicers=spec.reset_slicers,
                     invoice_split=spec.invoice_split,
+                    exceptions=spec.exceptions,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -363,6 +379,22 @@ async def _export_excel(
     return target
 
 
+def _apply_exceptions_in_place(path: Path, drop: DropSpec) -> None:
+    """Rewrite a simple report's raw download without its excepted rows.
+
+    R2 was always emailed exactly as Power BI produced it; this is the first
+    time it is opened. In place, because everything downstream (`_send`, the
+    deferred list, `Run.filenames`, the attachment name) holds this same Path.
+    The sheet keeps its original name; what does change is what any pass
+    through `_merge_xlsx_files` changes: the 'Applied filters:' footer goes and
+    dates are written in the merge's display format.
+    """
+    sheet_name = python_calamine.CalamineWorkbook.from_path(str(path)).sheet_names[0]
+    filtered = path.with_name(f"{path.stem}.filtered{path.suffix}")
+    _merge_xlsx_files([path], filtered, None, drop, sheet_name=sheet_name)
+    os.replace(filtered, path)
+
+
 async def _export_chunked_report(
     page: Page,
     button_name: str,
@@ -376,6 +408,7 @@ async def _export_chunked_report(
     full_range: bool = False,
     reset_slicers: tuple[str, ...] = (),
     invoice_split: bool = False,
+    exceptions: DropSpec | None = None,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -567,7 +600,11 @@ async def _export_chunked_report(
             f"{pile_slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(part_paths, merged_path, keep_entry_ids)
+        # The exceptions are applied here, at write time, and not before the
+        # invoice split: `classify` decides per invoice with no state shared
+        # between invoices, so leaving a whole invoice out at write time gives
+        # every other invoice exactly the pile it would have had anyway.
+        _merge_xlsx_files(part_paths, merged_path, keep_entry_ids, exceptions)
         outputs = _split_for_email(
             merged_path,
             part_paths,
@@ -577,6 +614,7 @@ async def _export_chunked_report(
             pile_slug,
             timestamp_label,
             keep_entry_ids,
+            exceptions,
         )
         items.extend(
             (path, f"{pile_name} ({first.isoformat()} to {last.isoformat()})")
@@ -697,6 +735,8 @@ def _merge_xlsx_files(
     paths: list[Path],
     output_path: Path,
     keep_entry_ids: frozenset | None = None,
+    drop: DropSpec | None = None,
+    sheet_name: str | None = None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
@@ -734,6 +774,12 @@ def _merge_xlsx_files(
     invoices is a legitimate empty pile, not a broken report, and the zero-row
     guard below still fires on the case it was written for, which is the export
     itself coming back empty.
+
+    `drop` (optional) is the report's File Exceptions list: rows whose key is in
+    it are left out, with the key columns resolved by name from the merged
+    header (a missing column fails the run loudly, same policy as the split).
+    What was dropped is recorded on the spec itself, per output file.
+    `sheet_name` (optional) names the output sheet; the default is xlsxwriter's.
     """
     if not paths:
         raise ValueError("No paths to merge")
@@ -770,9 +816,10 @@ def _merge_xlsx_files(
         if keep_entry_ids is not None
         else None
     )
+    row_filter = RowFilter(canonical_header, drop) if drop is not None else None
 
     out_wb = xlsxwriter.Workbook(str(output_path))
-    out_ws = out_wb.add_worksheet()
+    out_ws = out_wb.add_worksheet(sheet_name)
     # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
     # Paul no vea un cambio de presentacion en las columnas de fecha.
     fmt_datetime = out_wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
@@ -796,6 +843,8 @@ def _merge_xlsx_files(
         for row in _data_rows(_read(path)):
             if entry_id_col is not None and row[entry_id_col] not in keep_entry_ids:
                 continue
+            if row_filter is not None and row_filter.drops(row):
+                continue
             _write_row(row)
             written += 1
     out_wb.close()
@@ -805,6 +854,13 @@ def _merge_xlsx_files(
         len(paths), output_path.name, written, len(canonical_header),
         output_path.stat().st_size / 1048576,
     )
+    if row_filter is not None:
+        drop.record(output_path, row_filter)
+        logger.warning(
+            "[EXCEPTIONS] %s: dropped %d rows from %s (%d of %d keys matched)",
+            drop.label, row_filter.dropped, output_path.name,
+            len(row_filter.matched), len(drop.keys),
+        )
     if entry_id_col is not None and written == 0:
         logger.warning(
             "[REPORT chunked] %s quedo solo con el header: ninguna de las %d filas "
@@ -837,6 +893,7 @@ def _split_for_email(
     slug: str,
     timestamp_label: str,
     keep_entry_ids: frozenset | None = None,
+    drop: DropSpec | None = None,
 ) -> list[tuple[Path, dt.date, dt.date]]:
     """Return the files to email as [(path, range_start, range_end)].
 
@@ -907,9 +964,13 @@ def _split_for_email(
             f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(group, out_path, keep_entry_ids)
+        _merge_xlsx_files(group, out_path, keep_entry_ids, drop)
         outputs.append((out_path, group_start, group_end))
     merged_path.unlink(missing_ok=True)
+    if drop is not None:
+        # The big merge never goes out; its drop count must not be added to
+        # the counts of the files that replace it.
+        drop.forget(merged_path)
     return outputs
 
 

@@ -79,6 +79,14 @@ class ChunkedReport(NamedTuple):
     full_range: bool
     reset_slicers: tuple[str, ...] = ()
     invoice_split: bool = False
+    # Columnas que el export TIENE que traer. No es el esquema completo a
+    # proposito: el esquema deriva solo (R1 paso de 13 a 14 columnas en agosto)
+    # y fijarlo entero seria una falla por mes. Van las que identifican al tab
+    # correcto. El 2026-09-03 el portal partio R1 en tabs y el que queda
+    # seleccionado por default trae 'Entry ID', 'Invoice #', 'Status' y
+    # 'Amount' igual que el bueno, asi que el invoice split lo hubiera aceptado
+    # y entregado un archivo con SOLO los pagados y la pila de rechazados vacia.
+    required_columns: tuple[str, ...] = ()
 
 
 # R1 goes out as two files: the rejections first, the payable entries 20 minutes
@@ -175,6 +183,7 @@ async def download_reports(
                     full_range=spec.full_range,
                     reset_slicers=spec.reset_slicers,
                     invoice_split=spec.invoice_split,
+                    required_columns=spec.required_columns,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -376,6 +385,7 @@ async def _export_chunked_report(
     full_range: bool = False,
     reset_slicers: tuple[str, ...] = (),
     invoice_split: bool = False,
+    required_columns: tuple[str, ...] = (),
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -479,56 +489,85 @@ async def _export_chunked_report(
 
     async def _export_one_range(chunk_start, chunk_end, seq):
         """Setea el filtro de fechas, exporta el visual a xlsx y devuelve
-        (path, data_rows). Lo llama el driver adaptativo."""
+        (path, data_rows). Lo llama el driver adaptativo.
+
+        Reintenta cuando el footer del export no confirma el rango pedido. El
+        filtro se escribe en un textbox y el primer commit despues de que carga
+        el visual se pierde: el PRIMER chunk de cada corrida salia con el rango
+        entero (ver `_validate_chunk_xlsx`). Volver a aplicarlo alcanza — los
+        chunks 2..N siempre salieron bien, y son justamente los que se aplican
+        sobre un visual ya rendereado.
+        """
         label = f"{chunk_start.isoformat()} to {chunk_end.isoformat()}"
         logger.warning("[REPORT chunked] Exporting part %d (%s)", seq, label)
-
-        await _set_date_filter(
-            start_input, end_input, chunk_start, chunk_end, date_fmt
-        )
-
-        # El tab nuevo tiene multiples visuals — scope al table visual via
-        # aria-label ("Row" lo distingue de los charts).
-        table_visual = iframe.get_by_role("group").filter(
-            has_text="Scroll left Scroll right Row"
-        )
-        more_btn = table_visual.get_by_test_id("visual-more-options-btn")
-        export_item = iframe.get_by_test_id("pbimenu-item.Export data")
-
-        # En iter >= 2 a veces el click sobre "..." no abre el menu (el visual
-        # esta busy con el re-render del filtro nuevo). Retry con Escape + hover
-        # entre intentos para limpiar el estado.
-        for attempt in range(3):
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
-            await table_visual.hover()
-            await more_btn.wait_for(state="visible")
-            await more_btn.click(force=True)
-            try:
-                await export_item.wait_for(state="visible", timeout=5000)
-                break
-            except PlaywrightTimeoutError:
-                logger.warning(
-                    "[REPORT chunked] Menu didn't open on attempt %d/3, retrying",
-                    attempt + 1,
-                )
-                if attempt == 2:
-                    raise
-
-        await export_item.click(force=True)
-        await iframe.get_by_text("Data with current layout").click(force=True)
-
-        async with page.expect_download() as download_info:
-            await iframe.get_by_test_id("export-btn").click(force=True)
-        download = await download_info.value
 
         part_path = output_dir / (
             f"{slug}_part_{seq:03d}"
             f"_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        await download.save_as(part_path)
-        rows = _validate_chunk_xlsx(part_path)
+        # Un chunk que cubre el extent entero del slicer no deja rastro en el
+        # footer (no hay filtro que restatear), asi que ahi no hay nada que
+        # verificar; en cualquier otro caso el footer tiene que confirmarlo.
+        covers_everything = chunk_start <= slicer_min and chunk_end >= slicer_max
+        expected = (None, None) if covers_everything else (chunk_start, chunk_end)
+
+        async def _download_once():
+            # El tab nuevo tiene multiples visuals — scope al table visual via
+            # aria-label ("Row" lo distingue de los charts).
+            table_visual = iframe.get_by_role("group").filter(
+                has_text="Scroll left Scroll right Row"
+            )
+            more_btn = table_visual.get_by_test_id("visual-more-options-btn")
+            export_item = iframe.get_by_test_id("pbimenu-item.Export data")
+
+            # En iter >= 2 a veces el click sobre "..." no abre el menu (el
+            # visual esta busy con el re-render del filtro nuevo). Retry con
+            # Escape + hover entre intentos para limpiar el estado.
+            for attempt in range(3):
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+                await table_visual.hover()
+                await more_btn.wait_for(state="visible")
+                await more_btn.click(force=True)
+                try:
+                    await export_item.wait_for(state="visible", timeout=5000)
+                    break
+                except PlaywrightTimeoutError:
+                    logger.warning(
+                        "[REPORT chunked] Menu didn't open on attempt %d/3, retrying",
+                        attempt + 1,
+                    )
+                    if attempt == 2:
+                        raise
+
+            await export_item.click(force=True)
+            await iframe.get_by_text("Data with current layout").click(force=True)
+
+            async with page.expect_download() as download_info:
+                await iframe.get_by_test_id("export-btn").click(force=True)
+            download = await download_info.value
+            await download.save_as(part_path)
+
+        for attempt in range(1, _FILTER_ATTEMPTS + 1):
+            await _set_date_filter(
+                start_input, end_input, chunk_start, chunk_end, date_fmt
+            )
+            await _download_once()
+            try:
+                rows = _validate_chunk_xlsx(
+                    part_path, *expected, required_columns=required_columns
+                )
+                break
+            except AppliedFilterMismatch as exc:
+                if attempt == _FILTER_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "[REPORT chunked] Part %d (%s): %s — reaplicando el filtro "
+                    "(intento %d/%d)",
+                    seq, label, exc, attempt, _FILTER_ATTEMPTS,
+                )
+
         part_meta[part_path] = (chunk_start, chunk_end, rows)
         logger.warning(
             "[REPORT chunked] Part %d (%s) OK (%d data rows)", seq, label, rows
@@ -589,7 +628,56 @@ async def _export_chunked_report(
     return items
 
 
-def _validate_chunk_xlsx(path: Path) -> int:
+# The range Power BI restates in the export's own footer, e.g.
+# "Date Of Service is on or after 06/08/2025 and is before 09/01/2026".
+# The upper bound is exclusive, so it reads as the day after the range we asked
+# for. A line with no "and is before" means no upper bound was applied at all.
+_APPLIED_RANGE_RE = re.compile(
+    r"is on or after (\d{1,2}/\d{1,2}/\d{4})"
+    r"(?: and is before (\d{1,2}/\d{1,2}/\d{4}))?"
+)
+
+# Veces que reaplicamos el filtro de fechas cuando el export no lo confirma.
+# Con 2 alcanza en todo lo medido (siempre falla el primero y anda el segundo);
+# la tercera es para no morir por un re-render lento.
+_FILTER_ATTEMPTS = 3
+
+
+class AppliedFilterMismatch(ValueError):
+    """El export no confirma el rango de fechas que le pedimos.
+
+    Propia, y no un ValueError pelado, porque el caller la reintenta: es la
+    unica falla de validacion que se arregla volviendo a aplicar el filtro.
+    """
+
+
+def _applied_ranges(rows: list) -> list[tuple[dt.date, dt.date | None]]:
+    """The date windows Power BI says it applied, read off the export's footer.
+
+    PBI writes that footer as the LAST row of the sheet, not the first.
+    """
+    found = []
+    for row in rows:
+        first = row[0] if row else None
+        if not isinstance(first, str) or not first.startswith("Applied filters:"):
+            continue
+        for m in _APPLIED_RANGE_RE.finditer(first):
+            lo = dt.datetime.strptime(m.group(1), "%m/%d/%Y").date()
+            hi = (
+                dt.datetime.strptime(m.group(2), "%m/%d/%Y").date()
+                if m.group(2)
+                else None
+            )
+            found.append((lo, hi))
+    return found
+
+
+def _validate_chunk_xlsx(
+    path: Path,
+    expected_start: dt.date | None = None,
+    expected_end: dt.date | None = None,
+    required_columns: tuple[str, ...] = (),
+) -> int:
     """Valida el chunk recien descargado y devuelve su cantidad de data rows.
 
     Usa calamine (rapido) porque el driver adaptativo cuenta CADA chunk para
@@ -598,8 +686,18 @@ def _validate_chunk_xlsx(path: Path) -> int:
 
     NO falla si data_rows == 0: con el chunking adaptativo un sub-rango vacio es
     legitimo. El caso "reporte entero vacio" lo atrapa _merge_xlsx_files. El
-    conteo excluye el header y la fila "Applied filters:" que inyecta PBI, para
-    que matchee con lo que cuenta el merge (y con el cap de 150k de PBI).
+    conteo excluye el header, las filas en blanco y la fila "Applied filters:"
+    que inyecta PBI, para que matchee con lo que cuenta el merge (y con el cap
+    de 150k de PBI).
+
+    Con `expected_start`/`expected_end` ademas exige que el footer confirme el
+    rango que pedimos. Hace falta porque el filtro se escribe en un textbox y
+    el commit se puede perder: el PRIMER chunk de cada corrida salia sin fecha
+    de fin y traia el rango entero, y como los chunks siguientes vuelven a
+    traer sus propias filas, el merge las duplicaba. Se veia solo cuando el
+    rango completo quedaba por debajo del umbral del chunking adaptativo; por
+    encima, el driver descartaba el chunk y el bug quedaba tapado (medido:
+    150.001 filas, el techo de PBI, el 2026-08-28 y otra vez el 2026-09-05).
     """
     try:
         sheet = python_calamine.CalamineWorkbook.from_path(
@@ -610,14 +708,39 @@ def _validate_chunk_xlsx(path: Path) -> int:
         raise ValueError(
             f"{path.name}: no se pudo abrir (descarga truncada/corrupta): {exc}"
         )
-    if not rows or not any(c not in (None, "") for c in rows[0]):
+    if not rows or _is_blank(rows[0]):
         raise ValueError(f"{path.name}: sin header (export vacio / sesion caida)")
+
+    header = {str(c).strip() for c in rows[0] if c not in (None, "")}
+    missing = [name for name in required_columns if name not in header]
+    if missing:
+        raise ValueError(
+            f"{path.name}: al export le faltan las columnas {missing} — "
+            f"esto no es el reporte que esperabamos. Trae: {sorted(header)}"
+        )
+
+    if expected_start is not None and expected_end is not None:
+        # El limite superior es exclusivo, pero aceptamos las dos convenciones:
+        # lo que no se acepta es que no haya limite, o que sea otro rango.
+        ok = any(
+            lo == expected_start
+            and hi is not None
+            and expected_end <= hi <= expected_end + dt.timedelta(days=1)
+            for lo, hi in _applied_ranges(rows)
+        )
+        if not ok:
+            raise AppliedFilterMismatch(
+                f"{path.name}: el export dice haber aplicado "
+                f"{_applied_ranges(rows) or 'ningun rango de fechas'}, "
+                f"no {expected_start}..{expected_end}"
+            )
+
     data_rows = 0
     for row in rows[1:]:
         first = row[0] if row else None
         if isinstance(first, str) and first.startswith("Applied filters:"):
             continue
-        if any(c not in (None, "") for c in row):
+        if not _is_blank(row):
             data_rows += 1
     return data_rows
 
@@ -628,10 +751,23 @@ def _read(path: Path) -> list:
     ).get_sheet_by_index(0).to_python(skip_empty_area=True)
 
 
+def _is_blank(row) -> bool:
+    """A row Power BI padded the export with: every cell empty.
+
+    The same predicate `_validate_chunk_xlsx` uses, so the per-chunk count and
+    the merge's count agree. They did not: on 2026-09-05 four chunks came back
+    with no data at all, each carrying one blank row, and the merge counted
+    those four as data. `total_rows == 0` never fired, xlsxwriter wrote four
+    rows that materialize no cells, and a header-only file went out to ZipRide
+    with the run marked SUCCESS.
+    """
+    return not any(c not in (None, "") for c in (row or ()))
+
+
 def _data_rows(rows: list):
-    """Las filas que el merge escribe: todo menos el header y la fila que
-    Power BI inyecta al final de cada export con el filtro aplicado (ej:
-    "Applied filters: EndDate is on or after X and is before Y").
+    """Las filas que el merge escribe: todo menos el header, las filas en blanco
+    y la fila que Power BI inyecta al final de cada export con el filtro
+    aplicado (ej: "Applied filters: EndDate is on or after X and is before Y").
 
     Module level so the invoice split classifies exactly the rows the merge
     would write. If the two ever disagreed, a row could be classified into a
@@ -640,6 +776,8 @@ def _data_rows(rows: list):
     for row in rows[1:]:
         first = row[0] if row else None
         if isinstance(first, str) and first.startswith("Applied filters:"):
+            continue
+        if _is_blank(row):
             continue
         yield row
 

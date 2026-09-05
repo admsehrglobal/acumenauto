@@ -42,6 +42,8 @@ from __future__ import annotations
 import collections
 from typing import NamedTuple, Sequence
 
+from app.file_exceptions import column_indexes
+
 # The export's schema drifts on its own — 13 columns in May, 14 in August once
 # Acumen inserted `PA Number` at index 2 and pushed `Status` from 7 to 8. Every
 # column is therefore resolved by header name, never by position.
@@ -101,16 +103,10 @@ def resolve_columns(header: Sequence) -> Columns:
     Raises ValueError naming what is missing, so a schema change fails loudly
     here rather than silently producing an empty or wrong pile downstream.
     """
-    index = {}
-    for position, name in enumerate(header):
-        if isinstance(name, str):
-            index.setdefault(name.strip(), position)
-
-    missing = [name for name in REQUIRED_COLUMNS if name not in index]
-    if missing:
-        raise ValueError(
-            f"invoice split: missing column(s) {missing} in export header {list(header)!r}"
-        )
+    try:
+        index = column_indexes(header, REQUIRED_COLUMNS)
+    except ValueError as exc:
+        raise ValueError(f"invoice split: {exc}") from None
     return Columns(
         entry_id=index["Entry ID"],
         invoice=index["Invoice #"],

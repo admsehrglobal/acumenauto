@@ -46,6 +46,12 @@
         {% endif %}
       </dd>
     </div>
+    {% if run.exceptions_summary %}
+    <div class="sm:col-span-2">
+      <dt class="text-slate-500">File Exceptions applied</dt>
+      <dd class="text-slate-900">{{ run.exceptions_summary }}</dd>
+    </div>
+    {% endif %}
   </dl>
 
   {% if run.error_message %}

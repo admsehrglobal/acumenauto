@@ -96,15 +96,28 @@ class Command(BaseCommand):
                     button_name=settings.DCI_REPORT_BUTTON_NAME,
                     n_chunks=config.date_range_chunks,
                     today=nj_started.date(),
-                    tab_name=None,  # R1 no tiene tabs
+                    # El 2026-09-03, entre las 10:00 y las 12:00 NJ, el portal
+                    # partio este reporte en 6 tabs. El que queda seleccionado
+                    # por default es 'Paid Invoices', que trae SOLO los pagados
+                    # y no tiene 'Rejected Reason' ni 'Aging'. El que reproduce
+                    # el export de siempre es 'Vendor Entry Status'.
+                    tab_name="Vendor Entry Status",
                     single_slicer=True,  # un solo date slicer
                     full_range=False,  # clampea end_date a hoy (no hay pagos futuros)
                     # el blank de Aging Category (las entries ya procesadas) quedo
                     # destildado en el portal y el export perdia el 98.9% de las
-                    # filas. Lo limpiamos en cada corrida.
-                    reset_slicers=("Aging Category",),
+                    # filas. Lo limpiamos en cada corrida. Ese slicer ahora vive
+                    # DENTRO del tab, por eso el reset va despues de elegirlo.
+                    # 'Status' es nuevo y es la misma trampa: si alguien lo deja
+                    # filtrado en el portal, el archivo sale corto y en SUCCESS.
+                    reset_slicers=("Aging Category", "Status"),
                     # R1 es el invoice file: sale como dos entregas.
                     invoice_split=True,
+                    # Las dos que distinguen el tab bueno del default: el invoice
+                    # split solo necesita Entry ID / Invoice # / Status / Amount,
+                    # y esas cuatro tambien estan en 'Paid Invoices', asi que sin
+                    # esto un cambio de tab pasa como si nada.
+                    required_columns=("Rejected Reason", "Aging"),
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.

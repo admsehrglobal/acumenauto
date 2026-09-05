@@ -21,16 +21,17 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 
 # Gap between the rejected pile and the payable one. Paul loads the rejections
 # first so an invoice resubmitted to Acumen ends up with the right final status
-# in ZipRide; Juan asked for 20 minutes on 2026-08-27 (he had been offered 5).
+# in ZipRide. Juan asked for 20 minutes on 2026-08-27 (he had been offered 5);
+# Paul asked for 5 on 2026-08-29 and that is what this is now.
 #
 # The wait sits in this command, after Playwright has closed and inside the try,
 # which is what keeps it honest: a run that overruns is marked FAILED by Celery's
-# soft limit instead of leaving a zombie holding the worker. It fits — the daily
-# run measured between 48s and 567s over the last month, so the worst case is
-# about 29.5 minutes against a 38 minute soft limit. The margin is 8.5 minutes
-# rather than the 28 we had, and a deploy landing inside the window costs the
-# payable pile for that run.
-INVOICE_PILE_GAP_S = 20 * 60
+# soft limit instead of leaving a zombie holding the worker. It fits comfortably —
+# the daily run measured between 48s and 567s over the last month, so the worst
+# case is about 14.5 minutes against a 38 minute soft limit, a margin of 23.5
+# minutes. A deploy landing inside the window still costs the payable pile for
+# that run, but the window is now a quarter of what it was.
+INVOICE_PILE_GAP_S = 5 * 60
 
 
 def _notify_failure(run: Run) -> None:

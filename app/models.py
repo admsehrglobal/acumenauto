@@ -178,3 +178,37 @@ class FileException(models.Model):
     @property
     def key_display(self) -> str:
         return f"{self.key_1} / {self.key_2}" if self.key_2 else self.key_1
+
+class PaSchedule(models.Model):
+    """What the accrual matrix export does not carry, per PA number.
+
+    Since 2026-09-03 the accrual file is rebuilt from the report's other tab
+    (see `app.accrual_rebuild`), and that export has the PA number, the week and
+    the amount but not the client id or the authorization's own dates. Those are
+    kept here instead, because no single source has them all:
+
+    - the authorization report, refreshed on every run that downloads it, holds
+      only CURRENT authorizations — 63% of the PAs in the accrual data are not
+      in it;
+    - the historical ones come from the last accrual file produced before the
+      portal changed, loaded once with `seed_pa_schedules`.
+
+    Together they covered 4,066 of 4,079 PAs in a measured quarter. Rows for a
+    PA that is in neither still go out, with these three columns empty and the
+    count reported.
+    """
+
+    pa_number = models.CharField(max_length=64, primary_key=True)
+    client_dddid = models.CharField(max_length=64, blank=True, default="")
+    start_date = models.DateField(null=True, blank=True)
+    end_date = models.DateField(null=True, blank=True)
+    # Which of the two sources last wrote this row, so a stale seeded value is
+    # tellable from one the authorization report confirmed today.
+    source = models.CharField(max_length=16, default="auth_report")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["pa_number"]
+
+    def __str__(self) -> str:
+        return f"PA {self.pa_number}"

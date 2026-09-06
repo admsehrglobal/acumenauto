@@ -143,12 +143,18 @@ class AccrualDropTests(unittest.TestCase):
         return [(r[1], r[2]) for r in _read(path)[1][1:]]
 
     def test_both_parts_must_match(self):
+        """Solo sale la fila cuya clave completa esta en la lista.
+
+        La fila en blanco que PBI deja antes del footer ya no viaja al archivo:
+        desde el 2026-09-05 no cuenta como dato, que es lo que mantenia
+        desactivado el guard de "reporte vacio" (cuatro chunks sin una sola fila
+        daban total_rows == 4 y salia un archivo con solo el header).
+        """
         drop = make_drop_spec("accruals", [("431798", "1553308787")])
         out = self.d / "out.xlsx"
         _merge_xlsx_files([self.chunk], out, None, drop)
         self.assertEqual(self._keys(out), [
             ("653983", "1553308787"),
-            (None, None),
             (None, "1553411994"),
             ("306194", "1553411994"),
         ])

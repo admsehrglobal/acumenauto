@@ -23,11 +23,29 @@ from app.scraper import _read
 COLUMNS = ("PA Number", "Client DDDID", "Start Date", "End Date")
 
 
+def _read_csv(path: Path) -> list:
+    """El CSV del repo, devuelto con la misma forma que un xlsx leido."""
+    import csv
+
+    with path.open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.reader(fh))
+    header = ["PA Number", "Client DDDID", "Start Date", "End Date"]
+    return [header] + rows[1:]
+
+
 class Command(BaseCommand):
     help = "Seed the PA lookup from a previous accrual file."
 
     def add_arguments(self, parser):
-        parser.add_argument("path")
+        parser.add_argument(
+            "path",
+            nargs="?",
+            help=(
+                "Un accrual file. Por defecto el CSV historico que viaja en el "
+                "repo (app/data/pa_seed.csv), que ya carga solo en la primera "
+                "corrida; este comando es para rehacerlo a mano."
+            ),
+        )
         parser.add_argument(
             "--overwrite",
             action="store_true",
@@ -38,11 +56,16 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        path = Path(options["path"])
+        path = Path(
+            options["path"]
+            or Path(__file__).resolve().parents[2] / "data" / "pa_seed.csv"
+        )
         if not path.exists():
             raise CommandError(f"no existe: {path}")
 
-        rows = _read(str(path))
+        rows = (
+            _read_csv(path) if path.suffix.lower() == ".csv" else _read(str(path))
+        )
         index = {
             str(c).strip(): n
             for n, c in enumerate(rows[0])

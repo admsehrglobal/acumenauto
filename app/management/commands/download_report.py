@@ -1,17 +1,20 @@
 import asyncio
+import datetime as dt
 import logging
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import xlsxwriter
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from app.accrual_rebuild import OUTPUT_COLUMNS, PaFacts, as_date, rebuild
 from app.email_utils import send_error_report, send_reports_email, verify_delivery
-from app.models import AppConfig, Recipient, Run
+from app.models import AppConfig, PaSchedule, Recipient, Run
 from app.invoice_split import PILE_PAYABLE, subject_override_for
-from app.scraper import ChunkedReport, download_reports
+from app.scraper import ChunkedReport, MatrixReport, _read, download_reports
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,113 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 # rather than the 28 we had, and a deploy landing inside the window costs the
 # payable pile for that run.
 INVOICE_PILE_GAP_S = 20 * 60
+
+
+
+# El accrual file dejo de poder exportarse de su propia pestaña el 2026-09-03 y
+# se arma desde la matriz del reporte (ver `app.accrual_rebuild`). Esa matriz no
+# trae el client id ni las fechas de la autorizacion, asi que se guardan en
+# `PaSchedule` y se refrescan con cada reporte de autorizaciones que baja.
+ACCRUAL_FLOOR = dt.date(2025, 6, 1)
+
+
+def _refresh_pa_schedules(path: Path) -> int:
+    """Guarda lo que el reporte de autorizaciones sabe de cada PA.
+
+    Corre antes de que el archivo se mande, porque el envio lo borra. Nunca
+    puede voltear una corrida: el archivo ya esta bien y esto es bookkeeping.
+    """
+    try:
+        rows = _read(path)
+        index = {str(c).strip(): n for n, c in enumerate(rows[0]) if c not in (None, "")}
+        needed = ("PA Number", "Client DDDID", "Start Date", "End Date")
+        if any(name not in index for name in needed):
+            logger.warning(
+                "[PA LOOKUP] el reporte de auths no trae %s — no actualizo nada",
+                [n for n in needed if n not in index],
+            )
+            return 0
+        seen: dict[str, PaSchedule] = {}
+        for row in rows[1:]:
+            first = row[0] if row else None
+            if isinstance(first, str) and first.startswith("Applied filters:"):
+                continue
+            pa = row[index["PA Number"]]
+            if pa in (None, ""):
+                continue
+            if isinstance(pa, float) and pa.is_integer():
+                pa = int(pa)
+            pa = str(pa).strip()
+            seen[pa] = PaSchedule(
+                pa_number=pa,
+                client_dddid=str(row[index["Client DDDID"]] or "").strip(),
+                start_date=as_date(row[index["Start Date"]]),
+                end_date=as_date(row[index["End Date"]]),
+                source="auth_report",
+            )
+        PaSchedule.objects.bulk_create(
+            list(seen.values()),
+            update_conflicts=True,
+            update_fields=["client_dddid", "start_date", "end_date", "source"],
+            unique_fields=["pa_number"],
+        )
+        logger.warning("[PA LOOKUP] %d PAs actualizados desde el reporte de auths",
+                       len(seen))
+        return len(seen)
+    except Exception:  # noqa: BLE001 - el archivo ya esta listo para enviarse
+        logger.exception("[PA LOOKUP] no pude actualizar el lookup de PAs")
+        return 0
+
+
+def _pa_lookup() -> dict:
+    return {
+        p.pa_number: PaFacts(p.client_dddid, p.start_date, p.end_date)
+        for p in PaSchedule.objects.all().iterator()
+    }
+
+
+def _assemble_accrual(parts, button_name, output_dir, timestamp_label):
+    """Los chunks de la matriz -> el accrual file de siempre, siete columnas."""
+    lookup = _pa_lookup()
+    rows, unmatched = [], set()
+    for part in parts:
+        result = rebuild(_read(part), lookup)
+        rows.extend(result.rows)
+        unmatched |= result.unmatched_pas
+
+    if not rows:
+        raise ValueError(
+            "accrual: la matriz no devolvio ni una fila — no mando un archivo vacio"
+        )
+
+    slug = "_".join(button_name.lower().split())
+    dates = [r[5] for r in rows if r[5] is not None]
+    span = f"{min(dates)}_to_{max(dates)}" if dates else "sin_fechas"
+    path = output_dir / f"{slug}_{span}_{timestamp_label}.xlsx"
+
+    workbook = xlsxwriter.Workbook(str(path))
+    sheet = workbook.add_worksheet()
+    date_format = workbook.add_format({"num_format": "yyyy-mm-dd"})
+    sheet.write_row(0, 0, OUTPUT_COLUMNS)
+    for r, row in enumerate(rows, start=1):
+        for c, value in enumerate(row):
+            if isinstance(value, dt.date):
+                sheet.write_datetime(
+                    r, c,
+                    dt.datetime(value.year, value.month, value.day),
+                    date_format,
+                )
+            else:
+                sheet.write(r, c, value)
+    workbook.close()
+
+    blank = sum(1 for r in rows if not r[1])
+    logger.warning(
+        "[REPORT matrix] %s: %d filas; %d (%.2f%%) sin Client DDDID / fechas, "
+        "en %d PAs",
+        path.name, len(rows), blank, 100 * blank / len(rows), len(unmatched),
+    )
+    return path, button_name
 
 
 def _notify_failure(run: Run) -> None:
@@ -87,6 +197,7 @@ class Command(BaseCommand):
 
         reports = []
         chunked_reports = []
+        matrix_reports = []
         # R1 (Vendor Payment Activity) se chunkea por date of service: un solo
         # date range slicer, sin tabs.
         if config.report_1_enabled and 1 in filter_ids:
@@ -126,27 +237,25 @@ class Command(BaseCommand):
                 (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2)
             )
         # R3 (Vendor Auth Accrual): tab con detalle PA + 2 date slicers.
+        # R3 (Vendor Auth Accrual). Salia del tab 'PA Details and Schedule by
+        # Client' hasta que el portal, el 2026-09-03, lo dejo devolviendo cero
+        # filas salvo que se elija UN PA a mano — y son ~6.000. Ahora se arma
+        # desde la matriz del tab por defecto, que sigue entera, y se completan
+        # las tres columnas que esa matriz no trae con `PaSchedule`.
+        # Se siguen incluyendo los accruals programados a futuro, hasta el fondo
+        # del slicer (Paul los quiere: es plata agendada real, confirmado
+        # 2026-06-15).
         if config.report_3_enabled and 3 in filter_ids:
-            chunked_reports.append(
-                ChunkedReport(
+            matrix_reports.append(
+                MatrixReport(
                     url=settings.DCI_REPORT_URL_3,
                     button_name=settings.DCI_REPORT_BUTTON_NAME_3,
-                    n_chunks=config.date_range_chunks,
-                    today=nj_started.date(),
-                    tab_name="PA Details and Schedule by",
-                    single_slicer=False,  # 2 slicers, identificar el correcto
-                    # chunkeamos la PA End Date hasta el MAX del slicer (no perder
-                    # PAs vigentes) e incluimos TODOS los accruals, tambien los
-                    # programados a futuro (Paul los quiere — plata agendada real
-                    # hasta el fondo del slicer, confirmado 2026-06-15).
-                    full_range=True,
-                    reset_slicers=(),  # R3 no tiene dropdown slicers que limpiar
-                    # R3 no tiene columna Status: un split lo dejaria en cero filas.
-                    invoice_split=False,
+                    n_chunks=config.date_range_chunks * 2,
+                    floor_date=ACCRUAL_FLOOR,
                 )
             )
 
-        if not reports and not chunked_reports:
+        if not reports and not chunked_reports and not matrix_reports:
             run.status = Run.Status.SUCCESS
             run.finished_at = timezone.now()
             run.save()
@@ -209,6 +318,11 @@ class Command(BaseCommand):
                 path.unlink(missing_ok=True)
 
         def on_report_ready(path: Path, display_name: str) -> None:
+            # Antes de mandarlo, porque el envio borra el archivo: el reporte de
+            # autorizaciones es la unica fuente fresca del lookup de PAs que el
+            # accrual necesita, y corre en otra invocacion que el accrual.
+            if display_name == settings.DCI_REPORT_BUTTON_NAME_2:
+                _refresh_pa_schedules(path)
             if no_email:
                 # --no-email: dejamos el archivo en output_dir para inspeccion.
                 sent.append(path.name)
@@ -229,6 +343,10 @@ class Command(BaseCommand):
                     timestamp_label=timestamp_label,
                     chunked_reports=chunked_reports,
                     on_report_ready=on_report_ready,
+                    matrix_reports=matrix_reports,
+                    assemble_matrix=lambda parts, name: _assemble_accrual(
+                        parts, name, output_dir, timestamp_label
+                    ),
                 )
             )
             if deferred:

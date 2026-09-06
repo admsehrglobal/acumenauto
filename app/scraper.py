@@ -60,6 +60,24 @@ LOGIN_5XX_ATTEMPTS = 5
 LOGIN_5XX_BACKOFF_S = 30
 
 
+class MatrixReport(NamedTuple):
+    """The accrual report, taken from its matrix tab instead of its detail tab.
+
+    Its own tab stopped returning rows unless a single PA is picked by hand
+    (2026-09-03), so the file is rebuilt from the matrix on the report's default
+    tab, which exports flat under 'Summarized data'. The scraper only downloads
+    the pieces; `app.accrual_rebuild` turns them into the file, because that
+    needs the database and this module stays Django-free.
+    """
+
+    url: str
+    button_name: str
+    n_chunks: int
+    # No se pide desde el principio del slicer: el archivo nunca llevo nada
+    # anterior a junio 2025 y los chunks vacios cuestan minutos igual.
+    floor_date: dt.date
+
+
 class ChunkedReport(NamedTuple):
     """One report downloaded in N date-range chunks.
 
@@ -104,6 +122,8 @@ async def download_reports(
     timestamp_label: str,
     chunked_reports: list["ChunkedReport"] = (),
     on_report_ready=None,
+    matrix_reports: list["MatrixReport"] = (),
+    assemble_matrix=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
@@ -188,6 +208,29 @@ async def download_reports(
                 results.extend(chunked_items)
                 for item in chunked_items:
                     await _ready(item)
+
+            for spec in matrix_reports:
+                await report_page.goto(spec.url)
+                logger.warning("[REPORT matrix] URL post-goto: %s", report_page.url)
+                parts = await _export_matrix_report(
+                    report_page,
+                    spec.button_name,
+                    spec.n_chunks,
+                    output_dir,
+                    timestamp_label,
+                    spec.floor_date,
+                )
+                try:
+                    # El armado lee la base (el lookup de PAs), asi que vive en
+                    # el caller: este modulo se mantiene Django-free.
+                    item = await asyncio.to_thread(
+                        assemble_matrix, parts, spec.button_name
+                    )
+                finally:
+                    for part in parts:
+                        part.unlink(missing_ok=True)
+                results.append(item)
+                await _ready(item)
             return results
         except Exception:
             await _dump_debug(context, output_dir)
@@ -370,6 +413,132 @@ async def _export_excel(
     target = output_dir / f"{slug}_{timestamp_label}.xlsx"
     await download.save_as(target)
     return target
+
+
+async def _export_matrix_visual(page, iframe, target: Path) -> bool:
+    """Export the matrix visual as 'Summarized data'. True if a file landed.
+
+    Two things here are not tidy and must not be tidied:
+
+    - the export shape is chosen by clicking the radio's LABEL. The input itself
+      sits outside the viewport, so Playwright cannot click it, and a JS click
+      on it sets `checked` without telling the component — the dialog then
+      closes on Export and no file is ever produced (two five-minute timeouts
+      spent learning that);
+    - the visual's "..." menu does not always open on the first click while the
+      visual is still re-rendering the new filter, the same way it does not for
+      the other chunked report, so it gets the same retry.
+    """
+    matrix = iframe.get_by_role("group").filter(has_text="Vendor").first
+    more_btn = matrix.get_by_test_id("visual-more-options-btn")
+    export_item = iframe.get_by_test_id("pbimenu-item.Export data")
+
+    for attempt in range(3):
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(1)
+        await matrix.hover()
+        await more_btn.wait_for(state="visible")
+        await more_btn.click(force=True)
+        try:
+            await export_item.wait_for(state="visible", timeout=8000)
+            break
+        except PlaywrightTimeoutError:
+            logger.warning(
+                "[REPORT matrix] el menu del visual no abrio (intento %d/3)",
+                attempt + 1,
+            )
+            if attempt == 2:
+                return False
+
+    await export_item.click(force=True)
+    await asyncio.sleep(4)
+    radio = iframe.locator('input[type=radio][aria-label="Summarized data"]')
+    radio_id = await radio.get_attribute("id")
+    await iframe.locator(f'label[for="{radio_id}"]').first.click(force=True)
+    await asyncio.sleep(2)
+
+    try:
+        async with page.expect_download(timeout=120000) as download_info:
+            await iframe.get_by_test_id("export-btn").click(force=True)
+        download = await download_info.value
+        await download.save_as(target)
+        return True
+    except PlaywrightTimeoutError:
+        logger.warning("[REPORT matrix] el export no devolvio archivo")
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(2)
+        return False
+
+
+async def _export_matrix_report(
+    page: Page,
+    button_name: str,
+    n_chunks: int,
+    output_dir: Path,
+    timestamp_label: str,
+    floor_date: dt.date,
+) -> list[Path]:
+    """Download the accrual matrix in date chunks and return the parts.
+
+    Chunked for the same reason everything else is: Power BI caps an xlsx export
+    at 150,000 rows, and this visual prints a line per PA per week.
+    """
+    iframe = await _open_report_iframe(page, button_name)
+    await asyncio.sleep(10)
+
+    date_inputs = iframe.locator("input[aria-label*='Available input range']")
+    label = await date_inputs.nth(0).get_attribute("aria-label")
+    lo, hi = label.split("Available input range ")[1].split(" to ")
+    slicer_min, date_fmt = _parse_filter_date(lo.strip())
+    slicer_max, _ = _parse_filter_date(hi.strip())
+    start = max(slicer_min, floor_date)
+    logger.warning(
+        "[REPORT matrix] slicer %s..%s, pidiendo desde %s",
+        slicer_min, slicer_max, start,
+    )
+
+    slug = "_".join(button_name.lower().split())
+    parts: list[Path] = []
+    for seq, (chunk_start, chunk_end) in enumerate(
+        _chunk_date_range(start, slicer_max, n_chunks), start=1
+    ):
+        target = output_dir / (
+            f"{slug}_matrix_{seq:02d}_{chunk_start.isoformat()}"
+            f"_to_{chunk_end.isoformat()}_{timestamp_label}.xlsx"
+        )
+        for attempt in range(1, 4):
+            await _set_date_filter(
+                date_inputs.nth(0), date_inputs.nth(1),
+                chunk_start, chunk_end, date_fmt,
+            )
+            if not await _export_matrix_visual(page, iframe, target):
+                continue
+            rows = _read(target)
+            # Mismo chequeo que los otros chunks: el filtro se escribe en un
+            # textbox y el primer commit de cada corrida se pierde.
+            if any(
+                lo_ == chunk_start
+                and hi_ is not None
+                and chunk_end <= hi_ <= chunk_end + dt.timedelta(days=1)
+                for lo_, hi_ in _applied_ranges(rows)
+            ):
+                logger.warning(
+                    "[REPORT matrix] Part %d (%s a %s) OK (%d lineas)",
+                    seq, chunk_start, chunk_end, len(rows),
+                )
+                parts.append(target)
+                break
+            logger.warning(
+                "[REPORT matrix] Part %d: el export dice %s, reaplicando el "
+                "filtro (intento %d/3)",
+                seq, _applied_ranges(rows) or "ningun rango", attempt,
+            )
+        else:
+            raise ValueError(
+                f"accrual matrix: el chunk {seq} ({chunk_start}..{chunk_end}) "
+                f"no se pudo bajar en 3 intentos"
+            )
+    return parts
 
 
 async def _export_chunked_report(

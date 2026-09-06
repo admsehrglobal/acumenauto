@@ -97,6 +97,14 @@ class ChunkedReport(NamedTuple):
     full_range: bool
     reset_slicers: tuple[str, ...] = ()
     invoice_split: bool = False
+    # Otros tabs del MISMO reporte cuyas filas van al mismo archivo. Existe
+    # porque el 2026-09-03 el portal partio las filas del invoice file en dos
+    # pestañas: 'Vendor Entry Status' se quedo con todo menos los pagados
+    # (lleva un filtro fijo `Status is not Paid`) y los pagados se fueron a
+    # 'Paid Invoices'. Sin esto el archivo sale con el 8% de las filas que
+    # llevaba antes. Cada tab tiene su propio extent de fechas y su propio
+    # juego de columnas; los headers se normalizan antes de unir.
+    extra_tabs: tuple[str, ...] = ()
     # Columnas que el export TIENE que traer. No es el esquema completo a
     # proposito: el esquema deriva solo (R1 paso de 13 a 14 columnas en agosto)
     # y fijarlo entero seria una falla por mes. Van las que identifican al tab
@@ -204,6 +212,7 @@ async def download_reports(
                     reset_slicers=spec.reset_slicers,
                     invoice_split=spec.invoice_split,
                     required_columns=spec.required_columns,
+                    extra_tabs=spec.extra_tabs,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -541,6 +550,63 @@ async def _export_matrix_report(
     return parts
 
 
+async def _prepare_tab(
+    page: Page,
+    iframe,
+    tab_name: str | None,
+    *,
+    single_slicer: bool,
+    reset_slicers: tuple[str, ...],
+):
+    """Select a tab, clear its dropdown slicers, and read its date slicer.
+
+    Extracted so the same preparation can run for a second tab of the same
+    report without duplicating it: since 2026-09-03 the invoice file's rows are
+    split across two tabs, and each carries its own slicers and its own date
+    extent — the payment activity report's two tabs ended 8/31 and 8/27 on the
+    same day.
+
+    Returns (date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt).
+    """
+    # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
+    # totales). Switch al tab con detalle PA + schedule semanal.
+    if tab_name is not None:
+        await iframe.get_by_role("tab", name=tab_name).click()
+        await asyncio.sleep(3)
+
+    # Los dropdown slicers arrastran la seleccion que dejo el ultimo humano en el
+    # portal; los limpiamos antes de exportar (ver _clear_slicer_filter).
+    for slicer_label in reset_slicers:
+        await _clear_slicer_filter(page, iframe, slicer_label)
+
+    # Esperamos a que carguen todos los date inputs antes de leer el slicer.
+    # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
+    # Date) carga unos segundos despues del A, leer antes identifica mal.
+    # R1: 1 slicer x 2 textboxes = 2 inputs.
+    needed_inputs = 2 if single_slicer else 4
+    date_inputs = iframe.locator("input[aria-label*='Available input range']")
+    deadline = asyncio.get_event_loop().time() + 30
+    while True:
+        count = await date_inputs.count()
+        if count >= needed_inputs:
+            break
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError(
+                f"Only {count} date inputs after 30s (needed {needed_inputs})"
+            )
+        await asyncio.sleep(0.5)
+
+    if single_slicer:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _read_single_slicer(date_inputs)
+        )
+    else:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _identify_accrual_slicer(date_inputs)
+        )
+    return date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt
+
+
 async def _export_chunked_report(
     page: Page,
     button_name: str,
@@ -555,6 +621,7 @@ async def _export_chunked_report(
     reset_slicers: tuple[str, ...] = (),
     invoice_split: bool = False,
     required_columns: tuple[str, ...] = (),
+    extra_tabs: tuple[str, ...] = (),
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -586,44 +653,12 @@ async def _export_chunked_report(
     """
     iframe = await _open_report_iframe(page, button_name)
 
-    # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
-    # totales). Switch al tab con detalle PA + schedule semanal. R1 no tiene
-    # tabs (tab_name=None) → se saltea.
-    if tab_name is not None:
-        await iframe.get_by_role("tab", name=tab_name).click()
-
-    # Los dropdown slicers arrastran la seleccion que dejo el ultimo humano en el
-    # portal; los limpiamos antes de exportar (ver _clear_slicer_filter).
-    for slicer_label in reset_slicers:
-        await _clear_slicer_filter(page, iframe, slicer_label)
-
-    # Esperamos a que carguen todos los date inputs antes de leer el slicer.
-    # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
-    # Date) carga unos segundos despues del A, leer antes identifica mal.
-    # R1: 1 slicer x 2 textboxes = 2 inputs.
-    needed_inputs = 2 if single_slicer else 4
-    date_inputs = iframe.locator(
-        "input[aria-label*='Available input range']"
+    date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+        await _prepare_tab(
+            page, iframe, tab_name,
+            single_slicer=single_slicer, reset_slicers=reset_slicers,
+        )
     )
-    deadline = asyncio.get_event_loop().time() + 30
-    while True:
-        count = await date_inputs.count()
-        if count >= needed_inputs:
-            break
-        if asyncio.get_event_loop().time() > deadline:
-            raise TimeoutError(
-                f"Only {count} date inputs after 30s (needed {needed_inputs})"
-            )
-        await asyncio.sleep(0.5)
-
-    if single_slicer:
-        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
-            await _read_single_slicer(date_inputs)
-        )
-    else:
-        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
-            await _identify_accrual_slicer(date_inputs)
-        )
     start_date = slicer_min
     # R3 (full_range=True): chunkeamos la PA End Date hasta slicer_max tal cual.
     # Asi entran TODOS los PAs (incluso los que terminan a futuro) y TODOS sus
@@ -646,10 +681,22 @@ async def _export_chunked_report(
         start_date, end_date, today, slicer_max, full_range,
     )
 
-    start_input = date_inputs.nth(start_idx)
-    end_input = date_inputs.nth(end_idx)
-
     slug = "_".join(button_name.lower().split())
+
+    # Contexto de la pestaña que se esta exportando. Es mutable a proposito: el
+    # exporter de abajo lo lee en cada chunk, y el loop lo reescribe al pasar al
+    # tab siguiente, que tiene sus propios inputs de fecha, su propio extent y
+    # sus propias columnas. Con `extra_tabs` vacio se escribe una sola vez y
+    # todo se comporta igual que antes.
+    tab = {
+        "start_input": date_inputs.nth(start_idx),
+        "end_input": date_inputs.nth(end_idx),
+        "fmt": date_fmt,
+        "min": slicer_min,
+        "max": slicer_max,
+        "required_columns": required_columns,
+        "prefix": "",
+    }
 
     # (start, end, data_rows) per exported part. `_split_for_email` needs it to
     # group parts into files that fit an email and to label each file with its
@@ -671,14 +718,16 @@ async def _export_chunked_report(
         logger.warning("[REPORT chunked] Exporting part %d (%s)", seq, label)
 
         part_path = output_dir / (
-            f"{slug}_part_{seq:03d}"
+            f"{slug}{tab['prefix']}_part_{seq:03d}"
             f"_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
         # Un chunk que cubre el extent entero del slicer no deja rastro en el
         # footer (no hay filtro que restatear), asi que ahi no hay nada que
         # verificar; en cualquier otro caso el footer tiene que confirmarlo.
-        covers_everything = chunk_start <= slicer_min and chunk_end >= slicer_max
+        covers_everything = (
+            chunk_start <= tab["min"] and chunk_end >= tab["max"]
+        )
         expected = (None, None) if covers_everything else (chunk_start, chunk_end)
 
         async def _download_once():
@@ -720,12 +769,14 @@ async def _export_chunked_report(
 
         for attempt in range(1, _FILTER_ATTEMPTS + 1):
             await _set_date_filter(
-                start_input, end_input, chunk_start, chunk_end, date_fmt
+                tab["start_input"], tab["end_input"],
+                chunk_start, chunk_end, tab["fmt"],
             )
             await _download_once()
             try:
                 rows = _validate_chunk_xlsx(
-                    part_path, *expected, required_columns=required_columns
+                    part_path, *expected,
+                    required_columns=tab["required_columns"],
                 )
                 break
             except AppliedFilterMismatch as exc:
@@ -751,6 +802,45 @@ async def _export_chunked_report(
         threshold=_RESPLIT_THRESHOLD,
         max_parts=_MAX_PARTS,
     )
+
+    # Los demas tabs que aportan filas al mismo archivo. Cada uno se prepara de
+    # cero: tiene sus propios inputs de fecha (los del tab anterior quedan
+    # detached al cambiar de pestaña), su propio extent y sus propias columnas.
+    for index, extra in enumerate(extra_tabs, start=1):
+        (
+            extra_inputs, extra_start_idx, extra_end_idx,
+            extra_min, extra_max, extra_fmt,
+        ) = await _prepare_tab(
+            page, iframe, extra,
+            single_slicer=single_slicer,
+            # Los slicers de `reset_slicers` son los del tab principal; pedirlos
+            # aca colgaria 60s esperando un locator que este tab no tiene.
+            reset_slicers=(),
+        )
+        tab.update({
+            "start_input": extra_inputs.nth(extra_start_idx),
+            "end_input": extra_inputs.nth(extra_end_idx),
+            "fmt": extra_fmt,
+            "min": extra_min,
+            "max": extra_max,
+            # `required_columns` identifica al tab principal; este tab, por
+            # definicion, no las tiene todas.
+            "required_columns": (),
+            "prefix": f"_tab{index}",
+        })
+        extra_end = extra_max if full_range else min(today, extra_max)
+        logger.warning(
+            "[REPORT chunked] Tab extra %r: %s a %s", extra, extra_min, extra_end,
+        )
+        part_paths += await _export_ranges_adaptive(
+            _export_one_range,
+            _chunk_date_range(extra_min, extra_end, n_chunks),
+            threshold=_RESPLIT_THRESHOLD,
+            max_parts=_MAX_PARTS,
+        )
+
+    if extra_tabs:
+        _normalise_part_headers(part_paths)
 
     # One pile for a plain chunked report (R3), two for the invoice file (R1).
     # The pile goes into the slug: both piles cover the same date range, so
@@ -998,6 +1088,63 @@ def _classify_invoice_piles(
         len(all_rows) - len(split.rejected) - len(split.payable),
     )
     return split, _meta_for(split.rejected), _meta_for(split.payable)
+
+
+def _normalise_part_headers(paths: list[Path]) -> None:
+    """Give every part the same columns, so parts from two tabs can be merged.
+
+    The two tabs the invoice file now comes from do not carry the same columns:
+    the one with the rejections has `Rejected Reason` and `Aging`, and the one
+    with the paid entries does not. `_merge_xlsx_files` refuses a header that
+    does not match the first chunk's, and rightly so — that check is what would
+    catch a real schema drift.
+
+    So the parts are reconciled here instead, once, before anything reads them:
+    the first part's columns are the shape, every other part is rewritten to it
+    matching by column NAME, and a column a part does not have is left empty.
+    Columns are never dropped: a part carrying a column the first one lacks is
+    a real difference and stops the run rather than losing data quietly.
+    """
+    if not paths:
+        return
+    canonical = [str(c).strip() if c is not None else "" for c in _read(paths[0])[0]]
+    for path in paths[1:]:
+        rows = _read(path)
+        header = [str(c).strip() if c is not None else "" for c in rows[0]]
+        if header == canonical:
+            continue
+        unknown = [c for c in header if c and c not in canonical]
+        if unknown:
+            raise ValueError(
+                f"{path.name}: trae columnas que el primer chunk no tiene "
+                f"({unknown}) — no las tiro en silencio"
+            )
+        source = {name: i for i, name in enumerate(header) if name}
+        logger.warning(
+            "[REPORT chunked] %s: normalizando %d columnas a %d (faltan %s)",
+            path.name, len(header), len(canonical),
+            [c for c in canonical if c not in source] or "ninguna",
+        )
+        rewritten = path.with_name(f"{path.stem}.norm{path.suffix}")
+        workbook = xlsxwriter.Workbook(str(rewritten))
+        sheet = workbook.add_worksheet()
+        fmt_datetime = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+        fmt_date = workbook.add_format({"num_format": "yyyy-mm-dd"})
+        sheet.write_row(0, 0, canonical)
+        out_row = 1
+        for row in _data_rows(rows):
+            for col, name in enumerate(canonical):
+                i = source.get(name)
+                value = row[i] if i is not None and i < len(row) else None
+                if isinstance(value, dt.datetime):
+                    sheet.write_datetime(out_row, col, value, fmt_datetime)
+                elif isinstance(value, dt.date):
+                    sheet.write_datetime(out_row, col, value, fmt_date)
+                else:
+                    sheet.write(out_row, col, value)
+            out_row += 1
+        workbook.close()
+        rewritten.replace(path)
 
 
 def _merge_xlsx_files(

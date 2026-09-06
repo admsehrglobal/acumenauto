@@ -13,7 +13,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("app", "0013_dci_credentials"),
+        ("app", "0014_pa_schedule"),
     ]
 
     operations = [

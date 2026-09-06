@@ -265,6 +265,12 @@ class Command(BaseCommand):
                     # y esas cuatro tambien estan en 'Paid Invoices', asi que sin
                     # esto un cambio de tab pasa como si nada.
                     required_columns=("Rejected Reason", "Aging"),
+                    # 'Vendor Entry Status' lleva un filtro fijo del reporte,
+                    # `Status is not Paid`, asi que por si solo entrega el 8% de
+                    # las filas que el archivo llevaba antes del 2026-09-03:
+                    # 2.420 contra 100.462, porque los 96.660 pagados se fueron
+                    # a esta otra pestaña. Las dos se exportan y se unen.
+                    extra_tabs=("Paid Invoices",),
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.

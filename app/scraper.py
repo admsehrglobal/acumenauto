@@ -27,6 +27,7 @@ import python_calamine
 import xlsxwriter
 from playwright.async_api import (
     BrowserContext,
+    Error as PlaywrightError,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -388,15 +389,23 @@ async def _open_report_iframe(
             # a que el boton sea accionable. Usamos el mismo budget que el iframe.
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-            except PlaywrightTimeoutError:
+            except PlaywrightError as exc:
                 # A page too wedged to mount the PBI iframe is often too wedged to
-                # reload either, so both timeouts fire together. Letting the reload
-                # error escape would kill the run on attempt 1 and void the retry.
-                # Burn the attempt and re-click anyway.
+                # reload either. Letting the reload error escape would kill the run
+                # on attempt 1 and void the retry. Burn the attempt and re-click.
+                #
+                # PlaywrightError, not PlaywrightTimeoutError: the reload does not
+                # only time out. Run #757 (2026-08-27 14:00) died on
+                # `Page.reload: net::ERR_ABORTED; maybe frame was detached?`, which
+                # is a plain Error — it escaped the narrower except and killed the
+                # run on the first attempt, with the other two never happening.
+                # TimeoutError subclasses Error, so this still covers the slow
+                # reload. Deliberately NOT `except Exception`: Celery's
+                # SoftTimeLimitExceeded and a cancellation have to keep propagating.
                 logger.warning(
-                    "[REPORT] recovery reload timed out after %ds, "
-                    "re-clicking anyway (attempt %d/%d)",
-                    timeout_ms // 1000, attempt, attempts,
+                    "[REPORT] recovery reload failed (%s), re-clicking anyway "
+                    "(attempt %d/%d)",
+                    type(exc).__name__, attempt, attempts,
                 )
 
 

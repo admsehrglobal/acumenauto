@@ -106,19 +106,76 @@ class ExceptionWiringTests(unittest.TestCase):
         self.assertIsNotNone(chunked[0].exceptions)
         self.assertEqual(chunked[0].exceptions.columns, REPORTS["invoices"].columns)
 
-    def test_the_auth_file_is_filtered_by_the_auths_list_under_its_button_name(self):
+    def _ready_calls(self, display_name):
+        """Run the callback for one report and return what it did, in order."""
         kwargs = self._run()
-        simple = kwargs["simple_exceptions"]
-        # Keyed by button name: the scraper looks the list up by the same value
-        # it iterates the simple reports with, not by URL.
-        self.assertEqual(set(simple), {settings.DCI_REPORT_BUTTON_NAME_2})
-        spec = simple[settings.DCI_REPORT_BUTTON_NAME_2]
-        self.assertIsNotNone(spec)
-        self.assertEqual(spec.columns, REPORTS["auths"].columns)
+        calls = []
+        with mock.patch.object(
+            cmd, "_refresh_pa_schedules",
+            lambda p: calls.append(("refresh", p)),
+        ), mock.patch.object(
+            cmd, "_apply_exceptions_in_place",
+            lambda p, spec: calls.append(("filter", spec)),
+        ):
+            kwargs["on_report_ready"](self.tmp / "r.xlsx", display_name)
+        return kwargs, calls
+
+    def test_the_auth_file_is_filtered_by_the_auths_list(self):
+        _, calls = self._ready_calls(settings.DCI_REPORT_BUTTON_NAME_2)
+        filters = [c for c in calls if c[0] == "filter"]
+        self.assertEqual(len(filters), 1)
+        self.assertEqual(filters[0][1].columns, REPORTS["auths"].columns)
+
+    def test_the_lookup_is_refreshed_before_the_rows_are_dropped(self):
+        """An excluded authorization leaves the email, not the PA lookup that
+        feeds the accrual file. Filtering first would freeze that PA."""
+        _, calls = self._ready_calls(settings.DCI_REPORT_BUTTON_NAME_2)
+        self.assertEqual([c[0] for c in calls], ["refresh", "filter"])
+
+    def test_no_other_report_is_touched_by_the_auths_list(self):
+        _, calls = self._ready_calls(settings.DCI_REPORT_BUTTON_NAME)
+        self.assertEqual(calls, [])
+
+    def test_the_auth_report_is_still_asked_for(self):
+        kwargs = self._run()
         self.assertIn(
             (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2),
             kwargs["reports"],
         )
+
+    def test_a_failure_filtering_the_auth_file_does_not_take_the_run_with_it(self):
+        """This filter used to run inside the scraper's simple-report loop,
+        which executes before the chunked one: a column rename in R2 aborted the
+        run before the invoice file had been downloaded, and both files were
+        lost. Now only the auth file is."""
+        kwargs = self._run()
+
+        def _boom(path, spec):
+            raise ValueError("missing column(s) ['Client DDDID']")
+
+        with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None), \
+                mock.patch.object(cmd, "_apply_exceptions_in_place", _boom):
+            kwargs["on_report_ready"](
+                self.tmp / "r.xlsx", settings.DCI_REPORT_BUTTON_NAME_2
+            )
+
+    def test_the_unfiltered_auth_file_is_never_emailed_after_a_failure(self):
+        """Sending it unfiltered would deliver the very rows Paul excluded."""
+        kwargs = self._run()
+        sent = []
+
+        def _boom(path, spec):
+            raise ValueError("missing column(s) ['Client DDDID']")
+
+        with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None), \
+                mock.patch.object(cmd, "_apply_exceptions_in_place", _boom), \
+                mock.patch.object(
+                    cmd, "send_reports_email",
+                    lambda items, r, l, override=None: sent.append(items) or []):
+            kwargs["on_report_ready"](
+                self.tmp / "r.xlsx", settings.DCI_REPORT_BUTTON_NAME_2
+            )
+        self.assertEqual(sent, [])
 
     def test_the_accrual_file_is_filtered_by_the_accruals_list(self):
         kwargs = self._run()

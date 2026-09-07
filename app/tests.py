@@ -15,7 +15,7 @@ from django.utils.html import escape
 from openpyxl import Workbook
 
 from app.management.commands.download_report import _load_exceptions, _stamp_matches
-from app.models import FileException
+from app.models import FileException, FileExceptionChange
 
 
 def _xlsx(rows) -> bytes:
@@ -126,6 +126,63 @@ class FileExceptionsPagesTests(TestCase):
         entry.refresh_from_db()
         self.assertIsNone(entry.removed_at)
         self.assertEqual(FileException.objects.count(), 1)
+
+    def test_the_record_of_changes_keeps_every_change_not_just_the_last(self):
+        """The promise to Rob (2026-08-31): "keep a record of those changes so
+        they can be reverted if needed". Before the log, this exact sequence
+        left no trace that the key had ever been removed: re-adding it
+        overwrote created_at/created_by and the removal was gone."""
+        self._add("invoices", key_1="500")
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self._add("invoices", key_1="500")
+
+        actions = list(
+            FileExceptionChange.objects.filter(entry=entry)
+            .order_by("at", "id")
+            .values_list("action", flat=True)
+        )
+        self.assertEqual(actions, ["added", "removed", "restored"])
+        self.assertEqual(FileException.objects.count(), 1)
+
+    def test_restoring_does_not_rewrite_when_the_key_was_first_listed(self):
+        self._add("invoices", key_1="500")
+        entry = FileException.objects.get()
+        first_listed, first_by = entry.created_at, entry.created_by
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self.client.post(reverse("exception_restore", args=["invoices", entry.pk]))
+        entry.refresh_from_db()
+        self.assertEqual((entry.created_at, entry.created_by),
+                         (first_listed, first_by))
+        self.assertIsNone(entry.removed_at)
+
+    def test_every_change_says_who_made_it(self):
+        self._add("invoices", key_1="500")
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self.assertEqual(
+            set(FileExceptionChange.objects.values_list("by", flat=True)), {"paul"}
+        )
+
+    def test_the_page_shows_both_the_removal_and_the_re_add(self):
+        self._add("invoices", key_1="500")
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self._add("invoices", key_1="500")
+        response = self.client.get(reverse("exceptions_list", args=["invoices"]))
+        body = response.content.decode()
+        for word in ("Added", "Removed", "Restored"):
+            self.assertIn(word, body)
+
+    def test_a_change_log_row_belongs_to_the_report_it_was_made_on(self):
+        self._add("invoices", key_1="500")
+        self._add("accruals", key_1="306194", key_2="1553411994")
+        self.assertEqual(
+            FileExceptionChange.objects.filter(report="invoices").count(), 1
+        )
+        self.assertEqual(
+            FileExceptionChange.objects.filter(report="accruals").count(), 1
+        )
 
     def test_a_search_finds_a_removed_entry_so_it_can_be_restored(self):
         self._add("invoices", key_1="500")

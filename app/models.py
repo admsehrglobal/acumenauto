@@ -179,6 +179,44 @@ class FileException(models.Model):
     def key_display(self) -> str:
         return f"{self.key_1} / {self.key_2}" if self.key_2 else self.key_1
 
+
+class FileExceptionChange(models.Model):
+    """One row per change to an entry. Never updated, never deleted.
+
+    Ev promised Rob in writing on 2026-08-31: "keep a record of those changes so
+    they can be reverted if needed". The entry itself could not be that record.
+    It carried a single `created_at`/`removed_at` pair, so any key touched twice
+    lost its history: add a key, remove it, add it again, and the removal was
+    overwritten — the page then showed the key as freshly added, with nothing
+    saying it had ever been taken off the list.
+
+    Append-only is the point. The entry still says what is true NOW (`active`,
+    who removed it, what the last run did with it); this says what happened, in
+    order. `report` is denormalised so the page reads one report's history
+    without a join.
+    """
+
+    ADDED = "added"
+    REMOVED = "removed"
+    RESTORED = "restored"
+    ACTIONS = [(ADDED, "Added"), (REMOVED, "Removed"), (RESTORED, "Restored")]
+
+    entry = models.ForeignKey(
+        FileException, on_delete=models.CASCADE, related_name="changes"
+    )
+    report = models.CharField(max_length=20)
+    action = models.CharField(max_length=10, choices=ACTIONS)
+    at = models.DateTimeField(default=timezone.now)
+    by = models.CharField(max_length=150, blank=True, default="")
+
+    class Meta:
+        ordering = ["-at", "-id"]
+        indexes = [models.Index(fields=["report", "-at"])]
+
+    def __str__(self) -> str:
+        return f"{self.entry.key_display} {self.action} {self.at:%Y-%m-%d %H:%M}"
+
+
 class PaSchedule(models.Model):
     """What the accrual matrix export does not carry, per PA number.
 

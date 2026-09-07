@@ -132,9 +132,9 @@ class RowFilterTests(unittest.TestCase):
 class SummarizeTests(unittest.TestCase):
     def test_only_reports_that_wrote_a_file_are_mentioned(self):
         ran = DropSpec("Invoices", ("Invoice #",), frozenset({("1",), ("2",)}),
-                       {"a.xlsx": (3, {("1",)}), "b.xlsx": (1, {("1",)})})
+                       {"a.xlsx": (3, {("1",)}), "b.xlsx": (1, {("1",)})}, set())
         idle = DropSpec("Accruals", ("Client DDDID", "PA Number"),
-                        frozenset({("1", "A")}), {})
+                        frozenset({("1", "A")}), {}, set())
         self.assertEqual(
             summarize([ran, None, idle]),
             "Invoices: 4 rows dropped (1 of 2 keys matched)",
@@ -142,6 +142,58 @@ class SummarizeTests(unittest.TestCase):
 
     def test_nothing_applied_is_an_empty_line(self):
         self.assertEqual(summarize([None]), "")
+
+    def test_a_file_the_list_emptied_is_named_in_the_run_record(self):
+        spec = DropSpec("Invoices", ("Invoice #",), frozenset({("1",)}),
+                        {"a.xlsx": (3, {("1",)})}, {"a.xlsx"})
+        self.assertEqual(
+            summarize([spec]),
+            "Invoices: 3 rows dropped (1 of 1 keys matched), "
+            "1 file(s) not emailed (no rows left)",
+        )
+
+
+class EmptiedFileTests(unittest.TestCase):
+    """Juan Pablo, 2026-09-07: "If an exclusion leaves a file with no data rows,
+    I would not send it." Only that case: a pile that had nothing to begin with
+    still goes out empty, because on those days the empty file is the answer and
+    silence is not."""
+
+    def _spec(self):
+        return make_drop_spec("invoices", [("1",)])
+
+    def _filter(self, spec, rows):
+        row_filter = RowFilter(["Invoice #"], spec)
+        return sum(1 for r in rows if not row_filter.drops(r)), row_filter
+
+    def test_a_file_the_list_emptied_is_marked(self):
+        spec = self._spec()
+        written, row_filter = self._filter(spec, [["1"], ["1"]])
+        spec.record("out.xlsx", row_filter, written)
+        self.assertEqual(written, 0)
+        self.assertIn("out.xlsx", spec.emptied)
+
+    def test_a_file_that_was_already_empty_is_not_marked(self):
+        spec = self._spec()
+        written, row_filter = self._filter(spec, [])
+        spec.record("out.xlsx", row_filter, written)
+        self.assertEqual((written, row_filter.dropped), (0, 0))
+        self.assertEqual(spec.emptied, set())
+
+    def test_a_file_with_survivors_is_not_marked(self):
+        spec = self._spec()
+        written, row_filter = self._filter(spec, [["1"], ["2"]])
+        spec.record("out.xlsx", row_filter, written)
+        self.assertEqual(written, 1)
+        self.assertEqual(spec.emptied, set())
+
+    def test_forgetting_the_big_merge_also_unmarks_it(self):
+        spec = self._spec()
+        written, row_filter = self._filter(spec, [["1"]])
+        spec.record("merged.xlsx", row_filter, written)
+        spec.forget("merged.xlsx")
+        self.assertEqual(spec.emptied, set())
+        self.assertEqual(spec.stats, {})
 
 
 class ParseUploadTests(unittest.TestCase):

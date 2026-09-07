@@ -465,6 +465,11 @@ def _apply_exceptions_in_place(path: Path, drop: DropSpec) -> None:
     filtered = path.with_name(f"{path.stem}.filtered{path.suffix}")
     _merge_xlsx_files([path], filtered, None, drop, sheet_name=sheet_name)
     os.replace(filtered, path)
+    if filtered in drop.emptied:
+        # The merge marked the temporary name; everything downstream holds the
+        # original Path, and that is the one the command checks before emailing.
+        drop.emptied.discard(filtered)
+        drop.emptied.add(path)
 async def _export_matrix_visual(page, iframe, target: Path) -> bool:
     """Export the matrix visual as 'Summarized data'. True if a file landed.
 
@@ -1318,7 +1323,7 @@ def _merge_xlsx_files(
         output_path.stat().st_size / 1048576,
     )
     if row_filter is not None:
-        drop.record(output_path, row_filter)
+        drop.record(output_path, row_filter, written)
         logger.warning(
             "[EXCEPTIONS] %s: dropped %d rows from %s (%d of %d keys matched)",
             drop.label, row_filter.dropped, output_path.name,

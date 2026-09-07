@@ -156,6 +156,20 @@ class FileExceptionsPagesTests(TestCase):
                          (first_listed, first_by))
         self.assertIsNone(entry.removed_at)
 
+    def test_re_adding_a_removed_key_does_not_rewrite_when_it_was_listed(self):
+        """The common path: Paul re-adds through the form or an upload, not
+        through the Restore button. This is the one that used to erase the
+        removal, so it is the one that has to be pinned."""
+        self._add("invoices", key_1="500")
+        entry = FileException.objects.get()
+        first_listed, first_by = entry.created_at, entry.created_by
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self._add("invoices", key_1="500")
+        entry.refresh_from_db()
+        self.assertEqual((entry.created_at, entry.created_by),
+                         (first_listed, first_by))
+        self.assertIsNone(entry.removed_at)
+
     def test_every_change_says_who_made_it(self):
         self._add("invoices", key_1="500")
         entry = FileException.objects.get()
@@ -170,9 +184,12 @@ class FileExceptionsPagesTests(TestCase):
         self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
         self._add("invoices", key_1="500")
         response = self.client.get(reverse("exceptions_list", args=["invoices"]))
-        body = response.content.decode()
-        for word in ("Added", "Removed", "Restored"):
-            self.assertIn(word, body)
+        # Asserted on the context, not the HTML: "Added" is also a column header
+        # on this page, so a text search passes even with an empty log.
+        self.assertEqual(
+            [c.action for c in response.context["recent"]],
+            ["restored", "removed", "added"],
+        )
 
     def test_a_change_log_row_belongs_to_the_report_it_was_made_on(self):
         self._add("invoices", key_1="500")

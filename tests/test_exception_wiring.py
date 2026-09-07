@@ -88,13 +88,17 @@ class ExceptionWiringTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _run(self):
+    def _run(self, ready=None):
+        """`ready` runs INSIDE handle(), so what the callback does reaches the
+        run record the same way a real report would."""
         async def _fake_download(**kwargs):
             self.kwargs = kwargs
+            if ready is not None:
+                ready(kwargs["on_report_ready"])
             return []
 
         with mock.patch.object(cmd, "download_reports", _fake_download):
-            cmd.Command().handle(output_dir=str(self.tmp), no_email=True,
+            cmd.Command().handle(output_dir=str(self.tmp), no_email=False,
                                  reports="1,2,3")
         return self.kwargs
 
@@ -176,6 +180,55 @@ class ExceptionWiringTests(unittest.TestCase):
                 self.tmp / "r.xlsx", settings.DCI_REPORT_BUTTON_NAME_2
             )
         self.assertEqual(sent, [])
+
+    def test_a_failure_filtering_the_auth_file_leaves_the_run_failed(self):
+        """Withholding the file quietly would be the worst of both: the client
+        gets no auth file and nothing says why."""
+        def _ready(callback):
+            with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None), \
+                    mock.patch.object(
+                        cmd, "_apply_exceptions_in_place",
+                        mock.Mock(side_effect=ValueError("missing column(s)"))):
+                callback(self.tmp / "r.xlsx", settings.DCI_REPORT_BUTTON_NAME_2)
+
+        self._run(ready=_ready)
+        self.assertEqual(self.run.status, cmd.Run.Status.FAILED)
+        self.assertIn("missing column(s)", self.run.error_message)
+
+    def test_a_file_an_exclusion_emptied_is_not_emailed(self):
+        """Juan Pablo, 2026-09-07: "If an exclusion leaves a file with no data
+        rows, I would not send it"."""
+        sent = []
+        path = self.tmp / "rejected.xlsx"
+        path.write_bytes(b"x")
+
+        def _ready(callback):
+            self.kwargs["chunked_reports"][0].exceptions.emptied.add(path)
+            with mock.patch.object(
+                cmd, "send_reports_email",
+                lambda items, r, l, override=None: sent.append(items) or [],
+            ):
+                callback(path, "rejected " + settings.DCI_REPORT_BUTTON_NAME)
+
+        self._run(ready=_ready)
+        self.assertEqual(sent, [])
+
+    def test_a_file_nothing_emptied_is_emailed(self):
+        """The other half: without this the test above passes on a broken
+        _send that never emails anything."""
+        sent = []
+        path = self.tmp / "rejected.xlsx"
+        path.write_bytes(b"x")
+
+        def _ready(callback):
+            with mock.patch.object(
+                cmd, "send_reports_email",
+                lambda items, r, l, override=None: sent.append(items) or [],
+            ):
+                callback(path, "rejected " + settings.DCI_REPORT_BUTTON_NAME)
+
+        self._run(ready=_ready)
+        self.assertEqual(len(sent), 1)
 
     def test_the_accrual_file_is_filtered_by_the_accruals_list(self):
         kwargs = self._run()

@@ -305,6 +305,15 @@ class UploadAliasTests(unittest.TestCase):
         parsed = parse_upload(rows, REPORTS["invoices"])
         self.assertEqual(parsed.keys, [("110847",)])
 
+    def test_an_alias_only_applies_to_the_report_whose_key_needs_it(self):
+        """`DDD ID` aliases `Client DDDID`, which is not part of the invoices
+        key. If the table were consulted for every report, a sheet of invoice
+        numbers that also carries a DDD ID column would start being refused for
+        a missing 'Invoice #' with the column sitting right there."""
+        rows = [["External Invoice Number", "DDD ID"], ["110847", "306194"]]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("110847",)])
+
     def test_aliases_never_reach_the_resolver_used_on_our_exports(self):
         """`column_indexes` reads the files we write. A name guessed wrong there
         keys a whole report on the wrong column and drops rows silently, so the

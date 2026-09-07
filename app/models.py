@@ -210,6 +210,8 @@ class FileExceptionChange(models.Model):
     by = models.CharField(max_length=150, blank=True, default="")
 
     class Meta:
+        # Newest first: the page shows the last 25 changes, so flipping this
+        # would freeze that panel on the first 25 changes ever made.
         ordering = ["-at", "-id"]
         indexes = [models.Index(fields=["report", "-at"])]
 

@@ -32,17 +32,25 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 
 # Gap between the rejected pile and the payable one. Paul loads the rejections
 # first so an invoice resubmitted to Acumen ends up with the right final status
-# in ZipRide. Juan asked for 20 minutes on 2026-08-27 (he had been offered 5);
-# Paul asked for 5 on 2026-08-29 and that is what this is now.
+# in ZipRide.
+#
+# Settled by the two people it affects, on the thread of 2026-09-07: Juan asked
+# for 20 minutes (his import wants the first file finished before the second
+# arrives), Paul answered that his side takes 2 to 3 minutes and asked for 5,
+# and Juan closed it at 10. Nobody gets to change this one alone — it is their
+# agreement, not our tuning knob.
 #
 # The wait sits in this command, after Playwright has closed and inside the try,
 # which is what keeps it honest: a run that overruns is marked FAILED by Celery's
-# soft limit instead of leaving a zombie holding the worker. It fits comfortably —
-# the daily run measured between 48s and 567s over the last month, so the worst
-# case is about 14.5 minutes against a 38 minute soft limit, a margin of 23.5
-# minutes. A deploy landing inside the window still costs the payable pile for
-# that run, but the window is now a quarter of what it was.
-INVOICE_PILE_GAP_S = 5 * 60
+# soft limit instead of leaving a zombie holding the worker. The work either side
+# of the wait measured between 48s and 567s over the month before the invoice
+# file went back to reading two tabs, so the worst case here is about 19.5
+# minutes against a 38 minute soft limit. Reading the second tab roughly doubles
+# the chunk exports, so that 567s is the number to re-measure after the deploy —
+# if the work alone ever approaches 28 minutes, this constant is the lever, not
+# the chunk count. A deploy landing inside the window still costs the payable
+# pile for that run.
+INVOICE_PILE_GAP_S = 10 * 60
 
 
 

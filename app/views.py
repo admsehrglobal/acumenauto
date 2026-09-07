@@ -9,6 +9,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib import messages
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.db.models import Q
 from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -312,13 +313,19 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int]:
             entry.removed_at = None
             entry.removed_by = ""
             to_restore.append(entry)
-    FileException.objects.bulk_create(to_create, batch_size=500)
-    if to_restore:
-        FileException.objects.bulk_update(
-            to_restore, ["removed_at", "removed_by"], batch_size=500,
-        )
-    _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
-    _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
+    # One transaction: the entries and their rows in the record of changes go in
+    # together or not at all. Without it a failure between the two leaves keys
+    # live —dropping rows from tomorrow's file— with nothing in the record
+    # saying they were added, and `exception_upload_confirm` tells the operator
+    # the upload failed while the list has in fact changed.
+    with transaction.atomic():
+        FileException.objects.bulk_create(to_create, batch_size=500)
+        if to_restore:
+            FileException.objects.bulk_update(
+                to_restore, ["removed_at", "removed_by"], batch_size=500,
+            )
+        _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
+        _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
     return len(to_create), len(to_restore), already
 
 
@@ -523,11 +530,12 @@ def exception_remove(request, report: str, pk: int):
     entry = get_object_or_404(FileException, pk=pk, report=report)
     if entry.active:
         now = timezone.now()
-        entry.removed_at = now
-        entry.removed_by = request.user.username
-        entry.save(update_fields=["removed_at", "removed_by"])
-        _log_changes([entry], FileExceptionChange.REMOVED,
-                     request.user.username, now)
+        with transaction.atomic():
+            entry.removed_at = now
+            entry.removed_by = request.user.username
+            entry.save(update_fields=["removed_at", "removed_by"])
+            _log_changes([entry], FileExceptionChange.REMOVED,
+                         request.user.username, now)
         messages.success(request, f"{entry.key_display} removed.")
     return redirect("exceptions_list", report=report)
 
@@ -540,11 +548,12 @@ def exception_restore(request, report: str, pk: int):
     if not entry.active:
         # `created_at` is left alone: it is when the key first went on the list,
         # and overwriting it here is what used to erase the removal being undone.
-        entry.removed_at = None
-        entry.removed_by = ""
-        entry.save(update_fields=["removed_at", "removed_by"])
-        _log_changes([entry], FileExceptionChange.RESTORED,
-                     request.user.username, timezone.now())
+        with transaction.atomic():
+            entry.removed_at = None
+            entry.removed_by = ""
+            entry.save(update_fields=["removed_at", "removed_by"])
+            _log_changes([entry], FileExceptionChange.RESTORED,
+                         request.user.username, timezone.now())
         messages.success(request, f"{entry.key_display} restored.")
     return redirect("exceptions_list", report=report)
 

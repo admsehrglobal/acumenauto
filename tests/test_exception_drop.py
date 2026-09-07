@@ -233,6 +233,66 @@ class RawExportRewriteTests(unittest.TestCase):
         self.assertEqual(sum(n for n, _ in drop.stats.values()), 1)
 
 
+class EmptiedByTheListTests(unittest.TestCase):
+    """A file the list left with no data rows is remembered, so the command can
+    skip that email (Juan Pablo, 2026-09-07). Only that case: a file that had
+    nothing to begin with is not marked, because that one still goes out."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_a_merge_the_list_emptied_is_marked_under_the_output_path(self):
+        part = self.d / "part.xlsx"
+        _make_xlsx(part, R1_HEADER, [_r1(1, "500"), _r1(2, "500")])
+        drop = make_drop_spec("invoices", [("500",)])
+        out = self.d / "merged.xlsx"
+        _merge_xlsx_files([part], out, None, drop)
+        self.assertEqual(drop.emptied, {out})
+
+    def test_a_merge_with_survivors_is_not_marked(self):
+        part = self.d / "part.xlsx"
+        _make_xlsx(part, R1_HEADER, [_r1(1, "500"), _r1(2, "501")])
+        drop = make_drop_spec("invoices", [("500",)])
+        out = self.d / "merged.xlsx"
+        _merge_xlsx_files([part], out, None, drop)
+        self.assertEqual(drop.emptied, set())
+
+    def test_a_pile_that_was_already_empty_is_not_marked(self):
+        """No rejected invoices today is an answer, not a gap: that file still
+        goes out, so nothing may mark it."""
+        part = self.d / "part.xlsx"
+        _make_xlsx(part, R1_HEADER, [_r1(1, "500")])
+        drop = make_drop_spec("invoices", [("999",)])
+        out = self.d / "merged.xlsx"
+        _merge_xlsx_files([part], out, frozenset(), drop)
+        self.assertEqual(drop.emptied, set())
+
+    def test_r2_is_marked_under_the_path_the_command_will_look_up(self):
+        """The rewrite merges into a temporary name and then renames. The mark
+        has to end up on the ORIGINAL path: that is the one `_send` is holding,
+        and if it stays on the temporary name the skip never fires for R2."""
+        raw = self.d / "view_vendor_authorization_report_ts.xlsx"
+        _make_xlsx(raw, R2_HEADER, [
+            [173066812, "A", "NJ1", "721253", "Approved"],
+        ], title="Export")
+        drop = make_drop_spec("auths", [("721253", "173066812")])
+        _apply_exceptions_in_place(raw, drop)
+        self.assertEqual(drop.emptied, {raw})
+        self.assertEqual(list(self.d.iterdir()), [raw])
+
+    def test_forgetting_the_big_merge_clears_its_mark_too(self):
+        part = self.d / "part.xlsx"
+        _make_xlsx(part, R1_HEADER, [_r1(1, "500")])
+        drop = make_drop_spec("invoices", [("500",)])
+        out = self.d / "merged.xlsx"
+        _merge_xlsx_files([part], out, None, drop)
+        self.assertEqual(drop.emptied, {out})
+        drop.forget(out)
+        self.assertEqual(drop.emptied, set())
+
+
 class SpecTests(unittest.TestCase):
     def test_no_exceptions_unless_the_command_passes_them(self):
         spec = ChunkedReport(

@@ -7,6 +7,7 @@ posterior, y agotamiento de intentos.
 """
 import unittest
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.scraper import _open_report_iframe
@@ -37,11 +38,14 @@ class _FakeLocator:
 class _FakePage:
     """Stub minimo de playwright Page para ejercitar el retry sin browser."""
 
-    def __init__(self, succeed_on, reload_raises_until=0):
+    def __init__(self, succeed_on, reload_raises_until=0,
+                 reload_error=PlaywrightTimeoutError):
         self.succeed_on = succeed_on  # primer intento (1-based) en que monta el iframe
-        # Reload attempts (1-based) that time out, as they do in prod when the page
-        # is too wedged to reload. 0 = reload always succeeds.
+        # Reload attempts (1-based) that fail, as they do in prod when the page is
+        # too wedged to reload. 0 = reload always succeeds. `reload_error` is how
+        # it fails: a timeout, or the plain Error prod actually produced.
         self.reload_raises_until = reload_raises_until
+        self.reload_error = reload_error
         self.attempt = 0
         self.reloads = 0
         self.calls = []
@@ -57,7 +61,7 @@ class _FakePage:
         self.reloads += 1
         self.calls.append(("reload", wait_until, timeout))
         if self.reloads <= self.reload_raises_until:
-            raise PlaywrightTimeoutError(f"Page.reload: Timeout {timeout}ms exceeded")
+            raise self.reload_error(f"Page.reload failed (timeout {timeout}ms)")
 
     def _clicks(self):
         return sum(1 for c in self.calls if c == ("click", "button"))
@@ -99,6 +103,34 @@ class IframeRetryTests(unittest.IsolatedAsyncioTestCase):
         frame = await _open_report_iframe(page, "Report", attempts=3, timeout_ms=10)
         self.assertEqual(frame, "FRAME-iframe")
         self.assertEqual(page.reloads, 2)
+        self.assertEqual(page._clicks(), 3)
+
+    async def test_a_reload_that_aborts_does_not_kill_the_run_either(self):
+        """Regression (prod, run #757, 2026-08-27 14:00): the recovery reload does
+        not only time out. That run died on
+
+            Page.reload: net::ERR_ABORTED; maybe frame was detached?
+
+        which is a plain playwright Error, not a TimeoutError. The except here only
+        caught the timeout, so this escaped, killed the run on attempt 1, and the
+        remaining attempts never happened - the retry was void for the one failure
+        production actually produced. Every test above raises a timeout, which is
+        why this looked covered for months."""
+        page = _FakePage(succeed_on=3, reload_raises_until=99,
+                         reload_error=PlaywrightError)
+        frame = await _open_report_iframe(page, "Report", attempts=3, timeout_ms=10)
+        self.assertEqual(frame, "FRAME-iframe")
+        self.assertEqual(page.reloads, 2)
+        self.assertEqual(page._clicks(), 3)
+
+    async def test_a_failing_reload_never_masks_the_terminal_error(self):
+        """Widening the except must not swallow the real failure: with every reload
+        aborting and the iframe never mounting, the helper still raises the iframe
+        timeout after the last attempt."""
+        page = _FakePage(succeed_on=99, reload_raises_until=99,
+                         reload_error=PlaywrightError)
+        with self.assertRaises(PlaywrightTimeoutError):
+            await _open_report_iframe(page, "Report", attempts=3, timeout_ms=10)
         self.assertEqual(page._clicks(), 3)
 
     async def test_reload_failures_still_end_in_the_iframe_timeout(self):

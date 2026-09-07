@@ -242,3 +242,7 @@ pw-*/
 # Reportes descargados localmente (cuando hacés docker compose cp)
 acumen/
 *.xlsx
+
+# Artefactos de debug del scraper (se generan al fallar un export)
+debug_out/
+tmp_error_*

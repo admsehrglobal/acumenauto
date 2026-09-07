@@ -10,7 +10,6 @@ from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib import messages
 from django.core.paginator import Paginator
 from django.db.models import Q
-from django.db.models.functions import Coalesce
 from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -31,7 +30,13 @@ from app.forms import (
     WeeklyReportConfigForm,
     WeeklyScheduleForm,
 )
-from app.models import AppConfig, FileException, Recipient, Run
+from app.models import (
+    AppConfig,
+    FileException,
+    FileExceptionChange,
+    Recipient,
+    Run,
+)
 from app.tasks import download_dci_reports, test_dci_login
 
 DAILY_TASK_NAME = "download-dci-reports-daily"
@@ -301,19 +306,35 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int]:
         elif entry.active:
             already += 1
         else:
-            entry.created_at = now
-            entry.created_by = actor
+            # `created_at` keeps the day the key first went on the list. It used
+            # to be overwritten here, which is exactly what erased the removal
+            # in between; the log below is what carries "added again".
             entry.removed_at = None
             entry.removed_by = ""
             to_restore.append(entry)
     FileException.objects.bulk_create(to_create, batch_size=500)
     if to_restore:
         FileException.objects.bulk_update(
-            to_restore,
-            ["created_at", "created_by", "removed_at", "removed_by"],
-            batch_size=500,
+            to_restore, ["removed_at", "removed_by"], batch_size=500,
         )
+    _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
+    _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
     return len(to_create), len(to_restore), already
+
+
+def _log_changes(entries, action: str, actor: str, at) -> None:
+    """Append one row per entry to the record of changes (never updates)."""
+    if not entries:
+        return
+    FileExceptionChange.objects.bulk_create(
+        [
+            FileExceptionChange(
+                entry=e, report=e.report, action=action, at=at, by=actor
+            )
+            for e in entries
+        ],
+        batch_size=500,
+    )
 
 
 def _upload_counts(spec, added: int, already: int, parsed) -> str:
@@ -364,12 +385,12 @@ def _exceptions_context(request, spec, key_form=None) -> dict:
     else:
         entries = entries.filter(removed_at__isnull=True)
     page = Paginator(entries, 50).get_page(request.GET.get("page"))
-    # The record of changes: every entry, latest change first. A removed entry
-    # keeps its row, so removals show up here with a Restore button.
+    # The record of changes, latest first: one row per change, not per entry, so
+    # a key that was removed and added again shows both. `select_related` keeps
+    # this to one query for the 25 rows.
     recent = (
-        FileException.objects.filter(report=report)
-        .annotate(changed_at=Coalesce("removed_at", "created_at"))
-        .order_by("-changed_at", "-id")[:25]
+        FileExceptionChange.objects.filter(report=report)
+        .select_related("entry")[:25]
     )
     return {
         "spec": spec,
@@ -501,9 +522,12 @@ def exception_remove(request, report: str, pk: int):
     _report_spec(report)
     entry = get_object_or_404(FileException, pk=pk, report=report)
     if entry.active:
-        entry.removed_at = timezone.now()
+        now = timezone.now()
+        entry.removed_at = now
         entry.removed_by = request.user.username
         entry.save(update_fields=["removed_at", "removed_by"])
+        _log_changes([entry], FileExceptionChange.REMOVED,
+                     request.user.username, now)
         messages.success(request, f"{entry.key_display} removed.")
     return redirect("exceptions_list", report=report)
 
@@ -514,13 +538,13 @@ def exception_restore(request, report: str, pk: int):
     _report_spec(report)
     entry = get_object_or_404(FileException, pk=pk, report=report)
     if not entry.active:
-        entry.created_at = timezone.now()
-        entry.created_by = request.user.username
+        # `created_at` is left alone: it is when the key first went on the list,
+        # and overwriting it here is what used to erase the removal being undone.
         entry.removed_at = None
         entry.removed_by = ""
-        entry.save(
-            update_fields=["created_at", "created_by", "removed_at", "removed_by"]
-        )
+        entry.save(update_fields=["removed_at", "removed_by"])
+        _log_changes([entry], FileExceptionChange.RESTORED,
+                     request.user.username, timezone.now())
         messages.success(request, f"{entry.key_display} restored.")
     return redirect("exceptions_list", report=report)
 

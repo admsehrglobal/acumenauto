@@ -172,18 +172,18 @@
       <p class="text-sm text-slate-600 mb-4">Latest first. A removed entry can be restored.</p>
       {% if recent %}
         <ul class="divide-y divide-slate-100 border border-slate-200 rounded text-sm">
-          {% for e in recent %}
+          {% for c in recent %}
             <li class="flex items-center justify-between px-3 py-2 gap-3">
               <div class="min-w-0">
-                <div class="font-mono {% if not e.active %}text-slate-400 line-through{% endif %} break-all">{{ e.key_display }}</div>
+                <div class="font-mono {% if not c.entry.active %}text-slate-400 line-through{% endif %} break-all">{{ c.entry.key_display }}</div>
                 <div class="text-xs text-slate-500">
-                  {% if e.active %}Added{% else %}Removed{% endif %}
-                  {{ e.changed_at|timezone:"America/New_York"|date:"Y-m-d H:i" }} NJ
-                  {% if e.active and e.created_by %}by {{ e.created_by }}{% elif not e.active and e.removed_by %}by {{ e.removed_by }}{% endif %}
+                  {{ c.get_action_display }}
+                  {{ c.at|timezone:"America/New_York"|date:"Y-m-d H:i" }} NJ
+                  {% if c.by %}by {{ c.by }}{% endif %}
                 </div>
               </div>
-              {% if not e.active %}
-                <form method="post" action="{% url 'exception_restore' spec.slug e.pk %}" class="inline shrink-0">
+              {% if not c.entry.active and c.action == 'removed' %}
+                <form method="post" action="{% url 'exception_restore' spec.slug c.entry.pk %}" class="inline shrink-0">
                   {% csrf_token %}
                   <button type="submit"
                           class="text-xs px-2 py-1 rounded border border-slate-300 hover:bg-slate-100">

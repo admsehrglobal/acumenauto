@@ -122,8 +122,10 @@ class ChunkedReport(NamedTuple):
     required_columns: tuple[str, ...] = ()
 
 
-# R1 goes out as two files: the rejections first, the payable entries 5 minutes
-# later, so an invoice resubmitted to Acumen lands in ZipRide with the right final
+# R1 goes out as two files: the rejections first, the payable entries after the
+# gap set in `download_report.INVOICE_PILE_GAP_S` (the number is only written
+# down there, so the two cannot drift apart again), so an invoice resubmitted to
+# Acumen lands in ZipRide with the right final
 # status (Paul, 2026-08-25). `PILE_REJECTED` / `PILE_PAYABLE` travel in the display
 # name and are what the caller matches on to pick the subject and to hold the
 # payable pile back; they live in `invoice_split` with the rest of that contract.

@@ -132,8 +132,10 @@ class DeliveryOrderTests(unittest.TestCase):
         self.assertEqual(kinds[2][0], "sent")
         self.assertIn(PILE_PAYABLE, kinds[2][1])
 
-    def test_the_gap_is_the_five_minutes_paul_asked_for(self):
-        self.assertEqual(cmd.INVOICE_PILE_GAP_S, 5 * 60)
+    def test_the_gap_is_the_ten_minutes_paul_and_juan_agreed_on(self):
+        """Juan asked 20, Paul asked 5, Juan closed it at 10 on the thread of
+        2026-09-07. Pinned because it is their agreement, not a tuning knob."""
+        self.assertEqual(cmd.INVOICE_PILE_GAP_S, 10 * 60)
 
     def test_empty_exception_lists_leave_the_run_record_blank(self):
         self._run_command()

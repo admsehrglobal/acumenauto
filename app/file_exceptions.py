@@ -116,18 +116,29 @@ class DropSpec(NamedTuple):
     It travels with the spec so the command can report what happened without
     the scraper growing a new return type. `_split_for_email` forgets the entry
     of the big merge it deletes, so a re-merged report is never counted twice.
+
+    `emptied` holds the files this list left with no data rows at all, which the
+    command reads to skip that email (Juan Pablo, 2026-09-07: "If an exclusion
+    leaves a file with no data rows, I would not send it"). It is deliberately
+    NOT "the file came out empty": a file that had nothing to begin with — a day
+    with no rejected invoices — still goes out empty, because that is an answer
+    and silence is not. Only a file this list emptied is held back.
     """
 
     label: str
     columns: tuple[str, ...]
     keys: frozenset[tuple[str, ...]]
     stats: dict
+    emptied: set
 
-    def record(self, output_path, row_filter: "RowFilter") -> None:
+    def record(self, output_path, row_filter: "RowFilter", written: int) -> None:
         self.stats[output_path] = (row_filter.dropped, set(row_filter.matched))
+        if written == 0 and row_filter.dropped:
+            self.emptied.add(output_path)
 
     def forget(self, output_path) -> None:
         self.stats.pop(output_path, None)
+        self.emptied.discard(output_path)
 
 
 def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
@@ -146,7 +157,7 @@ def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
             keys.add(fold_key(key))
     if not keys:
         return None
-    return DropSpec(spec.label, spec.columns, frozenset(keys), {})
+    return DropSpec(spec.label, spec.columns, frozenset(keys), {}, set())
 
 
 class RowFilter:
@@ -183,10 +194,13 @@ def summarize(specs: Iterable[DropSpec | None]) -> str:
         matched: set = set()
         for _, keys in spec.stats.values():
             matched |= keys
-        parts.append(
+        line = (
             f"{spec.label}: {rows} rows dropped "
             f"({len(matched)} of {len(spec.keys)} keys matched)"
         )
+        if spec.emptied:
+            line += f", {len(spec.emptied)} file(s) not emailed (no rows left)"
+        parts.append(line)
     return " | ".join(parts)
 
 

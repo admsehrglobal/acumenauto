@@ -204,7 +204,9 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label, drop=None
     workbook.close()
 
     if drop is not None:
-        drop.record(path, row_filter)
+        # Never zero here: the guard above already refused to write a file the
+        # list had emptied, so this path can never land in `drop.emptied`.
+        drop.record(path, row_filter, len(rows))
         logger.warning(
             "[EXCEPTIONS] %s: dropped %d rows from %s (%d of %d keys matched)",
             drop.label, row_filter.dropped, path.name,
@@ -431,7 +433,26 @@ class Command(BaseCommand):
         # is closed, so the wait costs a sleeping worker and not a live session.
         deferred: list[tuple[Path, str]] = []
 
+        def _emptied_by(path: Path):
+            """The list that left this file with no data rows, if any."""
+            for spec in exceptions.values():
+                if spec is not None and path in spec.emptied:
+                    return spec
+            return None
+
         def _send(path: Path, display_name: str) -> None:
+            # Juan Pablo, 2026-09-07: "If an exclusion leaves a file with no data
+            # rows, I would not send it." Only that case — a pile that was empty
+            # before any exception is still emailed, because on those days the
+            # empty file is the answer.
+            emptied_by = _emptied_by(path)
+            if emptied_by is not None:
+                logger.warning(
+                    "[EXCEPTIONS] %s no se envia: la lista de %s lo dejo sin "
+                    "una sola fila", display_name, emptied_by.label,
+                )
+                path.unlink(missing_ok=True)
+                return
             subject_override = subject_override_for(
                 display_name, subject_label, settings.DCI_REPORT_BUTTON_NAME_3
             )

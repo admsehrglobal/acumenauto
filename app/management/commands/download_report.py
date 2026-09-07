@@ -101,7 +101,43 @@ def _refresh_pa_schedules(path: Path) -> int:
         return 0
 
 
+# Las autorizaciones historicas, sacadas del ultimo accrual file bueno (el del
+# 2026-06-15) y reducidas a las cuatro columnas que hacen falta. Viaja en el
+# repo a proposito: el reporte de autorizaciones solo tiene las VIGENTES, y sin
+# esto el 63% de las filas saldria sin Client DDDID ni fechas. Es un dato fijo,
+# no crece; lo de todos los dias lo aporta R2.
+SEED_CSV = Path(__file__).resolve().parents[2] / "data" / "pa_seed.csv"
+
+
+def _seed_pa_schedules_if_empty() -> int:
+    """Carga el seed la primera vez, para que prender el reporte sea un click.
+
+    Solo cuando la tabla esta vacia: despues manda R2, que es dato de hoy.
+    """
+    if PaSchedule.objects.exists() or not SEED_CSV.exists():
+        return 0
+    import csv
+
+    with SEED_CSV.open(encoding="utf-8", newline="") as fh:
+        rows = [
+            PaSchedule(
+                pa_number=r["pa_number"],
+                client_dddid=r["client_dddid"],
+                start_date=as_date(r["start_date"]),
+                end_date=as_date(r["end_date"]),
+                source="seed",
+            )
+            for r in csv.DictReader(fh)
+            if r.get("pa_number")
+        ]
+    PaSchedule.objects.bulk_create(rows, ignore_conflicts=True)
+    logger.warning("[PA LOOKUP] sembrados %d PAs historicos desde %s",
+                   len(rows), SEED_CSV.name)
+    return len(rows)
+
+
 def _pa_lookup() -> dict:
+    _seed_pa_schedules_if_empty()
     return {
         p.pa_number: PaFacts(p.client_dddid, p.start_date, p.end_date)
         for p in PaSchedule.objects.all().iterator()
@@ -314,6 +350,12 @@ class Command(BaseCommand):
                     # y esas cuatro tambien estan en 'Paid Invoices', asi que sin
                     # esto un cambio de tab pasa como si nada.
                     required_columns=("Rejected Reason", "Aging"),
+                    # 'Vendor Entry Status' lleva un filtro fijo del reporte,
+                    # `Status is not Paid`, asi que por si solo entrega el 8% de
+                    # las filas que el archivo llevaba antes del 2026-09-03:
+                    # 2.420 contra 100.462, porque los 96.660 pagados se fueron
+                    # a esta otra pestaña. Las dos se exportan y se unen.
+                    extra_tabs=("Paid Invoices",),
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.

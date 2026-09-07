@@ -139,16 +139,16 @@ async def download_reports(
     timestamp_label: str,
     chunked_reports: list["ChunkedReport"] = (),
     on_report_ready=None,
-    simple_exceptions: dict[str, DropSpec] | None = None,
     matrix_reports: list["MatrixReport"] = (),
     assemble_matrix=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
-    `simple_exceptions` maps a simple report's button_name to its File
-    Exceptions list; the raw download is rewritten in place without those rows
-    before `on_report_ready` sees it. Chunked reports carry theirs in
-    `ChunkedReport.exceptions`.
+    A simple report's File Exceptions list is applied by the caller inside
+    `on_report_ready`, not here: this loop runs BEFORE the chunked one, so a
+    failure while filtering used to abort the run before the invoice file had
+    even been downloaded. Chunked reports carry theirs in
+    `ChunkedReport.exceptions`, which is applied while their file is written.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
@@ -207,9 +207,6 @@ async def download_reports(
                 path = await _export_excel(
                     report_page, button_name, output_dir, timestamp_label
                 )
-                drop = (simple_exceptions or {}).get(button_name)
-                if drop is not None:
-                    await asyncio.to_thread(_apply_exceptions_in_place, path, drop)
                 item = (path, button_name)
                 results.append(item)
                 await _ready(item)

@@ -22,7 +22,13 @@ from app.file_exceptions import (
 )
 from app.models import AppConfig, FileException, PaSchedule, Recipient, Run
 from app.invoice_split import PILE_PAYABLE, subject_override_for
-from app.scraper import ChunkedReport, MatrixReport, _read, download_reports
+from app.scraper import (
+    ChunkedReport,
+    MatrixReport,
+    _apply_exceptions_in_place,
+    _read,
+    download_reports,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -477,7 +483,28 @@ class Command(BaseCommand):
             # autorizaciones es la unica fuente fresca del lookup de PAs que el
             # accrual necesita, y corre en otra invocacion que el accrual.
             if display_name == settings.DCI_REPORT_BUTTON_NAME_2:
+                # El refresh va con el archivo ENTERO, antes de filtrarlo: una
+                # excepcion de auths saca la fila del mail, no del lookup, y si
+                # se filtrara primero ese PA quedaria congelado en la tabla que
+                # alimenta el accrual.
                 _refresh_pa_schedules(path)
+                drop = exceptions["auths"]
+                if drop is not None:
+                    try:
+                        _apply_exceptions_in_place(path, drop)
+                    except Exception as exc:
+                        # Este filtro corria dentro del loop de reportes simples
+                        # del scraper, que va ANTES del chunked: un rename de
+                        # columna en R2 mataba la corrida entera y no salia ni
+                        # el invoice file. Aca se pierde solo R2. No se manda sin
+                        # filtrar —serian filas que Paul saco— y el run queda
+                        # FAILED con aviso, no verde en silencio.
+                        logger.exception(
+                            "[EXCEPTIONS] no se pudo filtrar %s", display_name
+                        )
+                        send_errors.append(f"{display_name}: {exc}")
+                        path.unlink(missing_ok=True)
+                        return
             if no_email:
                 # --no-email: dejamos el archivo en output_dir para inspeccion.
                 sent.append(path.name)
@@ -498,9 +525,6 @@ class Command(BaseCommand):
                     timestamp_label=timestamp_label,
                     chunked_reports=chunked_reports,
                     on_report_ready=on_report_ready,
-                    simple_exceptions={
-                        settings.DCI_REPORT_BUTTON_NAME_2: exceptions["auths"]
-                    },
                     matrix_reports=matrix_reports,
                     assemble_matrix=lambda parts, name: _assemble_accrual(
                         parts, name, output_dir, timestamp_label,

@@ -192,7 +192,7 @@ class ParseUploadTests(unittest.TestCase):
 
     def test_a_headerless_two_column_sheet_is_still_refused(self):
         """The auths export puts Authorization ID first and Client DDDID
-        fourth, so guessing the order would store every key swapped."""
+        fifth, so guessing the order would store every key swapped."""
         with self.assertRaises(ValueError):
             parse_upload([["173066812", "721253"]], REPORTS["auths"])
 
@@ -211,6 +211,56 @@ class ParseUploadTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             parse_upload([["Invoice Number"], ["1"]], REPORTS["auths"])
         self.assertIn("'Client DDDID' and 'Authorization ID'", str(ctx.exception))
+
+
+class UploadAliasTests(unittest.TestCase):
+    """Paul's own exports label our key columns differently.
+
+    Measured on the three files he sent on 2026-09-05: the invoice one heads its
+    numbers 'External Invoice Number' and the accrual one 'DDD ID' + 'PA Number'.
+    Before this, all three were refused with "could not find the column
+    header(s)", which is what he would have hit on his first upload.
+    """
+
+    def test_pauls_invoice_export_header_is_accepted(self):
+        rows = [
+            ["Row", "External Invoice Number", "Client Number", "Client Name"],
+            [1, "110847", "NJ00000107", "Moore, A."],
+            [2, "220851206", "NJ00000160", "Bailey, C."],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("110847",), ("220851206",)])
+
+    def test_pauls_accrual_export_header_is_accepted(self):
+        rows = [
+            ["DDD ID", "PA Number", "Client Name"],
+            ["306194", "1553411994", "Void, V."],
+        ]
+        parsed = parse_upload(rows, REPORTS["accruals"])
+        self.assertEqual(parsed.keys, [("306194", "1553411994")])
+
+    def test_pauls_auth_export_is_still_refused(self):
+        """His auth export carries neither identifier, so there is nothing to
+        alias to - it has to keep failing loudly rather than half-resolve."""
+        rows = [["Row", "Acumen Client ID", "DDD ID", "Client Name"],
+                [1, "A-1", "306194", "Void, V."]]
+        with self.assertRaises(ValueError) as ctx:
+            parse_upload(rows, REPORTS["auths"])
+        self.assertIn("Authorization ID", str(ctx.exception))
+
+    def test_our_own_name_wins_when_a_sheet_carries_both(self):
+        rows = [["External Invoice Number", "Invoice #"], ["ignored", "110847"]]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("110847",)])
+
+    def test_aliases_never_reach_the_resolver_used_on_our_exports(self):
+        """`column_indexes` reads the files we write. A name guessed wrong there
+        keys a whole report on the wrong column and drops rows silently, so the
+        alias must not leak into it."""
+        with self.assertRaises(ValueError):
+            column_indexes(["External Invoice Number", "x"], ("Invoice #",))
+        with self.assertRaises(ValueError):
+            column_indexes(["DDD ID", "PA Number"], ("Client DDDID", "PA Number"))
 
 
 if __name__ == "__main__":

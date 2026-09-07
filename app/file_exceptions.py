@@ -41,6 +41,23 @@ REPORTS: dict[str, ReportSpec] = {
 }
 
 
+# What Paul's own exports call our key columns. His files come out of TCG's
+# system, not the portal, so the labels differ while the values are the same:
+# measured on the three files he sent on 2026-09-05, his 'External Invoice
+# Number' holds our 'Invoice #' and his 'DDD ID' holds our 'Client DDDID' (his
+# 'PA Number' already matches ours exactly). Without this every one of those
+# files is refused with "could not find the column header(s)".
+#
+# Read only while parsing an UPLOADED file. The reports we write keep resolving
+# by their exact names through `column_indexes`: there, a name guessed wrong
+# would key an entire file on the wrong column and drop the wrong rows silently,
+# which is a far worse failure than refusing an upload.
+UPLOAD_ALIASES: dict[str, str] = {
+    "External Invoice Number": "Invoice #",
+    "DDD ID": "Client DDDID",
+}
+
+
 def normalize_key(value) -> str:
     """The one canonical string for a key part, applied on both sides.
 
@@ -195,21 +212,32 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
 
     The header row is the first row, within the first twenty, that carries every
     key column of the report. Names are matched ignoring case and spaces, so
-    'invoice#' or 'client dddid' work, and any other column is ignored, so Paul
-    can upload a slice of the report itself. Rows missing a key part are
-    skipped and counted; repeats are folded to one entry, as asked.
+    'invoice#' or 'client dddid' work, plus the names Paul's own exports use
+    (see `UPLOAD_ALIASES`), and any other column is ignored, so Paul can upload
+    a slice of the report itself. Rows missing a key part are skipped and
+    counted; repeats are folded to one entry, as asked.
     """
     wanted = {_fold(name): name for name in spec.columns}
+    aliased = {
+        _fold(alias): canonical
+        for alias, canonical in UPLOAD_ALIASES.items()
+        if canonical in spec.columns
+    }
     positions: list[int] | None = None
     start = 0
     for r, row in enumerate(rows[:20]):
         found: dict[str, int] = {}
-        for i, cell in enumerate(row):
-            if cell in (None, ""):
-                continue
-            name = wanted.get(_fold(cell))
-            if name is not None and name not in found:
-                found[name] = i
+        # Our own names first, then aliases for whatever they did not fill. Two
+        # passes and not one dict: a sheet carrying both labels has to resolve
+        # to the column our own header would have picked, and a single pass
+        # would hand it to whichever label sits further left.
+        for names in (wanted, aliased):
+            for i, cell in enumerate(row):
+                if cell in (None, ""):
+                    continue
+                name = names.get(_fold(cell))
+                if name is not None and name not in found:
+                    found[name] = i
         if len(found) == len(spec.columns):
             positions = [found[name] for name in spec.columns]
             start = r + 1
@@ -229,7 +257,7 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             # a person actually makes. Only for a one-part key: a headerless
             # two-column sheet cannot be read safely, because the export's own
             # order is the reverse of the key order (in the auths export
-            # Authorization ID is the first column and Client DDDID the fourth),
+            # Authorization ID is the first column and Client DDDID the fifth),
             # so the parts would be stored swapped and never match anything.
             # A title line above the column becomes an entry, which is what the
             # confirmation screen is there to show.

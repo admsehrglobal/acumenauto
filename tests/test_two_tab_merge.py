@@ -23,7 +23,12 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from app.scraper import _merge_xlsx_files, _normalise_part_headers, _read
+from app.scraper import (
+    _merge_xlsx_files,
+    _normalise_part_headers,
+    _read,
+    _require_non_empty_tab,
+)
 
 FULL = [
     "Urgency", "Entry ID", "PA Number", "Invoice #", "Client Name",
@@ -150,6 +155,69 @@ class MergeAfterNormaliseTests(unittest.TestCase):
         b = _make(self.d / "b.xlsx", PAID, [_row(PAID, "2", "Paid")])
         with self.assertRaises(ValueError):
             _merge_xlsx_files([a, b], self.d / "out.xlsx")
+
+
+class EmptyTabGuardTests(unittest.TestCase):
+    """Un tab entero vacio tiene que frenar la corrida.
+
+    Con un solo tab, un export vacio moria en el guard `total_rows == 0` de
+    `_merge_xlsx_files`. Al pasar el invoice file a dos tabs ese guard dejo de
+    poder verlo: suma los parts de los dos, y las filas de 'Paid Invoices'
+    alcanzan para que el total nunca de cero aunque el tab que trae los
+    rechazos vuelva vacio. El resultado seria un archivo solo-header entregado
+    a ZipRide con el run en SUCCESS.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _meta(self, *counts):
+        """`part_meta` tal como lo arma `_export_one_range`: path -> (ini, fin, filas)."""
+        day = dt.date(2026, 9, 9)
+        meta, paths = {}, []
+        for i, rows in enumerate(counts):
+            path = self.d / f"part_{i}.xlsx"
+            meta[path] = (day, day, rows)
+            paths.append(path)
+        return paths, meta
+
+    def test_the_merge_guard_alone_does_not_see_an_empty_tab(self):
+        """El agujero que motiva el guard nuevo, escrito como test.
+
+        Tab principal sin una sola fila, tab de pagados con filas: el merge
+        produce un archivo y no levanta nada.
+        """
+        empty_main = _make(self.d / "main.xlsx", FULL, [])
+        paid = _make(self.d / "paid.xlsx", FULL, [_row(FULL, "1", "Paid")])
+        out = _merge_xlsx_files([empty_main, paid], self.d / "out.xlsx")
+        self.assertTrue(out.exists())
+
+    def test_a_tab_with_no_rows_stops_the_run(self):
+        paths, meta = self._meta(0, 0, 0)
+        with self.assertRaises(ValueError) as ctx:
+            _require_non_empty_tab("Vendor Entry Status", paths, meta)
+        self.assertIn("Vendor Entry Status", str(ctx.exception))
+        self.assertIn("0 data rows", str(ctx.exception))
+
+    def test_an_empty_chunk_inside_a_tab_is_still_legitimate(self):
+        """El chunking adaptativo genera sub-rangos vacios; eso no es una falla."""
+        paths, meta = self._meta(0, 1200, 0)
+        _require_non_empty_tab("Paid Invoices", paths, meta)
+
+    def test_a_tab_that_brought_rows_passes(self):
+        paths, meta = self._meta(4795)
+        _require_non_empty_tab("Vendor Entry Status", paths, meta)
+
+    def test_a_path_without_meta_does_not_count_as_rows(self):
+        """Un part sin entrada en `part_meta` no puede hacer pasar el guard."""
+        paths, meta = self._meta(0)
+        paths.append(self.d / "huerfano.xlsx")
+        with self.assertRaises(ValueError):
+            _require_non_empty_tab("Vendor Entry Status", paths, meta)
 
 
 if __name__ == "__main__":

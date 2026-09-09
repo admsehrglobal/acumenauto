@@ -616,6 +616,30 @@ async def _prepare_tab(
     return date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt
 
 
+def _require_non_empty_tab(
+    label: str, paths: list[Path], part_meta: dict
+) -> None:
+    """Abort when a whole tab exported zero rows.
+
+    `_merge_xlsx_files` has a report-level zero-row guard, but it sums the parts
+    of every tab at once. Since the invoice file started merging two tabs, the
+    rows of 'Paid Invoices' are enough to keep that total above zero even when
+    the tab carrying the rejections comes back completely empty — the run stays
+    SUCCESS and ZipRide gets a header-only pile, which is the shape of the
+    2026-09-05 incident. Counting per tab gives back the protection the
+    single-tab version had.
+
+    An individual chunk with no rows stays legitimate (adaptive chunking
+    produces them); this only fires when a tab contributes nothing at all.
+    """
+    rows = sum(part_meta[path][2] for path in paths if path in part_meta)
+    if rows == 0:
+        raise ValueError(
+            f"Tab {label!r}: export vacio ({len(paths)} chunks, 0 data rows) — "
+            "filtro no aplicado o sesion caida"
+        )
+
+
 async def _export_chunked_report(
     page: Page,
     button_name: str,
@@ -811,6 +835,7 @@ async def _export_chunked_report(
         threshold=_RESPLIT_THRESHOLD,
         max_parts=_MAX_PARTS,
     )
+    _require_non_empty_tab(tab_name or button_name, part_paths, part_meta)
 
     # Los demas tabs que aportan filas al mismo archivo. Cada uno se prepara de
     # cero: tiene sus propios inputs de fecha (los del tab anterior quedan
@@ -841,12 +866,14 @@ async def _export_chunked_report(
         logger.warning(
             "[REPORT chunked] Tab extra %r: %s a %s", extra, extra_min, extra_end,
         )
-        part_paths += await _export_ranges_adaptive(
+        extra_paths = await _export_ranges_adaptive(
             _export_one_range,
             _chunk_date_range(extra_min, extra_end, n_chunks),
             threshold=_RESPLIT_THRESHOLD,
             max_parts=_MAX_PARTS,
         )
+        _require_non_empty_tab(extra, extra_paths, part_meta)
+        part_paths += extra_paths
 
     if extra_tabs:
         _normalise_part_headers(part_paths)
@@ -1194,9 +1221,10 @@ def _merge_xlsx_files(
     without this function growing a second code path: passing None leaves every
     line below identical to what R3 has always run. A filter that matches nothing
     writes a header-only file rather than failing — a day with no rejected-only
-    invoices is a legitimate empty pile, not a broken report, and the zero-row
-    guard below still fires on the case it was written for, which is the export
-    itself coming back empty.
+    invoices is a legitimate empty pile, not a broken report. The zero-row guard
+    below covers the whole merge; with more than one tab it can no longer tell
+    which tab came back empty, so `_require_non_empty_tab` checks each tab at
+    export time and this stays as the last line of defence.
     """
     if not paths:
         raise ValueError("No paths to merge")

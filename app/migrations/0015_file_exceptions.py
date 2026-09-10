@@ -20,7 +20,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="run",
             name="exceptions_summary",
-            field=models.TextField(blank=True, default=""),
+            field=models.TextField(blank=True, default="", db_default=""),
         ),
         migrations.CreateModel(
             name="FileException",

@@ -34,7 +34,7 @@ class Run(models.Model):
     # What the File Exceptions lists removed from the emailed files, e.g.
     # "Invoices: 12 rows dropped (3 of 40 keys matched)". Empty when no list
     # applied to the files of this run.
-    exceptions_summary = models.TextField(blank=True, default="")
+    exceptions_summary = models.TextField(blank=True, default="", db_default="")
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"

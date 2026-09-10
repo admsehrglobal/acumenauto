@@ -220,5 +220,69 @@ class EmptyTabGuardTests(unittest.TestCase):
             _require_non_empty_tab("Vendor Entry Status", paths, meta)
 
 
+class DuplicateEntryIdTests(unittest.TestCase):
+    """Un Entry ID que vuelve en los dos tabs se escribe UNA vez.
+
+    Los dos tabs se exportan con minutos de diferencia contra datos vivos. Un
+    invoice que el portal marca como pagado en esa ventana sale del tab de
+    rechazos (exportado antes, cuando todavia figuraba sin pagar) y tambien del
+    de pagados (exportado despues), con el mismo Entry ID. Sin deduplicar, el
+    merge escribe las dos filas y el invoice split suma su Amount dos veces.
+
+    Se conserva la ULTIMA: el tab de pagados se exporta al final, asi que es el
+    dato mas fresco, y es la fila que `classify` ya habia elegido.
+
+    Invariante medida sobre el archivo real del 2026-08-28: 100.462 filas,
+    100.462 Entry IDs distintos, cero repetidos. Hasta que el archivo salio de
+    dos tabs esto no podia pasar.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        # '2' cambia de estado entre los dos exports; '1' y '3' no se repiten.
+        self.a = _make(self.d / "tab1.xlsx", FULL, [
+            _row(FULL, "1", "Rejected", 100),
+            _row(FULL, "2", "Rejected", 200),
+        ])
+        self.b = _make(self.d / "tab2.xlsx", FULL, [
+            _row(FULL, "2", "Paid", 200),
+            _row(FULL, "3", "Paid", 300),
+        ])
+        self.out = self.d / "merged.xlsx"
+
+    def _merged_rows(self, keep=("1", "2", "3")):
+        _merge_xlsx_files([self.a, self.b], self.out, frozenset(keep))
+        wb = load_workbook(self.out, read_only=True)
+        try:
+            rows = list(wb.active.iter_rows(values_only=True))
+        finally:
+            wb.close()  # Windows: el handle bloquea el cleanup del tmpdir.
+        return rows[0], rows[1:]
+
+    def test_an_entry_in_both_tabs_is_written_once(self):
+        _, rows = self._merged_rows()
+        ids = [r[FULL.index("Entry ID")] for r in rows]
+        self.assertEqual(sorted(ids), ["1", "2", "3"])
+
+    def test_the_row_kept_is_the_one_from_the_later_tab(self):
+        """La del tab de pagados: es el estado con el que el invoice quedo."""
+        _, rows = self._merged_rows()
+        by_id = {r[FULL.index("Entry ID")]: r for r in rows}
+        self.assertEqual(by_id["2"][FULL.index("Status")], "Paid")
+
+    def test_the_amount_is_not_counted_twice(self):
+        _, rows = self._merged_rows()
+        total = sum(r[FULL.index("Amount")] for r in rows)
+        self.assertEqual(total, 600)  # 100 + 200 + 300, no 800
+
+    def test_entries_that_do_not_repeat_are_all_kept(self):
+        """El dedup no puede comerse filas distintas que comparten nada."""
+        _, rows = self._merged_rows(keep=("1", "3"))
+        ids = sorted(r[FULL.index("Entry ID")] for r in rows)
+        self.assertEqual(ids, ["1", "3"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,11 +45,29 @@ _ROWS = {
 
 
 class ExceptionWiringTests(unittest.TestCase):
+    def _write_auth_export(self, header=None):
+        """Un R2 con el header real. El guard de columnas lo abre de verdad."""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        ws = wb.active
+        ws.append(list(header if header is not None else cmd.AUTH_COLUMNS))
+        n = len(ws[1])
+        # La primera la saca la lista de auths de `_ROWS`; la segunda no, para
+        # que el archivo no quede vacio y lo retenga el skip de archivo-vaciado
+        # en vez del guard que se esta probando.
+        ws.append(["173066812", "1553308787", "Cli, A.", "1", "431798"] + [None] * (n - 5))
+        ws.append(["999999999", "1553999999", "Otro, B.", "2", "999999"] + [None] * (n - 5))
+        path = self.tmp / "r.xlsx"
+        wb.save(path)
+        return path
+
     def setUp(self):
         self.tmp = Path(os.environ.get("TEMP", "/tmp")) / "acumen_wiring_test"
         self.tmp.mkdir(parents=True, exist_ok=True)
         self.kwargs = {}
         self.run = _FakeRun()
+        self._write_auth_export()
 
         patches = [
             mock.patch.object(cmd, "send_reports_email",
@@ -240,6 +258,57 @@ class ExceptionWiringTests(unittest.TestCase):
             kwargs["assemble_matrix"]([], "R3")
         self.assertIsNotNone(seen["spec"])
         self.assertEqual(seen["spec"].columns, REPORTS["accruals"].columns)
+
+
+    def test_a_renamed_auth_column_stops_that_file_going_out(self):
+        """El caso que motiva el guard: Acumen renombra, ZipRide deja de leer.
+
+        Su importador resuelve por nombre - la columna que le insertaron a R1 en
+        agosto no lo rompio -, asi que un encabezado renombrado es una columna
+        que deja de leer sin decir nada, y del lado nuestro el run sale verde.
+        """
+        # Se renombra una columna que la lista de exclusiones NO usa como clave.
+        # Con 'Authorization ID' este test pasaba por el motivo equivocado: lo
+        # retenia el filtro al no encontrar su columna, no el guard. Verificado
+        # por mutacion - con el guard desactivado, aquella version seguia en
+        # verde.
+        renamed = tuple(
+            "Balance Remaining" if c == "Remaining Balance" else c
+            for c in cmd.AUTH_COLUMNS
+        )
+        path = self._write_auth_export(renamed)
+        kwargs = self._run()
+        sent = []
+        with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None),                 mock.patch.object(
+                    cmd, "send_reports_email",
+                    lambda items, r, l, override=None: sent.append(items) or []):
+            kwargs["on_report_ready"](path, settings.DCI_REPORT_BUTTON_NAME_2)
+        self.assertEqual(sent, [], "se mando un archivo con una columna renombrada")
+        self.assertFalse(path.exists(), "el archivo retenido tiene que borrarse")
+
+    def test_a_new_auth_column_still_goes_out(self):
+        """Una columna que no conocemos es dato agregado, no una perdida.
+
+        Se mide por el envio y no por si el archivo sigue en disco: `_send` lo
+        borra despues de mandarlo, asi que ausencia significa las dos cosas.
+        """
+        path = self._write_auth_export(cmd.AUTH_COLUMNS + ("Something New",))
+        kwargs = self._run()
+        sent = []
+        with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None),                 mock.patch.object(
+                    cmd, "send_reports_email",
+                    lambda items, r, l, override=None: sent.append(items) or []):
+            kwargs["on_report_ready"](path, settings.DCI_REPORT_BUTTON_NAME_2)
+        self.assertTrue(sent, "una columna nueva no puede retener el archivo")
+
+    def test_the_invoice_file_requires_all_fourteen_columns(self):
+        """R1 pedia solo dos; un renombre de las otras doce viajaba a ZipRide."""
+        kwargs = self._run()
+        spec = kwargs["chunked_reports"][0]
+        self.assertEqual(spec.required_columns, cmd.INVOICE_COLUMNS)
+        self.assertEqual(len(cmd.INVOICE_COLUMNS), 14)
+        for name in ("Entry ID", "Invoice #", "Client DDDID", "Amount", "Aging"):
+            self.assertIn(name, spec.required_columns)
 
 
 if __name__ == "__main__":

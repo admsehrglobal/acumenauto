@@ -11,6 +11,29 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from app.accrual_rebuild import OUTPUT_COLUMNS, PaFacts, as_date, rebuild
+
+# Las columnas que ZipRide carga POR NOMBRE de cada archivo. Medidas sobre los
+# exports reales, no declaradas de memoria: R1 contra el par del 2026-08-28 y el
+# del 2026-09-10 (identicos), R2 contra el del 2026-09-05.
+#
+# Existen para que un renombre de Acumen no viaje al archivo que mandamos. El
+# accrual file no las necesita porque se arma con `OUTPUT_COLUMNS` fijas; estos
+# dos se reenvian tal como bajan, asi que hay que mirarlos.
+INVOICE_COLUMNS = (
+    "Urgency", "Entry ID", "PA Number", "Invoice #", "Client Name",
+    "Client DDDID", "Client Number", "Service Code", "Status",
+    "Rejected Reason", "Date Of Service", "Entry Creation Date", "Amount",
+    "Aging",
+)
+AUTH_COLUMNS = (
+    "Authorization ID", "PA Number", "Client Name", "Client ID",
+    "Client DDDID", "Service Code", "Plan", "Outcome", "Service",
+    "Total Units", "Rate ($)", "Approve Date", "Approved By", "Start Date",
+    "End Date", "Expiration Date", "Initial Balance", "Remaining Balance",
+    "Maximum Daily Billable Units", "Hold Amount", "Available",
+    "Billing Rate", "Monthly Max", "Weekly Max", "Daily Max", "Daily Rate",
+    "Billing Unit", "Non Billable", "Billing Hold", "Status", "Created By",
+)
 from app.email_utils import send_error_report, send_reports_email, verify_delivery
 from app.file_exceptions import (
     REPORTS,
@@ -28,6 +51,7 @@ from app.scraper import (
     _apply_exceptions_in_place,
     _read,
     download_reports,
+    require_known_columns,
 )
 
 logger = logging.getLogger(__name__)
@@ -361,11 +385,15 @@ class Command(BaseCommand):
                     # R1 es el invoice file: sale como dos entregas.
                     invoice_split=True,
                     exceptions=exceptions["invoices"],
-                    # Las dos que distinguen el tab bueno del default: el invoice
-                    # split solo necesita Entry ID / Invoice # / Status / Amount,
-                    # y esas cuatro tambien estan en 'Paid Invoices', asi que sin
-                    # esto un cambio de tab pasa como si nada.
-                    required_columns=("Rejected Reason", "Aging"),
+                    # Las 14 que el archivo lleva y ZipRide carga por nombre.
+                    # Antes eran solo 'Rejected Reason' y 'Aging', las dos que
+                    # distinguen el tab bueno del default —el invoice split solo
+                    # necesita Entry ID / Invoice # / Status / Amount, y esas
+                    # cuatro tambien estan en 'Paid Invoices'—. Pedirlas todas
+                    # cubre ademas el renombre: si Acumen le cambia el nombre a
+                    # cualquiera de las 14, la corrida para en vez de entregar un
+                    # archivo con una columna que el importador ya no encuentra.
+                    required_columns=INVOICE_COLUMNS,
                     # 'Vendor Entry Status' lleva un filtro fijo del reporte,
                     # `Status is not Paid`, asi que por si solo entrega el 8% de
                     # las filas que el archivo llevaba antes del 2026-09-03:
@@ -483,6 +511,22 @@ class Command(BaseCommand):
             # autorizaciones es la unica fuente fresca del lookup de PAs que el
             # accrual necesita, y corre en otra invocacion que el accrual.
             if display_name == settings.DCI_REPORT_BUTTON_NAME_2:
+                # Antes que nada: si el export ya no trae alguna de las columnas
+                # que ZipRide carga por nombre, este archivo no sale. R2 es un
+                # reenvio directo de lo que baja del portal, asi que sin esto un
+                # renombre de Acumen viaja hasta el importador, que deja de leer
+                # esa columna sin decir nada — y del lado nuestro el run sale
+                # verde. Se retiene igual que un fallo del filtro: se pierde R2,
+                # el invoice file sale igual.
+                try:
+                    require_known_columns(path, display_name, AUTH_COLUMNS)
+                except Exception as exc:
+                    logger.exception(
+                        "[REPORT] columnas inesperadas en %s", display_name
+                    )
+                    send_errors.append(f"{display_name}: {exc}")
+                    path.unlink(missing_ok=True)
+                    return
                 # El refresh va con el archivo ENTERO, antes de filtrarlo: una
                 # excepcion de auths saca la fila del mail, no del lookup, y si
                 # se filtrara primero ese PA quedaria congelado en la tabla que

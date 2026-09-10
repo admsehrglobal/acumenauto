@@ -155,5 +155,72 @@ class PaNumberTests(unittest.TestCase):
         self.assertEqual(res.unmatched, 0)
 
 
+class RenamedHeadingsTests(unittest.TestCase):
+    """El portal renombra sus propios encabezados; el archivo que sale, no.
+
+    El 2026-09-10 la matriz volvio con `Week Starting` y `Auth Schedule Amount`
+    donde antes decia `EffectiveDate` y `Sum of Auth Sched`, y la corrida de las
+    17:00 UTC murio sin entregar (run 849). Se aceptan las dos grafias al LEER.
+
+    Lo que no se negocia es la salida: ZipRide carga el accrual file por los
+    encabezados que tuvo siempre, asi que un renombre de Acumen tiene que morir
+    aca y nunca llegar al archivo que mandamos.
+    """
+
+    # Como volvio la matriz el 2026-09-10, en su orden real.
+    RENAMED = [
+        "Vendor", "Client Name", "PA Number", "Week Starting",
+        "Auth Schedule Amount", "Accrued Auth Amount", "Weekly Paid",
+    ]
+    LOOKUP = {"PA1": PaFacts("111", dt.date(2026, 1, 1), dt.date(2026, 6, 30))}
+
+    def test_the_new_headings_are_read(self):
+        res = rebuild(
+            matrix([line("PA1", dt.date(2026, 2, 1), 175)], header=self.RENAMED),
+            self.LOOKUP,
+        )
+        self.assertEqual(len(res.rows), 1)
+        self.assertEqual(res.rows[0][5], dt.date(2026, 2, 1))
+        self.assertEqual(res.rows[0][6], 175)
+
+    def test_the_old_headings_still_work(self):
+        """No se cambia una grafia por otra: conviven."""
+        res = rebuild(
+            matrix([line("PA1", dt.date(2026, 2, 1), 175)]), self.LOOKUP,
+        )
+        self.assertEqual(len(res.rows), 1)
+        self.assertEqual(res.rows[0][6], 175)
+
+    def test_the_running_total_is_not_mistaken_for_the_week(self):
+        """`Accrued Auth Amount` es el acumulado, no el monto de la semana.
+
+        Es el unico error de mapeo que ningun guard puede ver: la columna
+        existe, el archivo sale, y los montos estan mal. Se fija poniendole al
+        acumulado un valor que se distingue.
+        """
+        row = ["TCG", "Cli, A.", "PA1", dt.date(2026, 2, 1), 175, 999999, 0]
+        res = rebuild(matrix([row], header=self.RENAMED), self.LOOKUP)
+        self.assertEqual(res.rows[0][6], 175)
+
+    def test_the_output_headings_never_follow_the_portal(self):
+        """La razon de todo esto: lo que ZipRide carga no se mueve."""
+        self.assertEqual(
+            OUTPUT_COLUMNS,
+            (
+                "Client Name", "Client DDDID", "PA Number", "Start Date",
+                "End Date", "Accrual Schedule Date", "Accrual Schedule Amount",
+            ),
+        )
+
+    def test_an_unresolvable_heading_names_every_alias_tried(self):
+        short = ["Vendor", "Client Name", "PA Number"]
+        with self.assertRaises(ValueError) as ctx:
+            rebuild(matrix([], header=short), {})
+        msg = str(ctx.exception)
+        self.assertIn("Week Starting", msg)
+        self.assertIn("EffectiveDate", msg)
+        self.assertIn("Auth Schedule Amount", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

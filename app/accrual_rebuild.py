@@ -9,9 +9,12 @@ about six thousand of them.
 The 'Estimated Accrural Balances' tab still works, and its visual exports as
 'Summarized data' in a flat shape:
 
-    Vendor | Client Name | PA Number | EffectiveDate | Sum of Auth Sched | ...
+    Vendor | Client Name | PA Number | Week Starting | Auth Schedule Amount | ...
 
-`Sum of Auth Sched` is the same number the accrual file calls
+(Those last two were `EffectiveDate` and `Sum of Auth Sched` until 2026-09-10;
+the portal renames its own headings, so both spellings are accepted on read.)
+
+That amount is the same number the accrual file calls
 `Accrual Schedule Amount`: measured against the last known-good file over the
 same window, 31,233 of 31,357 comparable (PA, week) pairs are identical, and the
 differences are consistent with three months of real movement (several are the
@@ -46,13 +49,40 @@ OUTPUT_COLUMNS = (
     "Accrual Schedule Amount",
 )
 
-# What the matrix export calls the fields we need. Resolved by name like
-# everywhere else: the exports rename columns on their own.
-MATRIX_PA = "PA Number"
-MATRIX_CLIENT = "Client Name"
-MATRIX_DATE = "EffectiveDate"
-# Power BI truncates this heading; match on the stable prefix instead.
-MATRIX_AMOUNT_PREFIX = "Sum of Auth Sched"
+# What the matrix export calls the fields we need, newest heading first.
+#
+# These are READ names, and each one is a LIST of aliases because the portal
+# renames its own headings without notice: on 2026-09-03 the week was
+# `EffectiveDate` and the amount `Sum of Auth Sched`; on 2026-09-10 the same two
+# columns came back as `Week Starting` and `Auth Schedule Amount`, and the run
+# stopped rather than shipping a file it could not read.
+#
+# `OUTPUT_COLUMNS` above does NOT follow them. ZipRide loads the accrual file by
+# the headings it has always had, so a rename upstream has to be absorbed here
+# and never reach what we send.
+MATRIX_PA = ("PA Number",)
+MATRIX_CLIENT = ("Client Name",)
+MATRIX_DATE = ("Week Starting", "EffectiveDate")
+# Power BI truncates these headings; match on the stable prefix instead. Neither
+# prefix matches 'Accrued Auth Amount', which is the running total, not the week.
+MATRIX_AMOUNT_PREFIXES = ("Auth Schedule Amount", "Sum of Auth Sched")
+
+
+def _resolve(idx: dict, aliases: tuple):
+    """Column number of the first alias the export actually carries."""
+    for name in aliases:
+        if name in idx:
+            return idx[name]
+    return None
+
+
+def _resolve_prefix(idx: dict, prefixes: tuple):
+    """Same, for the headings Power BI truncates."""
+    for prefix in prefixes:
+        for name, n in idx.items():
+            if name.startswith(prefix):
+                return n
+    return None
 
 
 class PaFacts(NamedTuple):
@@ -191,24 +221,27 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
     """
     header_at = find_header_row(matrix_rows)
     idx = _header_index(matrix_rows[header_at])
-    amount_col = next(
-        (n for name, n in idx.items() if name.startswith(MATRIX_AMOUNT_PREFIX)),
-        None,
-    )
+    pa_col = _resolve(idx, MATRIX_PA)
+    client_col = _resolve(idx, MATRIX_CLIENT)
+    date_col = _resolve(idx, MATRIX_DATE)
+    amount_col = _resolve_prefix(idx, MATRIX_AMOUNT_PREFIXES)
     missing = [
-        name
-        for name, present in (
-            (MATRIX_PA, MATRIX_PA in idx),
-            (MATRIX_CLIENT, MATRIX_CLIENT in idx),
-            (MATRIX_DATE, MATRIX_DATE in idx),
-            (MATRIX_AMOUNT_PREFIX, amount_col is not None),
+        aliases
+        for aliases, col in (
+            (MATRIX_PA, pa_col),
+            (MATRIX_CLIENT, client_col),
+            (MATRIX_DATE, date_col),
+            (MATRIX_AMOUNT_PREFIXES, amount_col),
         )
-        if not present
+        if col is None
     ]
     if missing:
+        # Naming every alias we tried is what makes the next rename a two-minute
+        # read instead of a hunt through the portal.
         raise ValueError(
-            f"matrix export: faltan las columnas {missing} — trae "
-            f"{sorted(idx)}"
+            "matrix export: no se pudo resolver "
+            + "; ".join(" o ".join(a) for a in missing)
+            + f" — trae {sorted(idx)}"
         )
 
     out: list = []
@@ -217,8 +250,8 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
     for row in matrix_rows[header_at + 1 :]:
         if _is_blank(row):
             continue
-        pa = _norm_pa(row[idx[MATRIX_PA]])
-        week = as_date(row[idx[MATRIX_DATE]])
+        pa = _norm_pa(row[pa_col])
+        week = as_date(row[date_col])
         if not pa or week is None:
             continue
         amount = row[amount_col]
@@ -232,7 +265,7 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
             matched += 1
         out.append(
             [
-                row[idx[MATRIX_CLIENT]],
+                row[client_col],
                 facts.client_dddid,
                 pa,
                 facts.start_date,

@@ -1261,7 +1261,11 @@ def _merge_xlsx_files(
     `keep_entry_ids` (optional) writes only the rows whose `Entry ID` is in the
     set, which is how R1 is cut into its two piles without a second download and
     without this function growing a second code path: passing None leaves every
-    line below identical to what R3 has always run. A filter that matches nothing
+    line below identical to what R3 has always run. Passing it also deduplicates
+    by `Entry ID`, keeping the last row seen — see the write loop for why the
+    two tabs can hand us the same entry twice. The dedup only sees the paths of
+    one call, which is every part of the report on the merge that matters; a
+    per-group re-merge in `_split_for_email` works on already-merged rows. A filter that matches nothing
     writes a header-only file rather than failing — a day with no rejected-only
     invoices is a legitimate empty pile, not a broken report. The zero-row guard
     below covers the whole merge; with more than one tab it can no longer tell
@@ -1281,18 +1285,30 @@ def _merge_xlsx_files(
     # so a bad chunk aborts before we produce a half-written file.
     canonical_header: list | None = None
     total_rows = 0
+    # Resolved by header name from the merged header, so the split follows the
+    # export's column drift (13 columns in May, 14 in August) for free.
+    entry_id_col: int | None = None
+    # Veces que aparece cada Entry ID. El loop de escritura lo decrementa y
+    # solo escribe cuando llega a cero, o sea en la ULTIMA aparicion.
+    entry_id_seen: dict = {}
     for path in paths:
         rows = _read(path)
         if not rows or not any(c not in (None, "") for c in rows[0]):
             raise ValueError(f"{path.name}: archivo vacio (sin header)")
         if canonical_header is None:
             canonical_header = rows[0]
+            if keep_entry_ids is not None:
+                entry_id_col = resolve_columns(canonical_header).entry_id
         elif rows[0] != canonical_header:
             raise ValueError(
                 f"{path.name}: header no matchea con el primer chunk "
                 f"({rows[0]!r} vs {canonical_header!r})"
             )
-        total_rows += sum(1 for _ in _data_rows(rows))
+        for row in _data_rows(rows):
+            total_rows += 1
+            if entry_id_col is not None:
+                eid = row[entry_id_col]
+                entry_id_seen[eid] = entry_id_seen.get(eid, 0) + 1
 
     # Guard a nivel reporte: sub-rangos vacios individuales son validos (el
     # chunking adaptativo puede generarlos), pero un merge con 0 filas en TOTAL
@@ -1302,13 +1318,6 @@ def _merge_xlsx_files(
             f"{output_path.name}: merge produjo 0 data rows — reporte vacio"
         )
 
-    # Resolved by header name from the merged header, so the split follows the
-    # export's column drift (13 columns in May, 14 in August) for free.
-    entry_id_col = (
-        resolve_columns(canonical_header).entry_id
-        if keep_entry_ids is not None
-        else None
-    )
     row_filter = RowFilter(canonical_header, drop) if drop is not None else None
 
     out_wb = xlsxwriter.Workbook(str(output_path))
@@ -1334,8 +1343,19 @@ def _merge_xlsx_files(
     written = 0
     for path in paths:
         for row in _data_rows(_read(path)):
-            if entry_id_col is not None and row[entry_id_col] not in keep_entry_ids:
-                continue
+            if entry_id_col is not None:
+                eid = row[entry_id_col]
+                if eid not in keep_entry_ids:
+                    continue
+                # Los dos tabs se exportan con minutos de diferencia contra
+                # datos vivos: un invoice que el portal marca como pagado en esa
+                # ventana vuelve en los dos, con el mismo Entry ID, y sin esto
+                # su Amount se contaria dos veces. Se conserva la ultima — el
+                # tab de pagados se exporta al final, asi que es el dato mas
+                # fresco y es la fila que `classify` ya habia elegido.
+                entry_id_seen[eid] -= 1
+                if entry_id_seen[eid] > 0:
+                    continue
             if row_filter is not None and row_filter.drops(row):
                 continue
             _write_row(row)

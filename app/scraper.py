@@ -1399,7 +1399,9 @@ def _split_for_email(
 
     Splitting by chunk (not by row) is what keeps each file self-describing:
     its date range goes into the filename and into the email subject, exactly
-    in the format a single-file run already uses.
+    in the format a single-file run already uses. The filename also carries the
+    group's position, because two groups can legitimately cover the same span
+    once the report is merged from more than one tab.
 
     Costs a second merge pass over the data (~2x the merge time), which only
     happens on the runs that would otherwise be rejected by Brevo outright.
@@ -1450,12 +1452,19 @@ def _split_for_email(
     )
 
     outputs: list[tuple[Path, dt.date, dt.date]] = []
-    for group in groups:
-        group_start = part_meta[group[0]][0]
-        group_end = part_meta[group[-1]][1]
+    for idx, group in enumerate(groups, 1):
+        # min/max over the group, not first/last: `parts` is only chronological
+        # while the report comes from a single tab. With two tabs it is two
+        # sequences over the same range laid end to end, so a group straddling
+        # the seam would otherwise be labelled with an end date months before
+        # its start. The group index keeps two groups covering the same span
+        # from resolving to one path and silently overwriting each other; it
+        # stays out of the subject, which is what ZipRide matches on.
+        group_start = min(part_meta[p][0] for p in group)
+        group_end = max(part_meta[p][1] for p in group)
         out_path = output_dir / (
             f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
-            f"_{timestamp_label}.xlsx"
+            f"_{idx:02d}_{timestamp_label}.xlsx"
         )
         _merge_xlsx_files(group, out_path, keep_entry_ids, drop)
         outputs.append((out_path, group_start, group_end))

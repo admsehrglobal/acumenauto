@@ -448,6 +448,37 @@ async def _export_excel(
     return target
 
 
+def require_known_columns(
+    path: Path, label: str, expected: tuple[str, ...]
+) -> None:
+    """Abort when a column ZipRide loads by name is no longer in the export.
+
+    The files we email are consumed by name, not by position, so a heading the
+    consumer does not recognise is a column it silently stops reading. Acumen
+    renames its own headings without notice — twice in the eight days to
+    2026-09-10 — and until now those renames travelled straight through to the
+    file we send, because the merge writes whatever header the export gave it.
+
+    A missing known column is therefore a stop, not a warning: not delivering is
+    recoverable in hours, a file quietly missing a column is not. A column we do
+    not know about is the opposite case — it is added data, so it goes out and is
+    only logged.
+    """
+    header = [str(c).strip() for c in _read(path)[0]]
+    missing = [c for c in expected if c not in header]
+    if missing:
+        raise ValueError(
+            f"{label}: el export ya no trae {missing} — renombradas o quitadas. "
+            f"Trae {header}"
+        )
+    unknown = [c for c in header if c and c not in expected]
+    if unknown:
+        logger.warning(
+            "[REPORT] %s: columnas nuevas en el export, se entregan igual: %s",
+            label, unknown,
+        )
+
+
 def _apply_exceptions_in_place(path: Path, drop: DropSpec) -> None:
     """Rewrite a simple report's raw download without its excepted rows.
 

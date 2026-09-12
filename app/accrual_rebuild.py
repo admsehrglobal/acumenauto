@@ -220,12 +220,19 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
     **Aviso sobre esos "139 missing" (corregido el 2026-09-12).** Se dieron por
     ruido de los tres meses que separaban los dos archivos, y no lo eran: la
     version original de la regla comparaba `start_date <= week`, que descarta la
-    semana que CONTIENE el inicio de la autorizacion. Medido despues contra el
-    archivo del pipeline viejo sobre la ventana comun completa, eran **367
-    autorizaciones** perdiendo una fila cada una — el borde que le dice a ZipRide
-    donde termina la primera semana parcial. Lo reporto Jessica (ZipRide) con un
-    caso concreto. **Leccion: un residual chico pero SISTEMATICO (una fila por
-    PA, siempre en el mismo lugar) no es ruido; el ruido no se alinea asi.**
+    semana que CONTIENE el inicio de la autorizacion. Eran **433 autorizaciones**
+    perdiendo una fila cada una — el borde que le dice a ZipRide donde termina la
+    primera semana parcial. Lo reporto Jessica (ZipRide) con dos casos.
+
+    **Leccion 1: un residual chico pero SISTEMATICO (una fila por PA, siempre en
+    el mismo lugar) no es ruido; el ruido no se alinea asi.**
+
+    **Leccion 2, sobre como contarlo:** medido contra el archivo del pipeline
+    viejo daba 367, y el segundo caso que reporto ZipRide NO estaba entre ellos
+    (arranca el 24-jun y ese archivo es del 15-jun, asi que la auth no existia
+    para comparar). Contra una copia vieja solo se ven los defectos de la parte
+    que comparten; **el conteo correcto es chequear el archivo contra su propia
+    regla** — ver `scratchpad/true_count.py`.
     """
     header_at = find_header_row(matrix_rows)
     idx = _header_index(matrix_rows[header_at])

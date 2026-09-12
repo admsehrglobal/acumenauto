@@ -215,9 +215,17 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
         this rule                      39,759 rows, 139 missing, 714 extra
 
     So: a week with an amount is always a row, and a week without one is a row
-    only when it falls inside the authorization's own period. Both the misses
-    and the extras are the size of three months of real movement, which is the
-    age of the file being compared against.
+    only when it OVERLAPS the authorization's own period — ver `_belongs`.
+
+    **Aviso sobre esos "139 missing" (corregido el 2026-09-12).** Se dieron por
+    ruido de los tres meses que separaban los dos archivos, y no lo eran: la
+    version original de la regla comparaba `start_date <= week`, que descarta la
+    semana que CONTIENE el inicio de la autorizacion. Medido despues contra el
+    archivo del pipeline viejo sobre la ventana comun completa, eran **367
+    autorizaciones** perdiendo una fila cada una — el borde que le dice a ZipRide
+    donde termina la primera semana parcial. Lo reporto Jessica (ZipRide) con un
+    caso concreto. **Leccion: un residual chico pero SISTEMATICO (una fila por
+    PA, siempre en el mismo lugar) no es ruido; el ruido no se alinea asi.**
     """
     header_at = find_header_row(matrix_rows)
     idx = _header_index(matrix_rows[header_at])
@@ -278,12 +286,32 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
 
 
 def _belongs(amount, week: dt.date, facts: PaFacts | None) -> bool:
-    """Whether this PA/week pair is a line of the accrual file. See `rebuild`."""
+    """Whether this PA/week pair is a line of the accrual file. See `rebuild`.
+
+    La comparacion es por SOLAPAMIENTO de la semana con el periodo del PA, no
+    por donde cae el domingo. Preguntar `start_date <= week` descartaba la
+    semana que CONTIENE el inicio de la autorizacion, porque una auth arranca
+    casi siempre a mitad de semana y entonces el domingo de esa semana cae
+    antes del start.
+
+    **Reportado por ZipRide el 2026-09-12** (Jessica, PA 1553761128: start
+    2026-03-13, un viernes): sin la fila de la semana del 2026-03-08 su
+    importador no ve donde termina la primera semana parcial, arranca la
+    distribucion en el start del PA y la estira hasta el final de la primera
+    semana completa — 03/13 a 03/21 en una sola, cuando son dos SDR distintas
+    (03/13-03/14 y 03/15-03/21). Resultado: monto duplicado.
+
+    Medido contra el archivo del pipeline viejo: **367 autorizaciones** de 6.283
+    comunes perdian esa fila, una cada una, todas con monto 0. Eran parte de los
+    "139 missing" que el docstring de `rebuild` daba por ruido de tres meses.
+    """
     if amount not in (None, "") and _as_number(amount) != 0:
         return True
     if facts is None or facts.start_date is None or facts.end_date is None:
         return False
-    return facts.start_date <= week <= facts.end_date
+    # La semana del portal es el domingo; cubre hasta el sabado siguiente.
+    week_end = week + dt.timedelta(days=6)
+    return facts.start_date <= week_end and week <= facts.end_date
 
 
 def _as_number(value) -> float:

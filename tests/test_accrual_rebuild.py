@@ -84,6 +84,36 @@ class InclusionTests(unittest.TestCase):
         res = rebuild(matrix([line("PA9", dt.date(2026, 3, 1), 0)]), {})
         self.assertEqual(res.rows, [])
 
+    def test_the_week_that_contains_the_start_date_is_a_row(self):
+        """Reportado por ZipRide el 2026-09-12 (PA 1553761128, start 2026-03-13,
+        viernes). La semana del portal es el domingo, asi que la semana que
+        CONTIENE el inicio empieza ANTES del start — y preguntar
+        `start_date <= week` la descartaba. Sin esa fila su importador no ve
+        donde termina la primera semana parcial: arranca en el start del PA y
+        estira hasta el final de la primera semana completa, juntando dos SDR en
+        una y duplicando el monto.
+
+        Medido: **367 autorizaciones** de 6.283 comunes perdian esta fila."""
+        lookup = {"PA2": PaFacts("222", dt.date(2026, 3, 13), dt.date(2027, 3, 12))}
+        res = rebuild(matrix([line("PA2", dt.date(2026, 3, 8), 0)]), lookup)
+        self.assertEqual(len(res.rows), 1, "la semana del inicio tiene que salir")
+        self.assertEqual(res.rows[0][5], dt.date(2026, 3, 8))
+
+    def test_the_week_that_contains_the_end_date_is_a_row(self):
+        """El mismo caso en el otro extremo: una auth que termina a mitad de
+        semana. Su ultima semana parcial tambien necesita su fila."""
+        lookup = {"PA3": PaFacts("333", dt.date(2026, 1, 1), dt.date(2026, 6, 30))}
+        res = rebuild(matrix([line("PA3", dt.date(2026, 6, 28), 0)]), lookup)
+        self.assertEqual(len(res.rows), 1)
+
+    def test_a_zero_week_that_ends_before_the_start_is_still_not_a_row(self):
+        """El arreglo es por solapamiento, no 'todo lo que este cerca'. Una
+        semana entera anterior al PA sigue afuera; si no, volvemos a meter las
+        filas que el archivo viejo nunca tuvo."""
+        lookup = {"PA2": PaFacts("222", dt.date(2026, 3, 13), dt.date(2027, 3, 12))}
+        res = rebuild(matrix([line("PA2", dt.date(2026, 3, 1), 0)]), lookup)
+        self.assertEqual(res.rows, [])
+
 
 class LookupTests(unittest.TestCase):
     def test_fills_the_three_columns_the_matrix_lacks(self):

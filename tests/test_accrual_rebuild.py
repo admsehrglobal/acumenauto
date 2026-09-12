@@ -20,6 +20,7 @@ from app.accrual_rebuild import (
     build_lookup,
     find_header_row,
     rebuild,
+    scan_funded_spans,
 )
 
 # Asi sale el export de la matriz: 'Applied filters:' PRIMERO, una fila en
@@ -135,6 +136,56 @@ class InclusionTests(unittest.TestCase):
         res = rebuild(matrix(rows), {})
         got = sorted(r[5] for r in res.rows)
         self.assertEqual(got, [dt.date(2026, 9, 13), dt.date(2026, 9, 20)])
+
+    def test_the_funded_span_is_measured_across_every_slice(self):
+        """El export baja en tramos de fecha y `rebuild` corre uno por vez, asi
+        que el tramo con plata de un PA sin fechas tiene que medirse sobre
+        TODOS antes de reconstruir ninguno.
+
+        Medido sobre el archivo del 2026-09-12: con el span medido adentro de
+        cada tramo, 14 autorizaciones salieron con 100 semanas ausentes, las 100
+        sobre una costura entre dos de los ocho tramos. Se cae la semana en cero
+        que queda despues de la ultima semana con plata de SU tramo, y tambien
+        la que queda antes de la primera del tramo siguiente."""
+        first = matrix([line("PA7", dt.date(2026, 9, 13), 600),
+                        line("PA7", dt.date(2026, 9, 20), 0)])
+        second = matrix([line("PA7", dt.date(2026, 9, 27), 0),
+                         line("PA7", dt.date(2026, 10, 4), 600)])
+        spans = {}
+        for part in (first, second):
+            scan_funded_spans(part, {}, into=spans)
+        self.assertEqual(spans["PA7"], (dt.date(2026, 9, 13),
+                                        dt.date(2026, 10, 4)))
+        got = sorted(
+            r[5]
+            for part in (first, second)
+            for r in rebuild(part, {}, funded_span=spans).rows
+        )
+        self.assertEqual(
+            got,
+            [dt.date(2026, 9, 13), dt.date(2026, 9, 20),
+             dt.date(2026, 9, 27), dt.date(2026, 10, 4)],
+            "las semanas en cero de la costura entre tramos faltan",
+        )
+
+    def test_a_slice_measured_on_its_own_is_what_dropped_the_seam(self):
+        """El mismo tramo sin el span compartido: la semana en cero del borde
+        se cae. Esta es la conducta vieja, y queda fijada para que se vea que el
+        arreglo es el span compartido y no otra cosa."""
+        first = matrix([line("PA7", dt.date(2026, 9, 13), 600),
+                        line("PA7", dt.date(2026, 9, 20), 0)])
+        got = sorted(r[5] for r in rebuild(first, {}).rows)
+        self.assertEqual(got, [dt.date(2026, 9, 13)])
+
+    def test_a_dated_pa_ignores_the_shared_span(self):
+        """El span compartido es solo para los que no se pueden fechar. Un PA
+        con periodo sigue usando su periodo, que es mejor dato."""
+        lookup = {"PA1": PaFacts("111", dt.date(2026, 1, 1),
+                                 dt.date(2026, 6, 30))}
+        spans = {"PA1": (dt.date(2020, 1, 1), dt.date(2030, 1, 1))}
+        res = rebuild(matrix([line("PA1", dt.date(2026, 9, 6), 0)]), lookup,
+                      funded_span=spans)
+        self.assertEqual(res.rows, [])
 
     def test_a_zero_week_that_ends_before_the_start_is_still_not_a_row(self):
         """El arreglo es por solapamiento, no 'todo lo que este cerca'. Una

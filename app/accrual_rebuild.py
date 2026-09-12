@@ -221,7 +221,61 @@ def build_lookup(
     return lookup
 
 
-def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
+def _columns(matrix_rows: list) -> tuple:
+    """Where the four fields we read live in this export."""
+    header_at = find_header_row(matrix_rows)
+    idx = _header_index(matrix_rows[header_at])
+    pa_col = _resolve(idx, MATRIX_PA)
+    client_col = _resolve(idx, MATRIX_CLIENT)
+    date_col = _resolve(idx, MATRIX_DATE)
+    amount_col = _resolve_prefix(idx, MATRIX_AMOUNT_PREFIXES)
+    missing = [
+        aliases
+        for aliases, col in (
+            (MATRIX_PA, pa_col),
+            (MATRIX_CLIENT, client_col),
+            (MATRIX_DATE, date_col),
+            (MATRIX_AMOUNT_PREFIXES, amount_col),
+        )
+        if col is None
+    ]
+    if missing:
+        # Naming every alias we tried is what makes the next rename a two-minute
+        # read instead of a hunt through the portal.
+        raise ValueError(
+            "matrix export: no se pudo resolver "
+            + "; ".join(" o ".join(a) for a in missing)
+            + f" — trae {sorted(idx)}"
+        )
+    return header_at, pa_col, client_col, date_col, amount_col
+
+
+def scan_funded_spans(matrix_rows: list, lookup: dict,
+                      into: dict | None = None) -> dict:
+    """Accumulate the funded span of every dateless PA across date slices.
+
+    The matrix comes down in slices, and `rebuild` runs on one slice at a time.
+    Measuring the span inside a slice makes it end at that slice's own last
+    funded week, so a zero week sitting past it — or before the first funded
+    week of the next slice — is dropped, and the ladder comes out with a hole
+    exactly on the seam.
+
+    **Measured on the file of 2026-09-12**: 14 authorizations, 100 weeks
+    missing, every one of them on a seam between two of the eight slices. Same
+    shape as the defect ZipRide reported, same consequence.
+    """
+    spans = {} if into is None else into
+    header_at, pa_col, _, date_col, amount_col = _columns(matrix_rows)
+    for pa, (lo, hi) in _funded_spans(matrix_rows, header_at, pa_col, date_col,
+                                      amount_col, lookup).items():
+        seen = spans.get(pa)
+        spans[pa] = (lo, hi) if seen is None else (min(seen[0], lo),
+                                                   max(seen[1], hi))
+    return spans
+
+
+def rebuild(matrix_rows: list, lookup: dict,
+            funded_span: dict | None = None) -> RebuildResult:
     """Turn one matrix export into accrual-file rows.
 
     The matrix prints a line per PA per week whether or not anything is
@@ -254,39 +308,21 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
     que comparten; **el conteo correcto es chequear el archivo contra su propia
     regla** — ver `scratchpad/true_count.py`.
     """
-    header_at = find_header_row(matrix_rows)
-    idx = _header_index(matrix_rows[header_at])
-    pa_col = _resolve(idx, MATRIX_PA)
-    client_col = _resolve(idx, MATRIX_CLIENT)
-    date_col = _resolve(idx, MATRIX_DATE)
-    amount_col = _resolve_prefix(idx, MATRIX_AMOUNT_PREFIXES)
-    missing = [
-        aliases
-        for aliases, col in (
-            (MATRIX_PA, pa_col),
-            (MATRIX_CLIENT, client_col),
-            (MATRIX_DATE, date_col),
-            (MATRIX_AMOUNT_PREFIXES, amount_col),
-        )
-        if col is None
-    ]
-    if missing:
-        # Naming every alias we tried is what makes the next rename a two-minute
-        # read instead of a hunt through the portal.
-        raise ValueError(
-            "matrix export: no se pudo resolver "
-            + "; ".join(" o ".join(a) for a in missing)
-            + f" — trae {sorted(idx)}"
-        )
+    header_at, pa_col, client_col, date_col, amount_col = _columns(matrix_rows)
 
-    # Primera pasada: para los PAs que el lookup NO puede fechar, el tramo de
-    # semanas que lleva plata. Sin esto sus semanas en cero nunca entran
-    # (`_belongs` corta antes por falta de fechas) y la escalera sale con
-    # agujeros en el medio — que es exactamente la forma del defecto que
-    # reporto ZipRide, y con la misma consecuencia: su importador fusiona las
-    # semanas que rodean el hueco. Medido: 10 autorizaciones, 165 semanas.
-    funded_span = _funded_spans(matrix_rows, header_at, pa_col, date_col,
-                                amount_col, lookup)
+    # Para los PAs que el lookup NO puede fechar, el tramo de semanas que lleva
+    # plata. Sin esto sus semanas en cero nunca entran (`_belongs` corta antes
+    # por falta de fechas) y la escalera sale con agujeros en el medio — que es
+    # exactamente la forma del defecto que reporto ZipRide, y con la misma
+    # consecuencia: su importador fusiona las semanas que rodean el hueco.
+    # Medido: 10 autorizaciones, 165 semanas.
+    #
+    # `funded_span` viene de afuera cuando el export baja en varios tramos de
+    # fecha: medirlo aca, sobre un tramo solo, deja agujeros en las costuras
+    # — ver `scan_funded_spans`.
+    if funded_span is None:
+        funded_span = _funded_spans(matrix_rows, header_at, pa_col, date_col,
+                                    amount_col, lookup)
 
     out: list = []
     unmatched: set = set()

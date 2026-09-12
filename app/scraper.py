@@ -442,13 +442,26 @@ async def _open_report_iframe(
     for attempt in range(1, attempts + 1):
         step = "click al boton"
         try:
-            # Explicit timeout: without it the click inherits the 60s context
-            # default (see `context.set_default_timeout` above), not this
-            # function's `timeout_ms`. Short on purpose — a click blocked on a
-            # stuck navigation cannot succeed, so this budget's only job is to
-            # reach the recovery goto below. A healthy click takes well under a
-            # second, since the caller's own goto already waited for load.
-            await page.get_by_role("button", name=button_name).click(timeout=25000)
+            # Explicit, y del tamaño de la cadena de OAuth, no mas corto.
+            #
+            # Sin el kwarg heredaba los 60s del context default y no el
+            # `timeout_ms` de esta funcion, asi que conviene que sea explicito.
+            # Pero el numero NO puede bajar: el `[NAV]` del 12-sep 04:03 UTC
+            # mostro que el portal **se re-autentica solo en medio de la
+            # corrida** — despues de commitear la pagina del grupo se va al
+            # root y hace toda la cadena federada (authorize → Account/Login →
+            # signin-oidc → ?code= → vuelta al grupo → al reporte), unas 14
+            # navegaciones cross-domain. Mientras eso pasa SIEMPRE hay un
+            # document pendiente, asi que el pre-check del click se bloquea ahi.
+            # Esa corrida entro igual y termino bien: el click gana la carrera
+            # si la cadena cierra dentro del budget.
+            #
+            # Con 25s una corrida fallo y la siguiente, con la misma cadena,
+            # paso — o sea que un budget corto convierte una re-auth
+            # sobrevivible en una falla. El propio proyecto ya lo tenia medido
+            # en el comentario del `set_default_timeout` de arriba: esa cadena
+            # "puede tardar > 30s".
+            await page.get_by_role("button", name=button_name).click(timeout=60000)
             step = "iframe 'Embedded report'"
             await iframe_element.wait_for(timeout=timeout_ms)
             step = "hover del iframe"

@@ -10,7 +10,13 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from app.accrual_rebuild import OUTPUT_COLUMNS, PaFacts, as_date, rebuild
+from app.accrual_rebuild import (
+    OUTPUT_COLUMNS,
+    PaFacts,
+    as_date,
+    rebuild,
+    scan_funded_spans,
+)
 
 # Las columnas que ZipRide carga POR NOMBRE de cada archivo. Medidas sobre los
 # exports reales, no declaradas de memoria: R1 contra el par del 2026-08-28 y el
@@ -192,9 +198,21 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label, drop=None
     Client DDDID.
     """
     lookup = _pa_lookup()
+
+    # The funded span of a PA the lookup cannot date has to be measured over
+    # EVERY slice before any of them is rebuilt. Measured inside one slice it
+    # ends at that slice's own last funded week, and the zero weeks past it fall
+    # out: on 2026-09-12 that left 100 weeks missing across 14 authorizations,
+    # every one of them on a seam between two slices. Reading the parts twice is
+    # the cost; holding all of them in memory at once is not an option on a 2 GB
+    # machine.
+    spans: dict = {}
+    for part in parts:
+        scan_funded_spans(_read(part), lookup, into=spans)
+
     rows, unmatched = [], set()
     for part in parts:
-        result = rebuild(_read(part), lookup)
+        result = rebuild(_read(part), lookup, funded_span=spans)
         rows.extend(result.rows)
         unmatched |= result.unmatched_pas
 

@@ -158,14 +158,20 @@ class IframeRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([g[0] for g in page.gotos], ["GROUP", "GROUP"])
         self.assertNotIn("REPORT", [g[0] for g in page.gotos])
 
-    async def test_the_click_carries_its_own_short_timeout(self):
-        """Sin timeout explicito el click hereda los 60s del context default, no el
-        `timeout_ms` de la funcion. Corto a proposito: un click bloqueado en una
-        navegacion trabada no puede salir bien, asi que el unico trabajo de ese
-        budget es llegar a la recuperacion."""
+    async def test_the_click_budget_covers_the_oauth_chain(self):
+        """El click tiene que aguantar la re-autenticacion del portal.
+
+        Sin timeout explicito heredaba los 60s del context default y no el
+        `timeout_ms` de la funcion, asi que se fija aca. **Y no puede bajar**: el
+        `[NAV]` del 12-sep mostro que el portal se re-autentica solo en medio de la
+        corrida (~14 navegaciones cross-domain), y mientras eso pasa el pre-check
+        del click se bloquea. Con 25s una corrida fallo y la siguiente, con la misma
+        cadena, paso. Este test existe para que nadie lo vuelva a bajar 'para que
+        falle mas rapido'."""
         page = _FakePage(succeed_on=1)
         await _open_report_iframe(page, "Report", attempts=3, timeout_ms=120000)
-        self.assertEqual(page.click_timeouts, [25000])
+        self.assertEqual(page.click_timeouts, [60000])
+        self.assertGreaterEqual(page.click_timeouts[0], 30000)
 
     async def test_the_log_names_the_step_that_failed(self):
         """EL GUARD DE E9, y el que sigue sirviendo para siempre: durante seis

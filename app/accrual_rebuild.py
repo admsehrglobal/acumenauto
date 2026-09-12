@@ -158,6 +158,13 @@ def find_header_row(rows: list) -> int:
     )
 
 
+def _is_later(a: dt.date | None, b: dt.date | None) -> bool:
+    """`a` es una fecha de fin posterior a `b`. Un None nunca gana."""
+    if a is None:
+        return False
+    return b is None or a > b
+
+
 def build_lookup(
     r2_rows: list | None = None,
     prior_accrual_rows: list | None = None,
@@ -175,12 +182,25 @@ def build_lookup(
             if _is_blank(row):
                 continue
             pa = _norm_pa(row[idx["PA Number"]])
-            if pa and pa not in lookup:
-                lookup[pa] = PaFacts(
-                    row[idx["Client DDDID"]],
-                    as_date(row[idx["Start Date"]]),
-                    as_date(row[idx["End Date"]]),
-                )
+            if not pa:
+                continue
+            facts = PaFacts(
+                row[idx["Client DDDID"]],
+                as_date(row[idx["Start Date"]]),
+                as_date(row[idx["End Date"]]),
+            )
+            # El archivo previo trae una fila por (PA, semana), y una
+            # autorizacion EXTENDIDA aparece con DOS End Date distintos. Quedarse
+            # con la primera fila agarraba el periodo VIEJO: 2 PAs emitian 68
+            # filas ($18.602,50) fechadas DESPUES de su propio End Date, y otros
+            # 5 perdian las 88 semanas de la extension. Nos quedamos con el End
+            # Date mas grande. Medido contra el R2 del mismo dia: de los 14 PAs
+            # con dos periodos, los 7 vigentes traen en R2 exactamente el End
+            # Date mas grande; los 7 ya vencidos no estan en R2, y para esos el
+            # archivo previo es la unica fuente que existe.
+            prev = lookup.get(pa)
+            if prev is None or _is_later(facts.end_date, prev.end_date):
+                lookup[pa] = facts
 
     if r2_rows:
         idx = _header_index(r2_rows[0])
@@ -259,6 +279,15 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
             + f" — trae {sorted(idx)}"
         )
 
+    # Primera pasada: para los PAs que el lookup NO puede fechar, el tramo de
+    # semanas que lleva plata. Sin esto sus semanas en cero nunca entran
+    # (`_belongs` corta antes por falta de fechas) y la escalera sale con
+    # agujeros en el medio — que es exactamente la forma del defecto que
+    # reporto ZipRide, y con la misma consecuencia: su importador fusiona las
+    # semanas que rodean el hueco. Medido: 10 autorizaciones, 165 semanas.
+    funded_span = _funded_spans(matrix_rows, header_at, pa_col, date_col,
+                                amount_col, lookup)
+
     out: list = []
     unmatched: set = set()
     matched = 0
@@ -271,7 +300,7 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
             continue
         amount = row[amount_col]
         facts = lookup.get(pa)
-        if not _belongs(amount, week, facts):
+        if not _belongs(amount, week, facts, funded_span.get(pa)):
             continue
         if facts is None:
             unmatched.add(pa)
@@ -292,7 +321,44 @@ def rebuild(matrix_rows: list, lookup: dict) -> RebuildResult:
     return RebuildResult(out, matched, len(out) - matched, unmatched)
 
 
-def _belongs(amount, week: dt.date, facts: PaFacts | None) -> bool:
+def _funded_spans(matrix_rows, header_at, pa_col, date_col, amount_col,
+                  lookup) -> dict:
+    """Por PA sin fechas en el lookup, la primera y la ultima semana con plata.
+
+    Solo para esos: un PA fechado usa su propio periodo, que es mejor dato. Los
+    sin fechas son los que no estan ni en el reporte de auths (que es
+    current-only) ni en la siembra historica — 155 al 2026-09-05.
+    """
+    spans: dict[str, list] = {}
+    for row in matrix_rows[header_at + 1 :]:
+        if _is_blank(row):
+            continue
+        pa = _norm_pa(row[pa_col])
+        if not pa:
+            continue
+        facts = lookup.get(pa)
+        if facts is not None and facts.start_date is not None \
+                and facts.end_date is not None:
+            continue
+        week = as_date(row[date_col])
+        if week is None:
+            continue
+        amount = row[amount_col]
+        if amount in (None, "") or _as_number(amount) == 0:
+            continue
+        span = spans.get(pa)
+        if span is None:
+            spans[pa] = [week, week]
+        else:
+            if week < span[0]:
+                span[0] = week
+            if week > span[1]:
+                span[1] = week
+    return {pa: (lo, hi) for pa, (lo, hi) in spans.items()}
+
+
+def _belongs(amount, week: dt.date, facts: PaFacts | None,
+             funded_span: tuple | None = None) -> bool:
     """Whether this PA/week pair is a line of the accrual file. See `rebuild`.
 
     La comparacion es por SOLAPAMIENTO de la semana con el periodo del PA, no
@@ -315,7 +381,13 @@ def _belongs(amount, week: dt.date, facts: PaFacts | None) -> bool:
     if amount not in (None, "") and _as_number(amount) != 0:
         return True
     if facts is None or facts.start_date is None or facts.end_date is None:
-        return False
+        # Sin fechas no sabemos el periodo, pero SI sabemos entre que semanas
+        # esta autorizacion lleva plata: entre esas dos la escalera tiene que
+        # ser contigua, o el importador de ZipRide fusiona las semanas que
+        # rodean el hueco.
+        if funded_span is None:
+            return False
+        return funded_span[0] <= week <= funded_span[1]
     # La semana del portal es el domingo; cubre hasta el sabado siguiente.
     week_end = week + dt.timedelta(days=6)
     return facts.start_date <= week_end and week <= facts.end_date

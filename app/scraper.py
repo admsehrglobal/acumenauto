@@ -194,6 +194,7 @@ async def download_reports(
             page = await context.new_page()
             await _login(page, username, password)
             report_page = await _open_reports_popup(page, username, password)
+            _trace_navigations(report_page)
 
             async def _ready(item: tuple[Path, str]) -> None:
                 # Corre en thread: el callback hace I/O bloqueante (email Brevo).
@@ -365,6 +366,35 @@ async def test_login(username: str, password: str) -> None:
             await browser.close()
 
 
+def _trace_navigations(page: Page) -> None:
+    """Loguea el ciclo de vida de cada navegacion de documento del tab de reportes.
+
+    El unico dato que falta para cerrar el diagnostico del click bloqueado: un
+    `[NAV] req .../report/<uuid>` sin su `[NAV] commit` ni su `[NAV] failed` es
+    el portal dejando un document request colgado, que es lo que traba los
+    pre-checks de `Locator.click`. Ver `_open_report_iframe`.
+
+    Solo loguea, no espera nada y no puede fallar la corrida: son handlers
+    sincronicos sobre datos que Playwright ya tiene en memoria.
+    """
+
+    def _req(request) -> None:
+        if request.is_navigation_request():
+            logger.warning("[NAV] req %s", request.url)
+
+    def _failed(request) -> None:
+        if request.is_navigation_request():
+            logger.warning("[NAV] failed %s (%s)", request.url, request.failure)
+
+    def _committed(frame) -> None:
+        if frame == page.main_frame:
+            logger.warning("[NAV] commit %s", frame.url)
+
+    page.on("request", _req)
+    page.on("requestfailed", _failed)
+    page.on("framenavigated", _committed)
+
+
 async def _open_report_iframe(
     page: Page,
     button_name: str,
@@ -374,51 +404,109 @@ async def _open_report_iframe(
 ):
     """Click el boton del reporte y devuelve el content_frame del iframe de PBI.
 
-    Power BI a veces no inserta el iframe 'Embedded report' en el DOM (timeout
-    intermitente — ~1/3 de las corridas del cron fallaban asi, jun 2026). Subir
-    el timeout solo hace el fallo mas lento; en cambio reintentamos: recargamos
-    la pagina y re-clickeamos el boton hasta `attempts` veces. El segundo intento
-    casi siempre monta el iframe.
+    Dos fallas intermitentes distintas viven en esta funcion, y durante seis
+    semanas se confundieron porque el log decia lo mismo para las dos:
+
+    1. **PBI no inserta el iframe 'Embedded report'** (~1/3 de las corridas del
+       cron, jun 2026). Subir el timeout solo hace el fallo mas lento; en cambio
+       reintentamos hasta `attempts` veces y el segundo intento casi siempre lo
+       monta.
+    2. **El click al boton se queda esperando una navegacion que no termina**
+       (~1 de cada 8 corridas desde ago 2026; mato la entrega del accrual el
+       2026-09-11). `Locator.click` corre los pre-checks de accion ANTES de
+       resolver el selector, y si el frame principal tiene un document request
+       pendiente se bloquea ahi: el click nunca se despacha. El log de
+       Playwright lo dice con `waiting for "<url>" navigation to finish` y sin
+       ninguna linea `locator resolved to`.
+
+    Por eso la recuperacion es un `goto` al `group_url` y no un `reload`: el
+    reload re-pide lo que commiteo ULTIMO, que despues de un click que navego es
+    el documento del reporte — y ahi el boton de la lista no existe, asi que el
+    re-click no podia acertar nunca. El goto emite su propio documentId, supera
+    el request colgado, y nos deja en la pagina que si tiene el boton.
+
+    `step` existe para que el log nombre el paso que fallo, y `botones=` para
+    poder distinguir "Playwright se nego a actuar" de "el boton no esta en esta
+    pagina" en la primera ocurrencia.
 
     El hover fuerza que PBI renderice el menu "..." del visual (en headless, sin
     hover, el boton visual-more-options-btn puede no aparecer).
     """
     iframe_element = page.locator('iframe[title="Embedded report"]')
+    # The URL the caller navigated to, captured BEFORE any click: the page that
+    # HAS the report button. `page.reload()` re-requests whatever committed
+    # LAST, which after a click that navigated is the report document — and the
+    # report document does not carry the report list, so the re-click could
+    # never hit. Recovery has to go back to this URL instead.
+    group_url = page.url
     for attempt in range(1, attempts + 1):
+        step = "click al boton"
         try:
-            await page.get_by_role("button", name=button_name).click()
+            # Explicit timeout: without it the click inherits the 60s context
+            # default (see `context.set_default_timeout` above), not this
+            # function's `timeout_ms`. Short on purpose — a click blocked on a
+            # stuck navigation cannot succeed, so this budget's only job is to
+            # reach the recovery goto below. A healthy click takes well under a
+            # second, since the caller's own goto already waited for load.
+            await page.get_by_role("button", name=button_name).click(timeout=25000)
+            step = "iframe 'Embedded report'"
             await iframe_element.wait_for(timeout=timeout_ms)
+            step = "hover del iframe"
             await iframe_element.hover()
             return iframe_element.content_frame
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as exc:
+            # `count()` goes through Frame.queryCount, which runs none of the
+            # action pre-checks, so it answers even on a page where every
+            # action blocks: botones>=1 means Playwright refused to act on a
+            # button that was right there, botones=0 means the button is not on
+            # this page at all. Wrapped because an error path must never raise
+            # — a bare await here would replace the TimeoutError and void the
+            # retry.
+            try:
+                buttons = await asyncio.wait_for(
+                    page.get_by_role("button", name=button_name).count(), 5
+                )
+            except (PlaywrightError, TimeoutError):
+                buttons = -1
             logger.warning(
-                "[REPORT] iframe 'Embedded report' no aparecio en %ds (intento %d/%d)%s",
-                timeout_ms // 1000, attempt, attempts,
-                ", recargando y reintentando" if attempt < attempts else " — abortando",
+                "[REPORT] fallo esperando %s (intento %d/%d): url=%s botones=%d | %s%s",
+                step, attempt, attempts, page.url, buttons,
+                str(exc).splitlines()[0],
+                ", volviendo al grupo y reintentando" if attempt < attempts
+                else " — abortando",
             )
             if attempt >= attempts:
                 raise
-            # Reset del estado de PBI antes de re-clickear. domcontentloaded (no
-            # "load"): en esta SPA pesada el evento load puede tardar >60s y hacer
-            # fallar el propio reload (default 60s); el click siguiente ya espera
-            # a que el boton sea accionable. Usamos el mismo budget que el iframe.
+            # Volver al grupo con un goto, no con un reload. El goto emite su
+            # propio document request y su propio documentId, asi que el request
+            # al reporte que quedo colgado queda superado y se limpia al
+            # commitear — y ademas nos deja en la pagina que SI tiene el boton.
+            # domcontentloaded (no "load"): en esta SPA pesada el evento load
+            # puede tardar >60s y hacer fallar el propio goto; el click siguiente
+            # ya espera a que el boton sea accionable. Mismo budget que el iframe.
             try:
-                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+                await page.goto(
+                    group_url, wait_until="domcontentloaded", timeout=timeout_ms
+                )
             except PlaywrightError as exc:
                 # A page too wedged to mount the PBI iframe is often too wedged to
-                # reload either. Letting the reload error escape would kill the run
-                # on attempt 1 and void the retry. Burn the attempt and re-click.
+                # navigate either. Letting the recovery error escape would kill the
+                # run on attempt 1 and void the retry. Burn the attempt and
+                # re-click.
                 #
-                # PlaywrightError, not PlaywrightTimeoutError: the reload does not
-                # only time out. Run #757 (2026-08-27 14:00) died on
+                # PlaywrightError, not PlaywrightTimeoutError: the recovery does
+                # not only time out. Run #757 (2026-08-27 14:00) died on
                 # `Page.reload: net::ERR_ABORTED; maybe frame was detached?`, which
                 # is a plain Error — it escaped the narrower except and killed the
-                # run on the first attempt, with the other two never happening.
-                # TimeoutError subclasses Error, so this still covers the slow
-                # reload. Deliberately NOT `except Exception`: Celery's
+                # run on the first attempt, with the other two never happening. The
+                # goto has the same two loud modes: `net::ERR_ABORTED`, and
+                # `Navigation to ... is interrupted by another navigation`, which is
+                # exactly what a stalled document request produces. TimeoutError
+                # subclasses Error, so this still covers the slow navigation.
+                # Deliberately NOT `except Exception`: Celery's
                 # SoftTimeLimitExceeded and a cancellation have to keep propagating.
                 logger.warning(
-                    "[REPORT] recovery reload failed (%s), re-clicking anyway "
+                    "[REPORT] recovery goto failed (%s), re-clicking anyway "
                     "(attempt %d/%d)",
                     type(exc).__name__, attempt, attempts,
                 )

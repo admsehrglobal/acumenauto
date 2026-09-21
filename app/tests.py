@@ -276,7 +276,7 @@ class FileExceptionsPagesTests(TestCase):
         self._add("accruals", key_1="431798", key_2="1553308787")
         exceptions = _load_exceptions()
         # What a run that wrote the invoice file leaves behind: one key matched.
-        exceptions["invoices"].stats["invoices.xlsx"] = (7, {("500",)})
+        exceptions["invoices"].stats["invoices.xlsx"] = (7, {("500", "")})
 
         _stamp_matches(exceptions, timezone.now())
 
@@ -296,6 +296,6 @@ class FileExceptionsPagesTests(TestCase):
         self.client.post(reverse("exception_remove", args=["invoices", removed.pk]))
 
         specs = _load_exceptions()
-        self.assertEqual(specs["invoices"].keys, frozenset({("500",)}))
+        self.assertEqual(specs["invoices"].keys, frozenset({("500", "")}))
         self.assertIsNone(specs["auths"])
         self.assertIsNone(specs["accruals"])

@@ -7,6 +7,9 @@ Covers what would be silent if it broke:
    dropped per output file. A key typed as a number matches the text cell.
 2. The composite keys of the auths and accruals files need BOTH parts to match:
    five PA Numbers sit under two different clients in the real file.
+2b. The invoices key takes the client too, and it is OPTIONAL: an entry with no
+   client drops every row carrying the number (which is every entry stored
+   before 2026-09-21) and one with a client drops only that client's row.
 3. `_split_for_email` applies the same list to every file it re-merges, and the
    big merge it deletes is not counted twice.
 4. R2 is rewritten in place: same path, same sheet name, same header, the
@@ -41,8 +44,8 @@ R3_HEADER = [
 R2_HEADER = ["Authorization ID", "Client Name", "Client ID", "Client DDDID", "Status"]
 
 
-def _r1(entry_id, invoice, status="Paid"):
-    return ["", entry_id, "PA1", invoice, "Cli", "D1", "C1", "Transportation",
+def _r1(entry_id, invoice, status="Paid", client="C1"):
+    return ["", entry_id, "PA1", invoice, "Cli", "D1", client, "Transportation",
             status, "", dt.datetime(2025, 7, 20), dt.datetime(2025, 7, 28),
             84.0, 0]
 
@@ -95,7 +98,7 @@ class InvoiceDropTests(unittest.TestCase):
         _merge_xlsx_files([self.chunk], out, frozenset({"2", "3", "4"}), drop)
         self.assertEqual(self._entry_ids(out), ["3", "4"])
         # Counted per output file: row 1 was never in this pile to begin with.
-        self.assertEqual(drop.stats[out], (1, {("500",)}))
+        self.assertEqual(drop.stats[out], (1, {("500", "")}))
 
     def test_a_number_in_the_list_matches_the_text_cell_in_the_export(self):
         """Paul's spreadsheet will carry 600, the export carries '600'."""
@@ -304,3 +307,97 @@ class SpecTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InvoiceClientKeyTests(unittest.TestCase):
+    """The optional client half of the invoices key.
+
+    ZipRide's import of the 2026-09-17 file flagged 66 entries, 61 of them
+    "Client mismatch: expected <one client>, got <another>". Measured on the
+    2026-09-06 pair, dropping those 66 by number alone takes 79 rows, not 70:
+    the 9 extra ones belong to the clients ZipRide says the invoice is for.
+    Naming the client is what stops that, and leaving it empty has to keep
+    behaving exactly as the list did before.
+    """
+
+    HEADER_NO_CLIENT = [c for c in R1_HEADER if c != "Client Number"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.chunk = self.d / "chunk.xlsx"
+        # Invoice 163746 under two clients, which is the real shape: Paul asked
+        # for the NJ00001544 row and the NJ00013618 one is another client's.
+        _make_xlsx(self.chunk, R1_HEADER, [
+            _r1("1", "163746", client="NJ00001544"),
+            _r1("2", "163746", client="NJ00013618"),
+            _r1("3", "999", client="NJ00001544"),
+        ])
+
+    def _ids(self, path):
+        return [r[1] for r in _read(path)[1][1:]]
+
+    def _merge(self, drop, chunk=None):
+        out = self.d / "payable.xlsx"
+        _merge_xlsx_files([chunk or self.chunk], out, None, drop)
+        return out
+
+    def test_a_client_narrows_the_entry_to_that_client_s_row(self):
+        drop = make_drop_spec("invoices", [("163746", "NJ00001544")])
+        out = self._merge(drop)
+        self.assertEqual(self._ids(out), ["2", "3"])
+        self.assertEqual(drop.stats[out], (1, {("163746", "nj00001544")}))
+
+    def test_no_client_still_drops_every_row_with_the_number(self):
+        """What the 428 entries already on the list do, unchanged."""
+        drop = make_drop_spec("invoices", [("163746", "")])
+        out = self._merge(drop)
+        self.assertEqual(self._ids(out), ["3"])
+        self.assertEqual(drop.stats[out], (2, {("163746", "")}))
+
+    def test_the_client_is_matched_ignoring_case(self):
+        drop = make_drop_spec("invoices", [("163746", "nj00001544")])
+        self.assertEqual(self._ids(self._merge(drop)), ["2", "3"])
+
+    def test_both_shapes_of_one_number_are_each_recorded_as_matched(self):
+        """A row is dropped once, but the page must not call either entry a
+        typo: 'Checked, matched nothing' is how a wrong key is spotted."""
+        drop = make_drop_spec(
+            "invoices", [("163746", ""), ("163746", "NJ00001544")]
+        )
+        out = self._merge(drop)
+        self.assertEqual(self._ids(out), ["3"])
+        dropped, matched = drop.stats[out]
+        self.assertEqual(dropped, 2)
+        self.assertEqual(matched, {("163746", ""), ("163746", "nj00001544")})
+
+    def test_an_export_without_the_client_column_does_not_fail_the_run(self):
+        """Acumen has renamed R1 columns twice in 2026. A rename of the column
+        the key does not require must not kill the invoice file; the entries
+        that name a client simply stop matching."""
+        chunk = self.d / "no_client.xlsx"
+        _make_xlsx(chunk, self.HEADER_NO_CLIENT, [
+            [c for i, c in enumerate(_r1("1", "163746", client="NJ00001544"))
+             if R1_HEADER[i] != "Client Number"],
+            [c for i, c in enumerate(_r1("3", "999"))
+             if R1_HEADER[i] != "Client Number"],
+        ])
+        drop = make_drop_spec(
+            "invoices", [("163746", "NJ00001544"), ("999", "")]
+        )
+        out = self._merge(drop, chunk)
+        # The wildcard still works; the one naming a client matched nothing.
+        self.assertEqual(self._ids(out), ["1"])
+        self.assertEqual(drop.stats[out], (1, {("999", "")}))
+
+    def test_a_missing_required_column_still_fails_loudly(self):
+        chunk = self.d / "no_invoice.xlsx"
+        header = [c for c in R1_HEADER if c != "Invoice #"]
+        _make_xlsx(chunk, header, [
+            [c for i, c in enumerate(_r1("1", "163746"))
+             if R1_HEADER[i] != "Invoice #"],
+        ])
+        drop = make_drop_spec("invoices", [("163746", "")])
+        with self.assertRaises(ValueError):
+            self._merge(drop, chunk)

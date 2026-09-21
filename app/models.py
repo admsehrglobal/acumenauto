@@ -134,7 +134,10 @@ class FileException(models.Model):
     """One key the run drops from an emailed file (Paul, 2026-08-31 / 09-02).
 
     `report` says which file; `key_1`/`key_2` hold the key parts in the order of
-    `app.file_exceptions.REPORTS[report].columns` (invoices use only key_1).
+    `app.file_exceptions.REPORTS[report].columns`. A part the report does not
+    require is stored empty: an invoice entry with no `Client Number` drops
+    every row carrying the number, which is what every entry made before
+    2026-09-21 does.
     Keys are stored already normalised, so the unique constraint and the match
     at run time agree on what "the same key" is.
 

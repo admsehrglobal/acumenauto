@@ -1406,7 +1406,8 @@ def _merge_xlsx_files(
 
     `drop` (optional) is the report's File Exceptions list: rows whose key is in
     it are left out, with the key columns resolved by name from the merged
-    header (a missing column fails the run loudly, same policy as the split).
+    header (a missing REQUIRED column fails the run loudly, same policy as the
+    split; an optional one simply reads as empty).
     What was dropped is recorded on the spec itself, per output file.
     `sheet_name` (optional) names the output sheet; the default is xlsxwriter's.
     """

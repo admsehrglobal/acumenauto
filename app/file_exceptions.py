@@ -24,20 +24,48 @@ from typing import Iterable, NamedTuple, Sequence
 
 
 class ReportSpec(NamedTuple):
+    """One report's key. `required` is how many of `columns` must be filled in.
+
+    Invoices are the only key with an optional part. Paul's list is a list of
+    invoice numbers and has to stay one, but the number alone is not unique:
+    measured on the 2026-09-06 pair (106,845 rows, 105,920 distinct numbers),
+    17 numbers sit under two different clients. ZipRide's import of 2026-09-17
+    flagged 66 entries as "Client mismatch", and dropping those by number alone
+    would have taken 9 further rows ($1,914.50) belonging to the very clients
+    their system says the invoice is for. Naming the client narrows the entry
+    to the one row; leaving it empty keeps the old behaviour, which is what
+    every entry already on the list does.
+    """
+
     slug: str
     label: str
     columns: tuple[str, ...]
+    required: int
+
+    @property
+    def required_columns(self) -> tuple[str, ...]:
+        return self.columns[: self.required]
+
+    @property
+    def optional_columns(self) -> tuple[str, ...]:
+        """Named apart because the pages have to say which is which; a field
+        that silently accepts nothing reads as a field that was forgotten."""
+        return self.columns[self.required:]
 
 
 # The key columns, by the exact header names the exports use (resolved by name,
 # never by position: R1 went from 13 to 14 columns between May and August 2026
 # and R2 renamed two columns in the same window).
 REPORTS: dict[str, ReportSpec] = {
-    "invoices": ReportSpec("invoices", "Invoices", ("Invoice #",)),
-    "auths": ReportSpec(
-        "auths", "Authorizations", ("Client DDDID", "Authorization ID")
+    "invoices": ReportSpec(
+        "invoices", "Invoices", ("Invoice #", "Client Number"), required=1
     ),
-    "accruals": ReportSpec("accruals", "Accruals", ("Client DDDID", "PA Number")),
+    "auths": ReportSpec(
+        "auths", "Authorizations", ("Client DDDID", "Authorization ID"), required=2
+    ),
+    "accruals": ReportSpec(
+        "accruals", "Accruals", ("Client DDDID", "PA Number"), required=2
+    ),
 }
 
 
@@ -56,6 +84,9 @@ UPLOAD_ALIASES: dict[str, str] = {
     "External Invoice Number": "Invoice #",
     "DDD ID": "Client DDDID",
 }
+# 'Client Number' needs no alias: the invoice status export TCG's system
+# produces spells it exactly as our own report does, and its values match ours
+# (checked on the 2026-09-17 export: all 66 flagged entries resolved).
 
 
 def normalize_key(value) -> str:
@@ -90,16 +121,23 @@ def fold_key(key: Sequence[str]) -> tuple[str, ...]:
     return tuple(part.lower() for part in key)
 
 
+def header_index(header: Sequence) -> dict[str, int]:
+    """Header name -> position. Only string cells count, names are stripped,
+    and the first occurrence wins."""
+    index: dict[str, int] = {}
+    for position, name in enumerate(header):
+        if isinstance(name, str):
+            index.setdefault(name.strip(), position)
+    return index
+
+
 def column_indexes(header: Sequence, names: Iterable[str]) -> dict[str, int]:
     """Locate columns by header name; ValueError naming whatever is missing.
 
     Same rules as the invoice split has always used: only string cells count,
     names are stripped, and the first occurrence wins.
     """
-    index: dict[str, int] = {}
-    for position, name in enumerate(header):
-        if isinstance(name, str):
-            index.setdefault(name.strip(), position)
+    index = header_index(header)
     wanted = list(names)
     missing = [name for name in wanted if name not in index]
     if missing:
@@ -130,6 +168,7 @@ class DropSpec(NamedTuple):
     keys: frozenset[tuple[str, ...]]
     stats: dict
     emptied: set
+    required: int = 0  # 0 = every part, so the older two-part specs are unchanged
 
     def record(self, output_path, row_filter: "RowFilter", written: int) -> None:
         self.stats[output_path] = (row_filter.dropped, set(row_filter.matched))
@@ -153,19 +192,36 @@ def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
     keys = set()
     for raw in raw_keys:
         key = tuple(normalize_key(part) for part in tuple(raw)[:width])
-        if len(key) == width and all(key):
+        key += ("",) * (width - len(key))
+        # Only the required parts have to be there. An invoice entry with no
+        # client is the wildcard every entry stored before 2026-09-21 is.
+        if all(key[: spec.required]):
             keys.add(fold_key(key))
     if not keys:
         return None
-    return DropSpec(spec.label, spec.columns, frozenset(keys), {}, set())
+    return DropSpec(
+        spec.label, spec.columns, frozenset(keys), {}, set(), spec.required
+    )
 
 
 class RowFilter:
     """Per-file state: resolves the key columns once, then answers per row."""
 
     def __init__(self, header: Sequence, spec: DropSpec):
-        positions = column_indexes(header, spec.columns)
-        self._positions = [positions[name] for name in spec.columns]
+        self._required = spec.required or len(spec.columns)
+        required = spec.columns[: self._required]
+        positions = column_indexes(header, required)
+        # The required columns fail the run loudly when they are missing. The
+        # optional ones are looked up leniently and read as empty when absent:
+        # making them mandatory would turn an Acumen rename of 'Client Number'
+        # into a dead run for a list that may not name a single client. Missing,
+        # only the wildcard entries can match, and the ones naming a client say
+        # so on the page ("Checked, matched nothing") instead of quietly
+        # widening to every row that carries the number.
+        index = header_index(header)
+        self._positions = [positions[name] for name in required] + [
+            index.get(name) for name in spec.columns[self._required :]
+        ]
         self._keys = spec.keys
         self.dropped = 0
         self.matched: set[tuple[str, ...]] = set()
@@ -173,15 +229,25 @@ class RowFilter:
     def drops(self, row: Sequence) -> bool:
         key = fold_key(
             tuple(
-                normalize_key(row[i]) if i < len(row) else ""
+                normalize_key(row[i]) if i is not None and i < len(row) else ""
                 for i in self._positions
             )
         )
-        if key in self._keys:
+        # The row's own key first, then the same key with the optional parts
+        # blanked: 'invoice 163746 of NJ00001544' and 'invoice 163746, any
+        # client' are two different entries and a row can be on the list under
+        # either. Both are recorded when both are listed, so the stamp on the
+        # page does not tell Paul that the entry he just added matched nothing.
+        width = len(self._positions)
+        hit = False
+        for n in range(width, self._required - 1, -1):
+            candidate = key[:n] + ("",) * (width - n)
+            if candidate in self._keys:
+                self.matched.add(candidate)
+                hit = True
+        if hit:
             self.dropped += 1
-            self.matched.add(key)
-            return True
-        return False
+        return hit
 
 
 def summarize(specs: Iterable[DropSpec | None]) -> str:
@@ -252,8 +318,13 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
                 name = names.get(_fold(cell))
                 if name is not None and name not in found:
                     found[name] = i
-        if len(found) == len(spec.columns):
-            positions = [found[name] for name in spec.columns]
+        if all(name in found for name in spec.columns[: spec.required]):
+            # The optional columns are taken when the sheet happens to carry
+            # them, which is what makes Paul's own export work unchanged: his
+            # invoice status file already has 'Client Number' next to the
+            # number, so uploading it as it comes out narrows every entry to
+            # its own client without him editing anything.
+            positions = [found.get(name) for name in spec.columns]
             start = r + 1
             break
     if positions is None:
@@ -266,23 +337,31 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             ),
             default=0,
         )
-        if len(spec.columns) == 1 and used_width == 1:
+        if spec.required == 1 and used_width == 1:
             # A bare column of invoice numbers with nothing above it - the file
-            # a person actually makes. Only for a one-part key: a headerless
-            # two-column sheet cannot be read safely, because the export's own
-            # order is the reverse of the key order (in the auths export
-            # Authorization ID is the first column and Client DDDID the fifth),
-            # so the parts would be stored swapped and never match anything.
-            # A title line above the column becomes an entry, which is what the
-            # confirmation screen is there to show.
-            positions, start = [0], 0
+            # a person actually makes. Only when one value is enough on its
+            # own: a headerless two-column sheet cannot be read safely, because
+            # the export's own order is the reverse of the key order (in the
+            # auths export Authorization ID is the first column and Client
+            # DDDID the fifth), so the parts would be stored swapped and never
+            # match anything. A title line above the column becomes an entry,
+            # which is what the confirmation screen is there to show.
+            positions = [0] + [None] * (len(spec.columns) - 1)
+            start = 0
         else:
-            raise ValueError(
+            required = spec.columns[: spec.required]
+            message = (
                 "could not find the column header(s) "
-                + " and ".join(f"'{name}'" for name in spec.columns)
+                + " and ".join(f"'{name}'" for name in required)
                 + " in the first sheet. Add a row with those names above the "
                 "values, in that order."
             )
+            optional = spec.columns[spec.required:]
+            if optional:
+                message += " " + " and ".join(
+                    f"'{name}'" for name in optional
+                ) + " is optional and is used when the sheet has it."
+            raise ValueError(message)
 
     keys: list[tuple[str, ...]] = []
     seen: set[tuple[str, ...]] = set()
@@ -291,9 +370,10 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
     too_long = 0
     for row in rows[start:]:
         key = tuple(
-            normalize_key(row[i]) if i < len(row) else "" for i in positions
+            normalize_key(row[i]) if i is not None and i < len(row) else ""
+            for i in positions
         )
-        if not all(key):
+        if not all(key[: spec.required]):
             if any(cell not in (None, "") for cell in row):
                 blank += 1
             continue

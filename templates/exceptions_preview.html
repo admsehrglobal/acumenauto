@@ -16,8 +16,8 @@
   <p class="text-3xl font-semibold text-slate-900">{{ key_count }}</p>
   <p class="text-sm text-slate-600 mb-4">
     entries to add to <span class="font-medium">{{ spec.label }}</span>, read from the
-    {% for column in spec.columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}
-    column{{ spec.columns|length|pluralize }}
+    {% for column in read_columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}
+    column{{ read_columns|length|pluralize }}
   </p>
 
   <dl class="text-sm border border-slate-200 rounded divide-y divide-slate-100 mb-4">
@@ -39,7 +39,7 @@
       {% if parsed.blank %}
         <li>
           {{ parsed.blank }} row{{ parsed.blank|pluralize }} skipped for a missing
-          {% for column in spec.columns %}{{ column }}{% if not forloop.last %} or {% endif %}{% endfor %}
+          {% for column in spec.required_columns %}{{ column }}{% if not forloop.last %} or {% endif %}{% endfor %}
         </li>
       {% endif %}
       {% if parsed.too_long %}

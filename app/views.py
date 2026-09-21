@@ -344,6 +344,12 @@ def _log_changes(entries, action: str, actor: str, at) -> None:
     )
 
 
+def _show_key(key) -> str:
+    """A key as Paul reads it: an empty optional part is not shown at all,
+    so a wildcard invoice entry stays the bare number it was typed as."""
+    return " / ".join(part for part in key if part)
+
+
 def _upload_counts(spec, added: int, already: int, parsed) -> str:
     """The numbers of one upload, each under its own name.
 
@@ -362,7 +368,7 @@ def _upload_counts(spec, added: int, already: int, parsed) -> str:
         rows = "row" if parsed.blank == 1 else "rows"
         parts.append(
             f"{parsed.blank:,} {rows} skipped for a missing "
-            + " or ".join(spec.columns)
+            + " or ".join(spec.columns[: spec.required])
         )
     if parsed.too_long:
         rows = "row" if parsed.too_long == 1 else "rows"
@@ -430,7 +436,7 @@ def exception_add(request, report: str):
     added, restored, already = _add_keys(
         report, [form.cleaned_key], request.user.username
     )
-    shown = " / ".join(form.cleaned_key)
+    shown = _show_key(form.cleaned_key)
     if already:
         messages.info(request, f"{shown} is already listed.")
     else:
@@ -479,8 +485,15 @@ def exception_upload(request, report: str):
             "rows_read": f"{len(rows):,}",
             "key_count": f"{len(parsed.keys):,}",
             "parsed": parsed,
-            "first_key": " / ".join(parsed.keys[0]),
-            "last_key": " / ".join(parsed.keys[-1]),
+            "first_key": _show_key(parsed.keys[0]),
+            "last_key": _show_key(parsed.keys[-1]),
+            # What the sheet actually gave, not what the report can take: the
+            # optional column is only named here when some row filled it in.
+            "read_columns": [
+                column
+                for i, column in enumerate(spec.columns)
+                if i < spec.required or any(key[i] for key in parsed.keys)
+            ],
             "confirm_form": FileExceptionConfirmForm(
                 spec,
                 initial={

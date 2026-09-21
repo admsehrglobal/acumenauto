@@ -150,8 +150,10 @@ class FileExceptionKeyForm(forms.Form):
         super().__init__(*args, **kwargs)
         self.spec = spec
         for i, column in enumerate(spec.columns, start=1):
+            optional = i > spec.required
             self.fields[f"key_{i}"] = forms.CharField(
-                label=column,
+                label=f"{column} (optional)" if optional else column,
+                required=not optional,
                 max_length=100,
                 widget=forms.TextInput(
                     attrs={"class": _INPUT_CLASS, "placeholder": column}
@@ -159,14 +161,15 @@ class FileExceptionKeyForm(forms.Form):
             )
 
     def clean(self):
-        """Build the normalised key. Every field is already required, so a
-        missing one has reported itself under its own label by now."""
+        """Build the normalised key. The required fields have already reported
+        themselves under their own label by now; an optional one left empty is
+        the wildcard, and stays the empty string."""
         data = super().clean()
         key = tuple(
             normalize_key(data.get(f"key_{i}", ""))
             for i in range(1, len(self.spec.columns) + 1)
         )
-        if all(key):
+        if all(key[: self.spec.required]):
             self.cleaned_key = key
         return data
 

@@ -74,9 +74,21 @@ class MakeDropSpecTests(unittest.TestCase):
 
     def test_keys_are_normalised_and_truncated_to_the_report_width(self):
         spec = make_drop_spec("invoices", [(500.0, ""), (" 600 ", "")])
-        self.assertEqual(spec.keys, frozenset({("500",), ("600",)}))
-        self.assertEqual(spec.columns, ("Invoice #",))
+        self.assertEqual(spec.keys, frozenset({("500", ""), ("600", "")}))
+        self.assertEqual(spec.columns, ("Invoice #", "Client Number"))
         self.assertEqual(spec.label, "Invoices")
+
+    def test_an_invoice_key_may_name_a_client_or_not(self):
+        """Both shapes live on the same list: every entry stored before
+        2026-09-21 has no client, and the ones added for ZipRide's 2026-09-17
+        mismatches do."""
+        spec = make_drop_spec("invoices", [("163746", ""), ("163746", "NJ00001544")])
+        self.assertEqual(
+            spec.keys, frozenset({("163746", ""), ("163746", "nj00001544")})
+        )
+
+    def test_an_invoice_key_with_no_number_is_still_refused(self):
+        self.assertIsNone(make_drop_spec("invoices", [("", "NJ00001544")]))
 
     def test_blank_parts_never_become_a_key(self):
         """A blank key would match the blank rows Power BI leaves in the
@@ -200,7 +212,7 @@ class ParseUploadTests(unittest.TestCase):
     def test_header_matched_ignoring_case_and_spaces(self):
         rows = [["invoice#", "note"], [500.0, "x"], ["600", None]]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("500",), ("600",)])
+        self.assertEqual(parsed.keys, [("500", ""), ("600", "")])
         self.assertEqual((parsed.blank, parsed.duplicates), (0, 0))
 
     def test_a_slice_of_the_report_itself_is_accepted(self):
@@ -217,12 +229,12 @@ class ParseUploadTests(unittest.TestCase):
     def test_title_rows_above_the_header_are_skipped(self):
         rows = [["Exceptions for Paul"], [], ["Invoice #"], ["1"], ["2"]]
         self.assertEqual(parse_upload(rows, REPORTS["invoices"]).keys,
-                         [("1",), ("2",)])
+                         [("1", ""), ("2", "")])
 
     def test_duplicates_fold_to_one_entry(self):
         rows = [["Invoice #"], ["1"], [1.0], [" 1 "], ["2"]]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("1",), ("2",)])
+        self.assertEqual(parsed.keys, [("1", ""), ("2", "")])
         self.assertEqual(parsed.duplicates, 2)
 
     def test_rows_missing_a_key_part_are_counted_not_added(self):
@@ -240,7 +252,9 @@ class ParseUploadTests(unittest.TestCase):
     def test_a_bare_column_of_invoice_numbers_needs_no_header(self):
         parsed = parse_upload([["110847"], [220851206.0], ["TCG12a"]],
                               REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("110847",), ("220851206",), ("TCG12a",)])
+        self.assertEqual(
+            parsed.keys, [("110847", ""), ("220851206", ""), ("TCG12a", "")]
+        )
 
     def test_a_headerless_two_column_sheet_is_still_refused(self):
         """The auths export puts Authorization ID first and Client DDDID
@@ -256,7 +270,7 @@ class ParseUploadTests(unittest.TestCase):
         """Storing it raises on Postgres and the page answers with a 500."""
         rows = [["Invoice #"], ["1"], ["x" * (MAX_KEY_LENGTH + 1)], ["2"]]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("1",), ("2",)])
+        self.assertEqual(parsed.keys, [("1", ""), ("2", "")])
         self.assertEqual((parsed.too_long, parsed.blank), (1, 0))
 
     def test_missing_header_names_what_was_expected(self):
@@ -281,7 +295,36 @@ class UploadAliasTests(unittest.TestCase):
             [2, "220851206", "NJ00000160", "Bailey, C."],
         ]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("110847",), ("220851206",)])
+        self.assertEqual(
+            parsed.keys, [("110847", "NJ00000107"), ("220851206", "NJ00000160")]
+        )
+
+    def test_pauls_flagged_export_narrows_each_entry_to_its_client(self):
+        """The shape TCG's system produced on 2026-09-17: the client sits next
+        to the number, so uploading the file as it comes out is enough."""
+        rows = [
+            ["Row", "External Invoice Number", "Client Number", "Review Reason"],
+            ["9447", "99004", "NJ00006544", "Client mismatch"],
+            ["7730", "100888", "NJ00006730", "Client mismatch"],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(
+            parsed.keys, [("99004", "NJ00006544"), ("100888", "NJ00006730")]
+        )
+
+    def test_a_row_with_no_client_is_a_wildcard_not_a_skipped_row(self):
+        """Only the number is required, so a gap in the optional column costs
+        precision, not the entry - it must not land in the 'skipped' count."""
+        rows = [["Invoice #", "Client Number"], ["1", "NJ1"], ["2", None]]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("1", "NJ1"), ("2", "")])
+        self.assertEqual(parsed.blank, 0)
+
+    def test_the_same_number_under_two_clients_stays_two_entries(self):
+        rows = [["Invoice #", "Client Number"], ["1", "NJ1"], ["1", "NJ2"]]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("1", "NJ1"), ("1", "NJ2")])
+        self.assertEqual(parsed.duplicates, 0)
 
     def test_pauls_accrual_export_header_is_accepted(self):
         rows = [
@@ -303,7 +346,7 @@ class UploadAliasTests(unittest.TestCase):
     def test_our_own_name_wins_when_a_sheet_carries_both(self):
         rows = [["External Invoice Number", "Invoice #"], ["ignored", "110847"]]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("110847",)])
+        self.assertEqual(parsed.keys, [("110847", "")])
 
     def test_an_alias_only_applies_to_the_report_whose_key_needs_it(self):
         """`DDD ID` aliases `Client DDDID`, which is not part of the invoices
@@ -312,7 +355,7 @@ class UploadAliasTests(unittest.TestCase):
         a missing 'Invoice #' with the column sitting right there."""
         rows = [["External Invoice Number", "DDD ID"], ["110847", "306194"]]
         parsed = parse_upload(rows, REPORTS["invoices"])
-        self.assertEqual(parsed.keys, [("110847",)])
+        self.assertEqual(parsed.keys, [("110847", "")])
 
     def test_aliases_never_reach_the_resolver_used_on_our_exports(self):
         """`column_indexes` reads the files we write. A name guessed wrong there

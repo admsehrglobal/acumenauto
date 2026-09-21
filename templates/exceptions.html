@@ -56,7 +56,9 @@
                 <tr class="border-t border-slate-100 hover:bg-slate-50">
                   <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">{{ e.key_1 }}</td>
                   {% if spec.columns|length > 1 %}
-                    <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">{{ e.key_2 }}</td>
+                    <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">
+                      {% if e.key_2 %}{{ e.key_2 }}{% else %}<span class="text-slate-400 font-sans">any</span>{% endif %}
+                    </td>
                   {% endif %}
                   <td class="px-4 py-2 text-slate-500 text-xs whitespace-nowrap">
                     {% if e.active %}
@@ -129,7 +131,7 @@
     <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
       <h2 class="text-lg font-medium text-slate-900 mb-1">Add an entry</h2>
       <p class="text-sm text-slate-600 mb-4">
-        {% if spec.columns|length > 1 %}Both values must match the row for it to be dropped.{% else %}Every row with this {{ spec.columns.0 }} is dropped.{% endif %}
+        {% if spec.optional_columns %}Leave {{ spec.optional_columns.0 }} empty and every row with this {{ spec.columns.0 }} is dropped. Fill it in and only that client&rsquo;s row is.{% elif spec.columns|length > 1 %}Both values must match the row for it to be dropped.{% else %}Every row with this {{ spec.columns.0 }} is dropped.{% endif %}
       </p>
       <form method="post" action="{% url 'exception_add' spec.slug %}" class="space-y-3">
         {% csrf_token %}
@@ -153,8 +155,9 @@
       <h2 class="text-lg font-medium text-slate-900 mb-1">Upload a list</h2>
       <p class="text-sm text-slate-600 mb-4">
         An Excel file whose first sheet has a column header named
-        {% for column in spec.columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}.
-        {% if spec.columns|length == 1 %}A single column of numbers with nothing above it works too.{% endif %}
+        {% for column in spec.required_columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}.
+        {% if spec.optional_columns %}If the sheet also has a <span class="font-mono">{{ spec.optional_columns.0 }}</span> column it is used, and each entry is narrowed to that client.{% endif %}
+        {% if spec.required == 1 %}A single column of numbers with nothing above it works too.{% endif %}
         Other columns are ignored. You see what was read before anything is saved.
       </p>
       <form method="post" action="{% url 'exception_upload' spec.slug %}" enctype="multipart/form-data" class="space-y-3">

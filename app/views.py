@@ -276,23 +276,26 @@ def _report_spec(report: str):
     return spec
 
 
-def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int]:
+def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     """Create the keys that are new, restore the ones removed earlier.
 
-    Returns (added, restored, already listed). Keys arrive normalised from the
-    form or the upload parser, so they compare with what is stored. They are
-    matched folded (`fold_key`), the same way the run matches them against the
-    export, so `AB12` after `ab12` is "already listed" and not a second entry
-    that would look live and drop nothing.
+    Returns (added, restored, already listed, narrowed). Keys arrive normalised
+    from the form or the upload parser, so they compare with what is stored.
+    They are matched folded (`fold_key`), the same way the run matches them
+    against the export, so `AB12` after `ab12` is "already listed" and not a
+    second entry that would look live and drop nothing.
     """
     now = timezone.now()
-    existing = {
+    stored = {
         fold_key((e.key_1, e.key_2)): e
         for e in FileException.objects.filter(report=report)
     }
+    existing = dict(stored)
     to_create: list[FileException] = []
     to_restore: list[FileException] = []
+    to_narrow: list[FileException] = []
     already = 0
+    spoken_for = _bare_keys(keys)
     for key in keys:
         parts = (key[0], key[1] if len(key) > 1 else "")
         folded = fold_key(parts)
@@ -313,6 +316,22 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int]:
             entry.removed_at = None
             entry.removed_by = ""
             to_restore.append(entry)
+        # An entry naming a client is dead weight while the bare key is also
+        # listed: `RowFilter.drops` tries the key with its optional parts
+        # blanked, so the wildcard drops the row whoever the client is, and the
+        # narrower entry changes nothing at all. Reading the upload as written
+        # means taking the wildcard off the list. Two things are left alone: a
+        # wildcard this same upload asks for, because a row with no client says
+        # "every client" in so many words and an upload does not get to argue
+        # with itself, and anything not already stored, which has no history to
+        # replace.
+        bare = fold_key((parts[0], ""))
+        if parts[1] and bare not in spoken_for:
+            wildcard = stored.get(bare)
+            if wildcard is not None and wildcard.active:
+                wildcard.removed_at = now
+                wildcard.removed_by = actor
+                to_narrow.append(wildcard)
     # One transaction: the entries and their rows in the record of changes go in
     # together or not at all. Without it a failure between the two leaves keys
     # live —dropping rows from tomorrow's file— with nothing in the record
@@ -320,13 +339,15 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int]:
     # the upload failed while the list has in fact changed.
     with transaction.atomic():
         FileException.objects.bulk_create(to_create, batch_size=500)
-        if to_restore:
+        if to_restore or to_narrow:
             FileException.objects.bulk_update(
-                to_restore, ["removed_at", "removed_by"], batch_size=500,
+                to_restore + to_narrow, ["removed_at", "removed_by"],
+                batch_size=500,
             )
         _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
         _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
-    return len(to_create), len(to_restore), already
+        _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
+    return len(to_create), len(to_restore), already, len(to_narrow)
 
 
 def _log_changes(entries, action: str, actor: str, at) -> None:
@@ -350,7 +371,39 @@ def _show_key(key) -> str:
     return " / ".join(part for part in key if part)
 
 
-def _upload_counts(spec, added: int, already: int, parsed) -> str:
+def _bare_keys(keys) -> set:
+    """The folded keys the batch asks for with no optional part filled in."""
+    return {
+        fold_key((key[0], ""))
+        for key in keys
+        if len(key) < 2 or not key[1]
+    }
+
+
+def _count_narrowing(report: str, spec, keys) -> int:
+    """How many listed wildcards this upload would take off the list.
+
+    Same rule as `_add_keys`, asked before anything is written so the preview
+    can say it. Counted per wildcard, not per key: two rows naming two clients
+    for one number retire that number once.
+    """
+    if spec.required >= len(spec.columns):
+        return 0
+    wanted = {
+        fold_key((key[0], "")) for key in keys if len(key) > 1 and key[1]
+    } - _bare_keys(keys)
+    if not wanted:
+        return 0
+    return sum(
+        1
+        for entry in FileException.objects.filter(
+            report=report, key_2="", removed_at__isnull=True
+        )
+        if fold_key((entry.key_1, "")) in wanted
+    )
+
+
+def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) -> str:
     """The numbers of one upload, each under its own name.
 
     They used to share two labels: the repeats inside Paul's own file were
@@ -362,6 +415,12 @@ def _upload_counts(spec, added: int, already: int, parsed) -> str:
     parts = [f"{added:,} added"]
     if already:
         parts.append(f"{already:,} already on your list")
+    if narrowed:
+        entries = "entry" if narrowed == 1 else "entries"
+        parts.append(
+            f"{narrowed:,} {entries} narrowed to the "
+            f"{spec.columns[spec.required]} in the file"
+        )
     if parsed.duplicates:
         parts.append(f"{parsed.duplicates:,} repeated in the file")
     if parsed.blank:
@@ -433,12 +492,18 @@ def exception_add(request, report: str):
         return render(
             request, "exceptions.html", _exceptions_context(request, spec, form)
         )
-    added, restored, already = _add_keys(
+    added, restored, already, narrowed = _add_keys(
         report, [form.cleaned_key], request.user.username
     )
     shown = _show_key(form.cleaned_key)
     if already:
         messages.info(request, f"{shown} is already listed.")
+    elif narrowed:
+        messages.success(
+            request,
+            f"{shown} added, and {form.cleaned_key[0]} on its own was removed: "
+            f"it covered every {spec.columns[spec.required]}.",
+        )
     else:
         messages.success(request, f"{shown} added.")
     return redirect("exceptions_list", report=report)
@@ -487,6 +552,13 @@ def exception_upload(request, report: str):
             "parsed": parsed,
             "first_key": _show_key(parsed.keys[0]),
             "last_key": _show_key(parsed.keys[-1]),
+            # Confirming takes entries OFF the list as well as putting them on,
+            # and a removal is the half worth seeing first: those rows start
+            # coming through again in tomorrow's file.
+            "narrowing": _count_narrowing(report, spec, parsed.keys),
+            "narrowed_by": spec.columns[spec.required]
+            if spec.required < len(spec.columns)
+            else "",
             # What the sheet actually gave, not what the report can take: the
             # optional column is only named here when some row filled it in.
             "read_columns": [
@@ -518,7 +590,7 @@ def exception_upload_confirm(request, report: str):
         return redirect("exceptions_list", report=report)
     parsed = form.parsed()
     try:
-        added, restored, already = _add_keys(
+        added, restored, already, narrowed = _add_keys(
             report, parsed.keys, request.user.username
         )
     except Exception as exc:  # noqa: BLE001 - a database error is not a read error
@@ -531,7 +603,7 @@ def exception_upload_confirm(request, report: str):
     report_message(
         request,
         f"{form.cleaned_data['filename']}: "
-        f"{_upload_counts(spec, added + restored, already, parsed)}",
+        f"{_upload_counts(spec, added + restored, already, parsed, narrowed)}",
     )
     return redirect("exceptions_list", report=report)
 

@@ -48,6 +48,16 @@
     </ul>
   {% endif %}
 
+  {% if narrowing %}
+    <div class="text-sm bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-4">
+      {{ narrowing }} entr{{ narrowing|pluralize:"y,ies" }} on your list
+      {{ narrowing|pluralize:"applies,apply" }} to every {{ narrowed_by }}, and this file names one.
+      Confirming replaces {{ narrowing|pluralize:"it,them" }}, so rows carrying the same
+      value under a different {{ narrowed_by }} go back into the file.
+      Removed entries can be restored.
+    </div>
+  {% endif %}
+
   <p class="text-sm text-slate-600 mb-4">
     Entries already on the list are counted, not added twice.
   </p>

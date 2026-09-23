@@ -256,6 +256,85 @@ class FileExceptionsPagesTests(TestCase):
         active = FileException.objects.filter(removed_at__isnull=True)
         self.assertEqual(sorted(active.values_list("key_1", flat=True)), ["1", "2"])
 
+    def _confirm(self, report: str, content: bytes, name: str = "list.xlsx"):
+        preview = self.client.post(
+            reverse("exception_upload", args=[report]),
+            {"file": _upload(name, content)},
+        )
+        return preview, self.client.post(
+            reverse("exception_upload_confirm", args=[report]),
+            preview.context["confirm_form"].initial,
+            follow=True,
+        )
+
+    def test_naming_a_client_takes_the_bare_number_off_the_list(self):
+        """Paul's 66 were already listed as bare numbers when he asked for the
+        client too. Left there, the wildcard drops every client's row and the
+        entry he just added changes nothing at all."""
+        self._add("invoices", key_1="163746")
+        content = _xlsx([
+            ["External Invoice Number", "Client Number"],
+            ["163746", "NJ00001544"],
+        ])
+        preview, response = self._confirm("invoices", content)
+        self.assertContains(preview, "applies to every Client Number")
+        self.assertContains(
+            response, "list.xlsx: 1 added, 1 entry narrowed to the Client Number"
+        )
+        live = FileException.objects.filter(removed_at__isnull=True)
+        self.assertEqual(
+            list(live.values_list("key_1", "key_2")), [("163746", "NJ00001544")]
+        )
+        # Removed, not deleted: the record of changes says so and Restore
+        # brings the wildcard back, the same as any other removal.
+        wildcard = FileException.objects.get(key_1="163746", key_2="")
+        self.assertEqual(wildcard.removed_by, "paul")
+        self.assertEqual(
+            list(wildcard.changes.values_list("action", flat=True)),
+            [FileExceptionChange.REMOVED, FileExceptionChange.ADDED],
+        )
+
+    def test_a_file_that_carries_both_keeps_the_bare_number(self):
+        """A row with no client says "every client" in so many words. An upload
+        does not get to argue with itself, whatever order the rows come in."""
+        self._add("invoices", key_1="163746")
+        content = _xlsx([
+            ["External Invoice Number", "Client Number"],
+            ["163746", "NJ00001544"],
+            ["163746", ""],
+        ])
+        _, response = self._confirm("invoices", content)
+        self.assertNotContains(response, "narrowed to the Client Number in the file")
+        self.assertEqual(
+            FileException.objects.filter(removed_at__isnull=True).count(), 2
+        )
+
+    def test_typing_the_client_in_narrows_the_number_already_typed(self):
+        self._add("invoices", key_1="163746")
+        response = self._add("invoices", key_1="163746", key_2="NJ00001544")
+        self.assertContains(
+            response,
+            "163746 on its own was removed: it covered every Client Number.",
+        )
+        self.assertFalse(
+            FileException.objects.get(key_1="163746", key_2="").active
+        )
+
+    def test_a_report_whose_key_has_no_optional_part_never_narrows(self):
+        """Both parts are required for authorizations, so there is no wildcard
+        to retire and nothing on the list may be touched by an upload."""
+        self._add("auths", key_1="664508", key_2="A1")
+        content = _xlsx([
+            ["Client DDDID", "Authorization ID"],
+            ["664508", "A2"],
+        ])
+        preview, response = self._confirm("auths", content)
+        self.assertNotContains(preview, "applies to every")
+        self.assertNotContains(response, "narrowed to the")
+        self.assertEqual(
+            FileException.objects.filter(removed_at__isnull=True).count(), 2
+        )
+
     def test_upload_without_the_expected_header_is_refused_with_the_names(self):
         content = _xlsx([["Invoice Number"], [1]])
         response = self.client.post(

@@ -4,18 +4,25 @@ These need the database (a real user, the unique constraint, the soft removal),
 so unlike `tests/` they run through Django's runner: `manage.py test` with the
 environment `acumenauto.settings` reads (see README).
 """
+import datetime as dt
 import io
+import re
+import tempfile
+from unittest.mock import patch
 
+from celery.exceptions import SoftTimeLimitExceeded
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.html import escape
 from openpyxl import Workbook
 
+from app import scraper
 from app.management.commands.download_report import _load_exceptions, _stamp_matches
-from app.models import FileException, FileExceptionChange, SharedKey
+from app.models import FileException, FileExceptionChange, Run, SharedKey
 
 
 def _xlsx(rows) -> bytes:
@@ -34,6 +41,18 @@ def _upload(name: str, content: bytes) -> SimpleUploadedFile:
         content,
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+_R1_HEADER = [
+    "Urgency", "Entry ID", "PA Number", "Invoice #", "Client Name", "Client DDDID",
+    "Client Number", "Service Code", "Status", "Rejected Reason", "Date Of Service",
+    "Entry Creation Date", "Amount", "Aging",
+]
+
+
+def _r1_row(entry_id, invoice, status, client, name):
+    return ["", entry_id, "PA1", invoice, name, "D1", client, "Transportation",
+            status, "", dt.datetime(2025, 7, 20), dt.datetime(2025, 7, 28), 84.0, 0]
 
 
 class FileExceptionsPagesTests(TestCase):
@@ -512,3 +531,154 @@ class FileExceptionsPagesTests(TestCase):
 
         self.assertEqual(SharedKey.objects.count(), 1)
         self.assertContains(self._page(), self.NOTICE)
+
+    def _notice_forms(self):
+        """The notice's forms exactly as the page renders them:
+        {button label: (action, [hidden client values])}."""
+        html = self._page().content.decode()
+        start = html.index('<div class="bg-amber-50')
+        notice = html[start:html.index("</ul>", start)]
+        forms = {}
+        for action, body in re.findall(
+            r'<form method="post" action="([^"]+)"[^>]*>(.*?)</form>', notice, re.S
+        ):
+            label = " ".join(re.search(r"<button[^>]*>(.*?)</button>", body, re.S)
+                             .group(1).split())
+            forms[label] = (action, re.findall(r'name="client" value="([^"]*)"', body))
+        return forms
+
+    def _submit(self, label):
+        action, clients = self._notice_forms()[label]
+        return self.client.post(action, {"client": clients} if clients else {}, follow=True)
+
+    def _active(self):
+        return sorted(
+            FileException.objects.filter(removed_at__isnull=True)
+            .values_list("key_1", "key_2")
+        )
+
+    def _shared_119344(self):
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+
+    def test_only_as_rendered_keeps_that_client(self):
+        self._shared_119344()
+        self._submit("Only NJ00006730 Burke, M.")
+        self.assertEqual(self._active(), [("119344", "NJ00006730")])
+
+    def test_all_of_them_as_rendered_keeps_every_client(self):
+        self._shared_119344()
+        self._submit("All of them, as now")
+        self.assertEqual(
+            self._active(), [("119344", "NJ00006516"), ("119344", "NJ00006730")]
+        )
+
+    def test_none_as_rendered_takes_the_number_off(self):
+        self._shared_119344()
+        self._submit("None: remove 119344")
+        self.assertEqual(self._active(), [])
+
+    def test_with_several_shared_numbers_a_click_touches_only_its_own(self):
+        """Production has five at once. '26' sorts after '119344', so a view
+        that read the first entry's clients would get this one wrong."""
+        self._add("invoices", key_1="119344")
+        self._add("invoices", key_1="26")
+        self._run_saw({
+            "119344": [self.BURKE, self.BURKERT],
+            "26": [("NJ00007458", "Larsen, M."), ("NJ00016747", "Badalov, A.")],
+        })
+        self._submit("Only NJ00016747 Badalov, A.")
+        self.assertEqual(self._active(), [("119344", ""), ("26", "NJ00016747")])
+
+    def test_a_number_with_letters_is_flagged_whatever_its_capitals(self):
+        """The run stores the number folded; Paul types it as the export spells
+        it. 427 invoice numbers on the 2026-09-06 files carry letters."""
+        self._add("invoices", key_1="TCG11634D868")
+        self._run_saw({"TCG11634D868": [self.BURKE, self.BURKERT]})
+        self.assertContains(self._page(), self.NOTICE)
+
+    def test_an_empty_list_leaves_no_old_picture_behind(self):
+        """With no entries the run applies no list and builds no picture, so
+        the stored one would only get older."""
+        self._shared_119344()
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+
+        _stamp_matches(_load_exceptions(), timezone.now())
+
+        self.assertFalse(SharedKey.objects.exists())
+
+
+class SharedKeyFailedRunTests(TestCase):
+    """The real command, with only the browser download replaced by the same
+    pile loop `_export_chunked_report` runs: rejected pile first, then payable.
+
+    The rejected pile keeps one line per invoice number, so it alone can never
+    show a number on two clients' lines. A run that dies before the payable
+    pile is written (the Celery soft limit, the documented case) must keep the
+    last complete run's picture instead of wiping the notice off the page.
+    """
+
+    def setUp(self):
+        User.objects.create_user("paul", password="pw")
+        self.client.login(username="paul", password="pw")
+        FileException.objects.create(report="invoices", key_1="119344", created_by="paul")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fail_on_payable = False
+
+    async def _download(self, **kw):
+        out = kw["output_dir"]
+        out.mkdir(parents=True, exist_ok=True)
+        spec = kw["chunked_reports"][0]
+        part = out / "part1.xlsx"
+        wb = Workbook()
+        ws = wb.active
+        ws.append(_R1_HEADER)
+        for row in (
+            _r1_row("1", "119344", "Paid", "NJ00006730", "Burke, M."),
+            _r1_row("2", "119344", "Paid", "NJ00006516", "Burkert, H."),
+            _r1_row("3", "777", "Rejected", "NJ00006730", "Burke, M."),
+        ):
+            ws.append(row)
+        wb.save(part)
+        meta = {part: (dt.date(2025, 6, 8), dt.date(2026, 9, 1), 3)}
+        split, rej_meta, pay_meta = scraper._classify_invoice_piles([part], meta)
+        items = []
+        for keep, slug, m in ((split.rejected, "vpa_rejected", rej_meta),
+                              (split.payable, "vpa_payable", pay_meta)):
+            if self.fail_on_payable and slug == "vpa_payable":
+                raise SoftTimeLimitExceeded()
+            merged = out / f"{slug}_ts.xlsx"
+            scraper._merge_xlsx_files([part], merged, keep, spec.exceptions)
+            outs = scraper._split_for_email(
+                merged, [part], m, (dt.date(2025, 6, 8), dt.date(2026, 9, 1)),
+                out, slug, "ts", keep, spec.exceptions,
+            )
+            items += [(p, slug) for p, _, _ in outs]
+        return items
+
+    def _run(self):
+        with patch("app.management.commands.download_report.download_reports",
+                   self._download), \
+             patch("app.management.commands.download_report._notify_failure"):
+            try:
+                call_command("download_report", reports="1", no_email=True,
+                             output_dir=self._tmp.name)
+            except SoftTimeLimitExceeded:
+                pass
+
+    def test_a_run_that_dies_before_the_payable_pile_keeps_the_notice(self):
+        self._run()
+        before = list(SharedKey.objects.values_list("key_1", "clients"))
+        self.assertEqual(
+            before, [("119344", "NJ00006516\tBurkert, H.\nNJ00006730\tBurke, M.")]
+        )
+
+        self.fail_on_payable = True
+        self._run()
+
+        self.assertEqual(Run.objects.order_by("-pk").first().status, Run.Status.FAILED)
+        self.assertEqual(list(SharedKey.objects.values_list("key_1", "clients")), before)
+        page = self.client.get(reverse("exceptions_list", args=["invoices"]))
+        self.assertContains(page, "Only NJ00006730 Burke, M.")

@@ -33,7 +33,7 @@
           <span class="font-mono font-medium">{{ e.key_1 }}</span>
           <div class="mt-1 flex flex-wrap gap-2">
             {% for number, name in clients %}
-              <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline">
+              <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline" onsubmit="this.querySelector('button').disabled = true;">
                 {% csrf_token %}
                 <input type="hidden" name="client" value="{{ number }}">
                 <button type="submit"
@@ -42,7 +42,7 @@
                 </button>
               </form>
             {% endfor %}
-            <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline">
+            <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline" onsubmit="this.querySelector('button').disabled = true;">
               {% csrf_token %}
               {% for number, name in clients %}<input type="hidden" name="client" value="{{ number }}">{% endfor %}
               <button type="submit"
@@ -51,7 +51,7 @@
               </button>
             </form>
             <form method="post" action="{% url 'exception_remove' spec.slug e.pk %}" class="inline"
-                  onsubmit="return confirm('Remove {{ e.key_display|escapejs }}?');">
+                  onsubmit="if (!confirm('Remove {{ e.key_display|escapejs }}?')) return false; this.querySelector('button').disabled = true;">
               {% csrf_token %}
               <button type="submit"
                       class="text-xs px-2 py-1 rounded border border-red-200 bg-white text-red-700 hover:bg-red-50">

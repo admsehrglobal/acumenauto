@@ -307,7 +307,9 @@ def _load_exceptions() -> dict[str, DropSpec | None]:
     return specs
 
 
-def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
+def _stamp_matches(
+    exceptions: dict[str, DropSpec | None], when, complete: bool = True
+) -> None:
     """Record, per entry, that this run read its file and whether it matched.
 
     Only for the files this run actually wrote: the daily invocation is
@@ -315,9 +317,21 @@ def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
     would mark the accruals entries "checked" on a run that never opened that
     export. `DropSpec.stats` is empty exactly when no file was written, which
     is the same guard `summarize` uses.
+
+    `complete` is False on the failure path. A run that died between the
+    rejected and the payable pile has seen part of the invoice file only, and
+    the rejected pile holds one line per number, so its picture of the numbers
+    on several clients' lines is empty: it would take every one of them off the
+    page. The last complete run's picture is kept instead.
     """
     for slug, spec in exceptions.items():
-        if spec is None or not spec.stats:
+        if spec is None:
+            # An empty list builds no picture at all, so the stored one would
+            # only get older. None is better than one of an old file.
+            if REPORTS[slug].optional_columns:
+                SharedKey.objects.filter(report=slug).delete()
+            continue
+        if not spec.stats:
             continue
         matched: set = set()
         for _, keys in spec.stats.values():
@@ -332,7 +346,7 @@ def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
         ]
         entries.update(last_checked_at=when)
         FileException.objects.filter(pk__in=hit).update(last_matched_at=when)
-        if spec.owners is not None:
+        if complete and spec.owners is not None:
             _replace_shared(slug, spec.shared(), when)
 
 
@@ -352,10 +366,12 @@ def _replace_shared(slug: str, shared: dict, when) -> None:
         ])
 
 
-def _stamp_matches_safely(exceptions: dict[str, DropSpec | None]) -> None:
+def _stamp_matches_safely(
+    exceptions: dict[str, DropSpec | None], complete: bool = True
+) -> None:
     """Bookkeeping, not delivery: never let it fail a run whose files are out."""
     try:
-        _stamp_matches(exceptions, timezone.now())
+        _stamp_matches(exceptions, timezone.now(), complete)
     except Exception:  # noqa: BLE001 - the run's own outcome is already decided
         logger.exception("[exceptions] no pude sellar las entradas")
 
@@ -647,7 +663,7 @@ class Command(BaseCommand):
                 )
             run.error_message = " | ".join(messages)
             run.exceptions_summary = summarize(exceptions.values())
-            _stamp_matches_safely(exceptions)
+            _stamp_matches_safely(exceptions, complete=False)
             run.finished_at = timezone.now()
             run.save()
             _notify_failure(run)

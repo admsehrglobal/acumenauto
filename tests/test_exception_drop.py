@@ -538,3 +538,13 @@ class SharedNumberTests(unittest.TestCase):
         drop = make_drop_spec("auths", [("721253", "173066812")])
         self.assertIsNone(drop.owners)
         self.assertEqual(drop.shared(), {})
+
+    def test_a_number_with_letters_in_two_spellings_is_one_number(self):
+        """427 invoice numbers on the 2026-09-06 files carry letters; the run
+        compares them ignoring capitals, and so does this."""
+        drop = make_drop_spec("invoices", [("TCG188a5359DR6", "")])
+        self._merge([
+            _r1("1", "TCG188a5359DR6", client="NJ00006730", name="Burke, M."),
+            _r1("2", "tcg188A5359dr6", client="NJ00006516", name="Burkert, H."),
+        ], drop)
+        self.assertEqual(list(drop.shared_entries()), [("tcg188a5359dr6",)])

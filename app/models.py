@@ -162,6 +162,11 @@ class FileException(models.Model):
     # is checked and never matches is a typo, and until now nothing said so.
     last_checked_at = models.DateTimeField(null=True, blank=True)
     last_matched_at = models.DateTimeField(null=True, blank=True)
+    # Whose rows an entry with no client dropped on that same run, when it was
+    # more than one client: "NJ00006516 Burkert, H.; NJ00006730 Burke, M.".
+    # Empty otherwise. `db_default` so that the code before this column can
+    # still insert entries after a rollback (the lesson of 0015).
+    last_clients = models.TextField(blank=True, default="", db_default="")
 
     class Meta:
         constraints = [

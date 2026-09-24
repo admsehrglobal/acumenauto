@@ -41,6 +41,10 @@ class ReportSpec(NamedTuple):
     label: str
     columns: tuple[str, ...]
     required: int
+    # Read next to the optional part, only to say whose rows an entry without
+    # it dropped: "NJ00006730 Burke, M." is something Paul can act on, the
+    # number alone is not.
+    name_column: str = ""
 
     @property
     def required_columns(self) -> tuple[str, ...]:
@@ -58,7 +62,8 @@ class ReportSpec(NamedTuple):
 # and R2 renamed two columns in the same window).
 REPORTS: dict[str, ReportSpec] = {
     "invoices": ReportSpec(
-        "invoices", "Invoices", ("Invoice #", "Client Number"), required=1
+        "invoices", "Invoices", ("Invoice #", "Client Number"), required=1,
+        name_column="Client Name",
     ),
     "auths": ReportSpec(
         "auths", "Authorizations", ("Client DDDID", "Authorization ID"), required=2
@@ -161,6 +166,9 @@ class DropSpec(NamedTuple):
     NOT "the file came out empty": a file that had nothing to begin with — a day
     with no rejected invoices — still goes out empty, because that is an answer
     and silence is not. Only a file this list emptied is held back.
+
+    `owners` is kept per output path the same way as `stats`: for each entry
+    with its optional part empty, whose rows it dropped (see `RowFilter`).
     """
 
     label: str
@@ -169,15 +177,40 @@ class DropSpec(NamedTuple):
     stats: dict
     emptied: set
     required: int = 0  # 0 = every part, so the older two-part specs are unchanged
+    name_column: str = ""
+    owners: dict | None = None
 
     def record(self, output_path, row_filter: "RowFilter", written: int) -> None:
         self.stats[output_path] = (row_filter.dropped, set(row_filter.matched))
+        if self.owners is not None:
+            self.owners[output_path] = row_filter.owners
         if written == 0 and row_filter.dropped:
             self.emptied.add(output_path)
 
     def forget(self, output_path) -> None:
         self.stats.pop(output_path, None)
+        if self.owners is not None:
+            self.owners.pop(output_path, None)
         self.emptied.discard(output_path)
+
+    def shared(self) -> dict[tuple[str, ...], list[str]]:
+        """The entries that dropped rows of more than one owner, across every
+        file written, each with those owners as the page shows them.
+
+        This is the invoice number entered without its client that also carries
+        another client's line. On 2026-09-17 it took nine lines ($1,914.50) that
+        ZipRide was accepting out of every file for a week, and nothing said so:
+        the run reported the rows as dropped, which they were.
+        """
+        merged: dict[tuple[str, ...], dict] = {}
+        for per_file in (self.owners or {}).values():
+            for key, owners in per_file.items():
+                merged.setdefault(key, {}).update(owners)
+        return {
+            key: sorted(owners.values())
+            for key, owners in merged.items()
+            if len(owners) > 1
+        }
 
 
 def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
@@ -200,7 +233,8 @@ def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
     if not keys:
         return None
     return DropSpec(
-        spec.label, spec.columns, frozenset(keys), {}, set(), spec.required
+        spec.label, spec.columns, frozenset(keys), {}, set(), spec.required,
+        spec.name_column, {},
     )
 
 
@@ -222,17 +256,20 @@ class RowFilter:
         self._positions = [positions[name] for name in required] + [
             index.get(name) for name in spec.columns[self._required :]
         ]
+        self._name = index.get(spec.name_column) if spec.name_column else None
         self._keys = spec.keys
         self.dropped = 0
         self.matched: set[tuple[str, ...]] = set()
+        # Entry with its optional parts empty -> {folded optional parts of a
+        # row it dropped: how the page names that owner}.
+        self.owners: dict[tuple[str, ...], dict[tuple[str, ...], str]] = {}
 
     def drops(self, row: Sequence) -> bool:
-        key = fold_key(
-            tuple(
-                normalize_key(row[i]) if i is not None and i < len(row) else ""
-                for i in self._positions
-            )
+        parts = tuple(
+            normalize_key(row[i]) if i is not None and i < len(row) else ""
+            for i in self._positions
         )
+        key = fold_key(parts)
         # The row's own key first, then the same key with the optional parts
         # blanked: 'invoice 163746 of NJ00001544' and 'invoice 163746, any
         # client' are two different entries and a row can be on the list under
@@ -245,9 +282,24 @@ class RowFilter:
             if candidate in self._keys:
                 self.matched.add(candidate)
                 hit = True
+                # A row with no client says nothing about whose it is, so it
+                # cannot make an entry look shared.
+                if n < width and any(key[n:]):
+                    self._note_owner(candidate, key[n:], parts[n:], row)
         if hit:
             self.dropped += 1
         return hit
+
+    def _note_owner(self, entry, owner, shown, row: Sequence) -> None:
+        owners = self.owners.setdefault(entry, {})
+        if owner in owners:
+            return
+        name = (
+            normalize_key(row[self._name])
+            if self._name is not None and self._name < len(row)
+            else ""
+        )
+        owners[owner] = " ".join(part for part in (*shown, name) if part)
 
 
 def summarize(specs: Iterable[DropSpec | None]) -> str:
@@ -264,6 +316,13 @@ def summarize(specs: Iterable[DropSpec | None]) -> str:
             f"{spec.label}: {rows} rows dropped "
             f"({len(matched)} of {len(spec.keys)} keys matched)"
         )
+        shared = spec.shared()
+        if shared:
+            optional = spec.columns[spec.required]
+            line += (
+                f", {len(shared)} with no {optional} matched more than one "
+                f"{optional}"
+            )
         if spec.emptied:
             line += f", {len(spec.emptied)} file(s) not emailed (no rows left)"
         parts.append(line)

@@ -464,12 +464,20 @@ def _exceptions_context(request, spec, key_form=None) -> dict:
         FileExceptionChange.objects.filter(report=report)
         .select_related("entry")[:25]
     )
+    # Entries with no client that dropped rows of more than one client on the
+    # last run. On a list of thousands a mark on the row sits on page 60, so
+    # they go at the top of the page.
+    shared = list(
+        FileException.objects.filter(report=report, removed_at__isnull=True)
+        .exclude(last_clients="")
+    )
     return {
         "spec": spec,
         "sections": list(REPORTS.values()),
         "page": page,
         "q": q,
         "recent": recent,
+        "shared": shared,
         "key_form": key_form or FileExceptionKeyForm(spec),
         "upload_form": FileExceptionUploadForm(),
     }

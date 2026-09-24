@@ -24,7 +24,7 @@ from unittest.mock import patch
 from openpyxl import Workbook, load_workbook
 
 from app import scraper
-from app.file_exceptions import make_drop_spec
+from app.file_exceptions import make_drop_spec, summarize
 from app.scraper import (
     ChunkedReport,
     _apply_exceptions_in_place,
@@ -44,8 +44,8 @@ R3_HEADER = [
 R2_HEADER = ["Authorization ID", "Client Name", "Client ID", "Client DDDID", "Status"]
 
 
-def _r1(entry_id, invoice, status="Paid", client="C1"):
-    return ["", entry_id, "PA1", invoice, "Cli", "D1", client, "Transportation",
+def _r1(entry_id, invoice, status="Paid", client="C1", name="Cli"):
+    return ["", entry_id, "PA1", invoice, name, "D1", client, "Transportation",
             status, "", dt.datetime(2025, 7, 20), dt.datetime(2025, 7, 28),
             84.0, 0]
 
@@ -401,3 +401,128 @@ class InvoiceClientKeyTests(unittest.TestCase):
         drop = make_drop_spec("invoices", [("163746", "")])
         with self.assertRaises(ValueError):
             self._merge(drop, chunk)
+
+
+class SharedNumberTests(unittest.TestCase):
+    """An invoice entry with no client that drops rows of more than one client.
+
+    Paul's list of 2026-09-17 carried 66 numbers with no client. Nine of those
+    numbers were on another client's line too, one ZipRide was accepting, and
+    those nine lines ($1,914.50) were left out of every file for a week without
+    anything saying so. On 2026-09-24 five more entries on the live list had the
+    same shape (1, 2, 26, 32 and 119344). The run has to name them.
+    """
+
+    HEADER_NO_NAME = [c for c in R1_HEADER if c != "Client Name"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _merge(self, rows, drop, keep=None, name="payable.xlsx", header=R1_HEADER):
+        chunk = self.d / f"chunk_{name}"
+        _make_xlsx(chunk, header, rows)
+        out = self.d / name
+        _merge_xlsx_files([chunk], out, keep, drop)
+        return out
+
+    def test_a_number_on_two_clients_lines_is_named_with_both(self):
+        drop = make_drop_spec("invoices", [("119344", ""), ("999", "")])
+        self._merge([
+            _r1("1", "119344", client="NJ00006730", name="Burke, M."),
+            _r1("2", "119344", client="NJ00006516", name="Burkert, H."),
+            _r1("3", "999", client="NJ00006730", name="Burke, M."),
+        ], drop)
+        self.assertEqual(drop.shared(), {
+            ("119344", ""): ["NJ00006516 Burkert, H.", "NJ00006730 Burke, M."],
+        })
+        self.assertIn(
+            ", 1 with no Client Number matched more than one Client Number",
+            summarize([drop]),
+        )
+
+    def test_a_number_on_one_client_s_lines_is_not_named(self):
+        """Two weeks of service under one invoice is the common shape (612
+        invoice-and-client pairs on the 2026-09-06 file), not a shared number."""
+        drop = make_drop_spec("invoices", [("500", "")])
+        self._merge([
+            _r1("1", "500", client="NJ00001544"),
+            _r1("2", "500", client="NJ00001544"),
+        ], drop)
+        self.assertEqual(drop.shared(), {})
+        self.assertNotIn("more than one", summarize([drop]))
+
+    def test_an_entry_naming_its_client_is_never_named(self):
+        drop = make_drop_spec("invoices", [("119344", "NJ00006730")])
+        self._merge([
+            _r1("1", "119344", client="NJ00006730"),
+            _r1("2", "119344", client="NJ00006516"),
+        ], drop)
+        self.assertEqual(drop.shared(), {})
+
+    def test_one_client_in_two_spellings_is_one_client(self):
+        drop = make_drop_spec("invoices", [("500", "")])
+        self._merge([
+            _r1("1", "500", client="NJ00001544"),
+            _r1("2", "500", client="nj00001544"),
+        ], drop)
+        self.assertEqual(drop.shared(), {})
+
+    def test_a_row_with_no_client_does_not_count_as_a_second_client(self):
+        drop = make_drop_spec("invoices", [("500", "")])
+        self._merge([
+            _r1("1", "500", client="NJ00001544"),
+            _r1("2", "500", client=""),
+        ], drop)
+        self.assertEqual(drop.shared(), {})
+
+    def test_the_two_clients_can_be_in_the_two_files(self):
+        """The invoice file goes out as two files, rejected and payable, each
+        written by its own merge. One client in each is still two clients."""
+        drop = make_drop_spec("invoices", [("119344", "")])
+        rows = [
+            _r1("1", "119344", "Rejected", client="NJ00006730"),
+            _r1("2", "119344", client="NJ00006516"),
+        ]
+        self._merge(rows, drop, keep=frozenset({"1"}), name="rejected.xlsx")
+        self._merge(rows, drop, keep=frozenset({"2"}), name="payable.xlsx")
+        self.assertEqual(
+            drop.shared(), {("119344", ""): ["NJ00006516 Cli", "NJ00006730 Cli"]}
+        )
+
+    def test_a_forgotten_merge_names_nobody(self):
+        """`_split_for_email` forgets the big merge it deletes; what it dropped
+        is counted again by the files that replace it."""
+        drop = make_drop_spec("invoices", [("119344", "")])
+        out = self._merge([
+            _r1("1", "119344", client="NJ00006730"),
+            _r1("2", "119344", client="NJ00006516"),
+        ], drop)
+        drop.forget(out)
+        self.assertEqual(drop.shared(), {})
+
+    def test_without_the_client_column_nobody_is_named(self):
+        """Rows with no client cannot be told apart, so the run stays quiet
+        rather than guess."""
+        header = [c for c in R1_HEADER if c != "Client Number"]
+        rows = [
+            [c for i, c in enumerate(_r1(n, "119344", client=cl))
+             if R1_HEADER[i] != "Client Number"]
+            for n, cl in (("1", "NJ00006730"), ("2", "NJ00006516"))
+        ]
+        drop = make_drop_spec("invoices", [("119344", "")])
+        self._merge(rows, drop, header=header)
+        self.assertEqual(drop.shared(), {})
+
+    def test_without_the_name_column_the_client_number_is_enough(self):
+        rows = [
+            [c for i, c in enumerate(_r1(n, "119344", client=cl))
+             if R1_HEADER[i] != "Client Name"]
+            for n, cl in (("1", "NJ00006730"), ("2", "NJ00006516"))
+        ]
+        drop = make_drop_spec("invoices", [("119344", "")])
+        self._merge(rows, drop, header=self.HEADER_NO_NAME)
+        self.assertEqual(
+            drop.shared(), {("119344", ""): ["NJ00006516", "NJ00006730"]}
+        )

@@ -19,6 +19,23 @@
   {% endfor %}
 </div>
 
+{% if shared %}
+  <div class="bg-amber-50 border border-amber-300 rounded-lg p-4 mb-6 text-sm text-amber-900">
+    <p class="font-medium">
+      {{ shared|length }} entr{{ shared|length|pluralize:"y,ies" }} with no {{ spec.optional_columns.0 }} dropped rows of more than one client on the last run
+    </p>
+    <p class="mt-1">
+      An entry with no {{ spec.optional_columns.0 }} drops the rows of every client that carries that {{ spec.columns.0 }}.
+      If only one client was meant, add it again with that client&rsquo;s {{ spec.optional_columns.0 }}; the entry without one comes off the list by itself.
+    </p>
+    <ul class="mt-2 space-y-1">
+      {% for e in shared %}
+        <li class="break-words"><span class="font-mono">{{ e.key_1 }}</span> &mdash; {{ e.last_clients }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+{% endif %}
+
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
   <div class="lg:col-span-2 space-y-6">
     <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
@@ -72,6 +89,9 @@
                   <td class="px-4 py-2 text-xs whitespace-nowrap">
                     {% if e.last_matched_at %}
                       <span class="text-slate-500">Dropped rows {{ e.last_matched_at|timezone:"America/New_York"|date:"Y-m-d H:i" }} NJ</span>
+                      {% if e.active and e.last_clients %}
+                        <div class="text-amber-700" title="{{ e.last_clients }}">of more than one client</div>
+                      {% endif %}
                     {% elif e.last_checked_at %}
                       <span class="text-amber-700">Checked, matched nothing</span>
                     {% else %}

@@ -317,13 +317,23 @@ def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
         # `matched` holds keys at the report's width, so a one-part key is a
         # 1-tuple there and has to be built the same way from the entry.
         width = len(spec.columns)
+        shared = spec.shared()
         entries = FileException.objects.filter(report=slug, removed_at__isnull=True)
-        hit = [
-            e.pk for e in entries
-            if fold_key((e.key_1, e.key_2)[:width]) in matched
-        ]
+        hit, clients = [], {}
+        for e in entries:
+            key = fold_key((e.key_1, e.key_2)[:width])
+            if key in matched:
+                hit.append(e.pk)
+            if key in shared:
+                clients[e.pk] = "; ".join(shared[key])
         entries.update(last_checked_at=when)
         FileException.objects.filter(pk__in=hit).update(last_matched_at=when)
+        # Rewritten every run, so an entry stops being flagged as soon as its
+        # file no longer gives it a second client. A handful per run, one
+        # update each.
+        entries.exclude(last_clients="").update(last_clients="")
+        for pk, text in clients.items():
+            FileException.objects.filter(pk=pk).update(last_clients=text)
 
 
 def _stamp_matches_safely(exceptions: dict[str, DropSpec | None]) -> None:

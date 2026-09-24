@@ -378,3 +378,57 @@ class FileExceptionsPagesTests(TestCase):
         self.assertEqual(specs["invoices"].keys, frozenset({("500", "")}))
         self.assertIsNone(specs["auths"])
         self.assertIsNone(specs["accruals"])
+
+    # --- entries with no client that drop more than one client's rows ---------
+
+    NOTICE = "dropped rows of more than one client on the last run"
+
+    def _run_saw(self, owners):
+        """Stamp as a run that wrote the invoice file would, with `owners` as
+        what its merges saw: number -> [(client, name), ...]."""
+        exceptions = _load_exceptions()
+        spec = exceptions["invoices"]
+        spec.stats["invoices.xlsx"] = (
+            sum(len(o) for o in owners.values()),
+            {(number, "") for number in owners},
+        )
+        spec.owners["invoices.xlsx"] = {
+            (number, ""): {(c.lower(),): f"{c} {n}" for c, n in seen}
+            for number, seen in owners.items()
+        }
+        _stamp_matches(exceptions, timezone.now())
+
+    def test_a_number_on_two_clients_lines_is_flagged_at_the_top_of_the_page(self):
+        self._add("invoices", key_1="119344")
+        self._add("invoices", key_1="500")
+        self._run_saw({
+            "119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")],
+            "500": [("NJ00001544", "Moore, A.")],
+        })
+
+        self.assertEqual(
+            FileException.objects.get(key_1="119344").last_clients,
+            "NJ00006516 Burkert, H.; NJ00006730 Burke, M.",
+        )
+        self.assertEqual(FileException.objects.get(key_1="500").last_clients, "")
+        response = self.client.get(reverse("exceptions_list", args=["invoices"]))
+        self.assertContains(response, "1 entry with no Client Number " + self.NOTICE)
+        self.assertContains(response, escape("NJ00006516 Burkert, H.; NJ00006730 Burke, M."))
+
+    def test_the_flag_goes_once_a_run_sees_one_client(self):
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")]})
+        self._run_saw({"119344": [("NJ00006730", "Burke, M.")]})
+
+        self.assertEqual(FileException.objects.get(key_1="119344").last_clients, "")
+        response = self.client.get(reverse("exceptions_list", args=["invoices"]))
+        self.assertNotContains(response, self.NOTICE)
+
+    def test_typing_the_client_in_takes_the_number_off_the_notice(self):
+        """What the notice tells Paul to do has to be enough to clear it,
+        without waiting for the next run."""
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")]})
+
+        response = self._add("invoices", key_1="119344", key_2="NJ00006730")
+        self.assertNotContains(response, self.NOTICE)

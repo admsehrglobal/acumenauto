@@ -22,15 +22,44 @@
 {% if shared %}
   <div class="bg-amber-50 border border-amber-300 rounded-lg p-4 mb-6 text-sm text-amber-900">
     <p class="font-medium">
-      {{ shared|length }} entr{{ shared|length|pluralize:"y,ies" }} with no {{ spec.optional_columns.0 }} dropped rows of more than one client on the last run
+      {{ shared|length }} invoice number{{ shared|length|pluralize }} on your list {{ shared|length|pluralize:"is,are" }} on more than one client&rsquo;s lines, and all of those lines are left out of the file
     </p>
     <p class="mt-1">
-      An entry with no {{ spec.optional_columns.0 }} drops the rows of every client that carries that {{ spec.columns.0 }}.
-      If only one client was meant, add it again with that client&rsquo;s {{ spec.optional_columns.0 }}; the entry without one comes off the list by itself.
+      Click the client each one is meant for; the other clients&rsquo; lines go back into the file.
     </p>
-    <ul class="mt-2 space-y-1">
-      {% for e in shared %}
-        <li class="break-words"><span class="font-mono">{{ e.key_1 }}</span> &mdash; {{ e.last_clients }}</li>
+    <ul class="mt-3 space-y-3">
+      {% for e, clients in shared %}
+        <li>
+          <span class="font-mono font-medium">{{ e.key_1 }}</span>
+          <div class="mt-1 flex flex-wrap gap-2">
+            {% for number, name in clients %}
+              <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline">
+                {% csrf_token %}
+                <input type="hidden" name="client" value="{{ number }}">
+                <button type="submit"
+                        class="text-xs px-2 py-1 rounded border border-amber-400 bg-white hover:bg-amber-100">
+                  Only {{ number }} {{ name }}
+                </button>
+              </form>
+            {% endfor %}
+            <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline">
+              {% csrf_token %}
+              {% for number, name in clients %}<input type="hidden" name="client" value="{{ number }}">{% endfor %}
+              <button type="submit"
+                      class="text-xs px-2 py-1 rounded border border-amber-400 bg-white hover:bg-amber-100">
+                All of them, as now
+              </button>
+            </form>
+            <form method="post" action="{% url 'exception_remove' spec.slug e.pk %}" class="inline"
+                  onsubmit="return confirm('Remove {{ e.key_display|escapejs }}?');">
+              {% csrf_token %}
+              <button type="submit"
+                      class="text-xs px-2 py-1 rounded border border-red-200 bg-white text-red-700 hover:bg-red-50">
+                None: remove {{ e.key_1 }}
+              </button>
+            </form>
+          </div>
+        </li>
       {% endfor %}
     </ul>
   </div>
@@ -89,9 +118,6 @@
                   <td class="px-4 py-2 text-xs whitespace-nowrap">
                     {% if e.last_matched_at %}
                       <span class="text-slate-500">Dropped rows {{ e.last_matched_at|timezone:"America/New_York"|date:"Y-m-d H:i" }} NJ</span>
-                      {% if e.active and e.last_clients %}
-                        <div class="text-amber-700" title="{{ e.last_clients }}">of more than one client</div>
-                      {% endif %}
                     {% elif e.last_checked_at %}
                       <span class="text-amber-700">Checked, matched nothing</span>
                     {% else %}

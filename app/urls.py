@@ -41,6 +41,7 @@ urlpatterns = [
         views.exception_upload_confirm,
         name="exception_upload_confirm",
     ),
+    path("exceptions/<slug:report>/<int:pk>/narrow/", views.exception_narrow, name="exception_narrow"),
     path("exceptions/<slug:report>/<int:pk>/remove/", views.exception_remove, name="exception_remove"),
     path("exceptions/<slug:report>/<int:pk>/restore/", views.exception_restore, name="exception_restore"),
 ]

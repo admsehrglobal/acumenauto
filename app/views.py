@@ -11,6 +11,7 @@ from django.contrib import messages
 from django.core.paginator import Paginator
 from django.db import transaction
 from django.db.models import Q
+from django.db.models.functions import Lower
 from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -37,6 +38,7 @@ from app.models import (
     FileExceptionChange,
     Recipient,
     Run,
+    SharedKey,
 )
 from app.tasks import download_dci_reports, test_dci_login
 
@@ -464,23 +466,36 @@ def _exceptions_context(request, spec, key_form=None) -> dict:
         FileExceptionChange.objects.filter(report=report)
         .select_related("entry")[:25]
     )
-    # Entries with no client that dropped rows of more than one client on the
-    # last run. On a list of thousands a mark on the row sits on page 60, so
-    # they go at the top of the page.
-    shared = list(
-        FileException.objects.filter(report=report, removed_at__isnull=True)
-        .exclude(last_clients="")
-    )
     return {
         "spec": spec,
         "sections": list(REPORTS.values()),
         "page": page,
         "q": q,
         "recent": recent,
-        "shared": shared,
+        "shared": _shared_on_list(report),
         "key_form": key_form or FileExceptionKeyForm(spec),
         "upload_form": FileExceptionUploadForm(),
     }
+
+
+def _shared_on_list(report: str) -> list:
+    """(entry, [(client number, name), ...]) for each entry with no client whose
+    number the last run's file carries on more than one client's lines.
+
+    Read against the list as it is NOW, so a number Paul has just added shows up
+    at once, and one he has just narrowed is gone at once. On a list of
+    thousands a mark on the row would sit on page 60, so the page puts these on
+    top.
+    """
+    shared = {
+        s.key_1: s.client_list for s in SharedKey.objects.filter(report=report)
+    }
+    if not shared:
+        return []
+    entries = FileException.objects.filter(
+        report=report, key_2="", removed_at__isnull=True
+    ).annotate(folded=Lower("key_1")).filter(folded__in=list(shared))
+    return [(e, shared[e.folded]) for e in entries]
 
 
 @login_required
@@ -613,6 +628,42 @@ def exception_upload_confirm(request, report: str):
         f"{form.cleaned_data['filename']}: "
         f"{_upload_counts(spec, added + restored, already, parsed, narrowed)}",
     )
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_narrow(request, report: str, pk: int):
+    """One click from the notice: keep the entry for the client(s) chosen, which
+    takes the number on its own off the list (`_add_keys`), so the other
+    clients' lines go back into the file.
+
+    Only clients the last run found on that number are accepted: the buttons
+    offer nothing else, and a notice left open across a run may be out of date.
+    """
+    _report_spec(report)
+    entry = get_object_or_404(FileException, pk=pk, report=report, key_2="")
+    offered = dict(
+        next(
+            (c for e, c in _shared_on_list(report) if e.pk == entry.pk), []
+        )
+    )
+    chosen = [c for c in request.POST.getlist("client") if c in offered]
+    if not chosen:
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} is no longer on more than one "
+            "client's lines, or no longer on the list on its own.",
+        )
+        return redirect("exceptions_list", report=report)
+    _add_keys(report, [(entry.key_1, c) for c in chosen], request.user.username)
+    names = "; ".join(f"{c} {offered[c]}".strip() for c in chosen)
+    # No full stop after the names: they end in one ("Burke, M.").
+    back = (
+        " — the other clients' lines go back into the file."
+        if len(chosen) < len(offered) else ""
+    )
+    messages.success(request, f"{entry.key_1} now leaves out only {names}{back}")
     return redirect("exceptions_list", report=report)
 
 

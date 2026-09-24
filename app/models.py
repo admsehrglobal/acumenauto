@@ -162,11 +162,6 @@ class FileException(models.Model):
     # is checked and never matches is a typo, and until now nothing said so.
     last_checked_at = models.DateTimeField(null=True, blank=True)
     last_matched_at = models.DateTimeField(null=True, blank=True)
-    # Whose rows an entry with no client dropped on that same run, when it was
-    # more than one client: "NJ00006516 Burkert, H.; NJ00006730 Burke, M.".
-    # Empty otherwise. `db_default` so that the code before this column can
-    # still insert entries after a rollback (the lesson of 0015).
-    last_clients = models.TextField(blank=True, default="", db_default="")
 
     class Meta:
         constraints = [
@@ -225,6 +220,36 @@ class FileExceptionChange(models.Model):
 
     def __str__(self) -> str:
         return f"{self.entry.key_display} {self.action} {self.at:%Y-%m-%d %H:%M}"
+
+
+class SharedKey(models.Model):
+    """A number the last run's file carries on more than one client's lines.
+
+    Replaced whole by every run that writes that file (see
+    `app.file_exceptions.Owners`). The page reads it so that such a number, put
+    on the list with no client, is flagged the moment it is added, with one
+    button per client, instead of dropping another client's lines unseen.
+    `key_1` is stored folded, the way the run compares keys.
+    """
+
+    report = models.CharField(max_length=20)
+    key_1 = models.CharField(max_length=100)
+    # One "Client Number<TAB>Client Name" per line, as the export spells them.
+    clients = models.TextField()
+    seen_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["report", "key_1"]
+
+    def __str__(self) -> str:
+        return f"{self.report}: {self.key_1}"
+
+    @property
+    def client_list(self) -> list[tuple[str, str]]:
+        return [
+            tuple((line.split("\t", 1) + [""])[:2])
+            for line in self.clients.splitlines()
+        ]
 
 
 class PaSchedule(models.Model):

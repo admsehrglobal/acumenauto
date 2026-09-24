@@ -15,7 +15,7 @@ from django.utils.html import escape
 from openpyxl import Workbook
 
 from app.management.commands.download_report import _load_exceptions, _stamp_matches
-from app.models import FileException, FileExceptionChange
+from app.models import FileException, FileExceptionChange, SharedKey
 
 
 def _xlsx(rows) -> bytes:
@@ -379,56 +379,136 @@ class FileExceptionsPagesTests(TestCase):
         self.assertIsNone(specs["auths"])
         self.assertIsNone(specs["accruals"])
 
-    # --- entries with no client that drop more than one client's rows ---------
+    # --- invoice numbers on more than one client's lines ----------------------
 
-    NOTICE = "dropped rows of more than one client on the last run"
+    NOTICE = "on more than one client&rsquo;s lines, and all of those lines"
+    BURKE = ("NJ00006730", "Burke, M.")
+    BURKERT = ("NJ00006516", "Burkert, H.")
 
-    def _run_saw(self, owners):
-        """Stamp as a run that wrote the invoice file would, with `owners` as
-        what its merges saw: number -> [(client, name), ...]."""
+    def _run_saw(self, numbers):
+        """Stamp as a run that wrote the invoice file would, its rows carrying
+        each number under the (client, name) pairs given. Needs one entry on
+        the invoices list, or the run applies no list at all."""
         exceptions = _load_exceptions()
         spec = exceptions["invoices"]
-        spec.stats["invoices.xlsx"] = (
-            sum(len(o) for o in owners.values()),
-            {(number, "") for number in owners},
-        )
-        spec.owners["invoices.xlsx"] = {
-            (number, ""): {(c.lower(),): f"{c} {n}" for c, n in seen}
-            for number, seen in owners.items()
-        }
+        spec.stats["invoices.xlsx"] = (0, set())
+        for number, seen in numbers.items():
+            for client, name in seen:
+                owner = (client.lower(),)
+                spec.owners.labels.setdefault(owner, ((client,), name))
+                spec.owners.note((number.lower(),), owner)
         _stamp_matches(exceptions, timezone.now())
 
-    def test_a_number_on_two_clients_lines_is_flagged_at_the_top_of_the_page(self):
+    def _page(self):
+        return self.client.get(reverse("exceptions_list", args=["invoices"]))
+
+    def _narrow(self, entry, *clients):
+        return self.client.post(
+            reverse("exception_narrow", args=["invoices", entry.pk]),
+            {"client": list(clients)},
+            follow=True,
+        )
+
+    def test_a_listed_number_on_two_clients_lines_is_on_top_with_a_button_each(self):
         self._add("invoices", key_1="119344")
         self._add("invoices", key_1="500")
         self._run_saw({
-            "119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")],
+            "119344": [self.BURKE, self.BURKERT],
             "500": [("NJ00001544", "Moore, A.")],
         })
 
+        response = self._page()
+        self.assertContains(response, "1 invoice number on your list is " + self.NOTICE)
+        self.assertContains(response, "Only NJ00006730 Burke, M.")
+        self.assertContains(response, "Only NJ00006516 Burkert, H.")
         self.assertEqual(
-            FileException.objects.get(key_1="119344").last_clients,
-            "NJ00006516 Burkert, H.; NJ00006730 Burke, M.",
+            list(SharedKey.objects.values_list("key_1", flat=True)), ["119344"]
         )
-        self.assertEqual(FileException.objects.get(key_1="500").last_clients, "")
-        response = self.client.get(reverse("exceptions_list", args=["invoices"]))
-        self.assertContains(response, "1 entry with no Client Number " + self.NOTICE)
-        self.assertContains(response, escape("NJ00006516 Burkert, H.; NJ00006730 Burke, M."))
 
-    def test_the_flag_goes_once_a_run_sees_one_client(self):
+    def test_the_notice_is_there_the_moment_the_number_is_added(self):
+        """No run in between: Paul sees it while he is still on the page."""
+        self._add("invoices", key_1="500")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        self.assertNotContains(self._page(), self.NOTICE)
+
+        response = self._add("invoices", key_1="119344")
+        self.assertContains(response, self.NOTICE)
+        self.assertContains(response, "Only NJ00006730 Burke, M.")
+
+    def test_an_entry_that_names_its_client_is_not_flagged(self):
+        self._add("invoices", key_1="119344", key_2="NJ00006730")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        self.assertNotContains(self._page(), self.NOTICE)
+
+    def test_one_click_keeps_that_client_and_takes_the_number_off(self):
         self._add("invoices", key_1="119344")
-        self._run_saw({"119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")]})
-        self._run_saw({"119344": [("NJ00006730", "Burke, M.")]})
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        wildcard = FileException.objects.get(key_1="119344", key_2="")
 
-        self.assertEqual(FileException.objects.get(key_1="119344").last_clients, "")
-        response = self.client.get(reverse("exceptions_list", args=["invoices"]))
+        response = self._narrow(wildcard, "NJ00006730")
+
+        self.assertContains(
+            response,
+            "119344 now leaves out only NJ00006730 Burke, M. — the other "
+            "clients&#x27; lines go back into the file.",
+        )
         self.assertNotContains(response, self.NOTICE)
+        wildcard.refresh_from_db()
+        self.assertFalse(wildcard.active)
+        self.assertEqual(wildcard.removed_by, "paul")
+        narrowed = FileException.objects.get(key_1="119344", key_2="NJ00006730")
+        self.assertTrue(narrowed.active)
+        self.assertEqual(narrowed.created_by, "paul")
+        self.assertEqual(
+            sorted(FileExceptionChange.objects.values_list("entry__key_2", "action")),
+            [("", "added"), ("", "removed"), ("NJ00006730", "added")],
+        )
 
-    def test_typing_the_client_in_takes_the_number_off_the_notice(self):
-        """What the notice tells Paul to do has to be enough to clear it,
-        without waiting for the next run."""
+    def test_all_of_them_keeps_every_client_by_name(self):
         self._add("invoices", key_1="119344")
-        self._run_saw({"119344": [("NJ00006730", "Burke, M."), ("NJ00006516", "Burkert, H.")]})
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        wildcard = FileException.objects.get(key_1="119344", key_2="")
 
-        response = self._add("invoices", key_1="119344", key_2="NJ00006730")
+        response = self._narrow(wildcard, "NJ00006730", "NJ00006516")
+
+        self.assertNotContains(response, "go back into the file")
         self.assertNotContains(response, self.NOTICE)
+        self.assertEqual(
+            sorted(
+                FileException.objects.filter(removed_at__isnull=True)
+                .values_list("key_1", "key_2")
+            ),
+            [("119344", "NJ00006516"), ("119344", "NJ00006730")],
+        )
+
+    def test_a_client_the_run_did_not_see_changes_nothing(self):
+        """The buttons offer only what the last run found; a stale page or a
+        hand-made request must not put anything else on the list."""
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        wildcard = FileException.objects.get(key_1="119344", key_2="")
+
+        response = self._narrow(wildcard, "NJ99999999")
+
+        self.assertContains(response, "Nothing changed")
+        self.assertEqual(FileException.objects.count(), 1)
+        wildcard.refresh_from_db()
+        self.assertTrue(wildcard.active)
+
+    def test_the_next_run_replaces_what_the_last_one_saw(self):
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        self._run_saw({"119344": [self.BURKE]})
+
+        self.assertFalse(SharedKey.objects.exists())
+        self.assertNotContains(self._page(), self.NOTICE)
+
+    def test_a_run_that_did_not_write_the_invoice_file_leaves_it_alone(self):
+        """The accruals run opens no invoice file, so it knows nothing new."""
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+
+        _stamp_matches(_load_exceptions(), timezone.now())
+
+        self.assertEqual(SharedKey.objects.count(), 1)
+        self.assertContains(self._page(), self.NOTICE)

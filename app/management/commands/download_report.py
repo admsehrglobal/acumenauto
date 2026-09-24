@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import xlsxwriter
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 from django.utils import timezone
 
 from app.accrual_rebuild import (
@@ -49,7 +50,14 @@ from app.file_exceptions import (
     make_drop_spec,
     summarize,
 )
-from app.models import AppConfig, FileException, PaSchedule, Recipient, Run
+from app.models import (
+    AppConfig,
+    FileException,
+    PaSchedule,
+    Recipient,
+    Run,
+    SharedKey,
+)
 from app.invoice_split import PILE_PAYABLE, subject_override_for
 from app.scraper import (
     ChunkedReport,
@@ -317,23 +325,31 @@ def _stamp_matches(exceptions: dict[str, DropSpec | None], when) -> None:
         # `matched` holds keys at the report's width, so a one-part key is a
         # 1-tuple there and has to be built the same way from the entry.
         width = len(spec.columns)
-        shared = spec.shared()
         entries = FileException.objects.filter(report=slug, removed_at__isnull=True)
-        hit, clients = [], {}
-        for e in entries:
-            key = fold_key((e.key_1, e.key_2)[:width])
-            if key in matched:
-                hit.append(e.pk)
-            if key in shared:
-                clients[e.pk] = "; ".join(shared[key])
+        hit = [
+            e.pk for e in entries
+            if fold_key((e.key_1, e.key_2)[:width]) in matched
+        ]
         entries.update(last_checked_at=when)
         FileException.objects.filter(pk__in=hit).update(last_matched_at=when)
-        # Rewritten every run, so an entry stops being flagged as soon as its
-        # file no longer gives it a second client. A handful per run, one
-        # update each.
-        entries.exclude(last_clients="").update(last_clients="")
-        for pk, text in clients.items():
-            FileException.objects.filter(pk=pk).update(last_clients=text)
+        if spec.owners is not None:
+            _replace_shared(slug, spec.shared(), when)
+
+
+def _replace_shared(slug: str, shared: dict, when) -> None:
+    """Swap in what this run's file says about numbers on several clients'
+    lines. Whole, so a number drops off as soon as the file stops sharing it."""
+    with transaction.atomic():
+        SharedKey.objects.filter(report=slug).delete()
+        SharedKey.objects.bulk_create([
+            SharedKey(
+                report=slug,
+                key_1=head[0],
+                clients="\n".join(f"{shown[0]}\t{name}" for shown, name in owners),
+                seen_at=when,
+            )
+            for head, owners in shared.items()
+        ])
 
 
 def _stamp_matches_safely(exceptions: dict[str, DropSpec | None]) -> None:

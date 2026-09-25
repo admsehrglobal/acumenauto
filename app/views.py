@@ -1,14 +1,18 @@
-"""Dashboard views: lista de Runs, detalle, settings, run-now.
+"""Dashboard views: lista de Runs, detalle, settings, run-now, File Exceptions.
 
 HTMX se usa solo en run-now para no recargar la pagina entera.
 """
 from datetime import timedelta
 
+import python_calamine
 from django.conf import settings
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib import messages
 from django.core.paginator import Paginator
-from django.http import HttpResponse
+from django.db import transaction
+from django.db.models import Q
+from django.db.models.functions import Lower
+from django.http import Http404, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
@@ -16,15 +20,26 @@ from django_celery_beat.models import PeriodicTask
 
 from app import crypto
 from app.email_utils import send_error_report
+from app.file_exceptions import MAX_KEY_LENGTH, REPORTS, fold_key, parse_upload
 from app.forms import (
     DailyReportsConfigForm,
     DCICredentialsForm,
+    FileExceptionConfirmForm,
+    FileExceptionKeyForm,
+    FileExceptionUploadForm,
     RecipientForm,
     ScheduleForm,
     WeeklyReportConfigForm,
     WeeklyScheduleForm,
 )
-from app.models import AppConfig, Recipient, Run
+from app.models import (
+    AppConfig,
+    FileException,
+    FileExceptionChange,
+    Recipient,
+    Run,
+    SharedKey,
+)
 from app.tasks import download_dci_reports, test_dci_login
 
 DAILY_TASK_NAME = "download-dci-reports-daily"
@@ -249,3 +264,440 @@ def dci_test_status(request):
     return render(
         request, "_dci_test_status.html", {"config": config, "polling": polling}
     )
+
+
+# --- File Exceptions (Paul, 2026-08-31 / 2026-09-02) -------------------------
+# One page per file: upload an Excel list, add or remove one entry at a time.
+# The run reads the active entries and drops those rows before emailing.
+
+
+def _report_spec(report: str):
+    spec = REPORTS.get(report)
+    if spec is None:
+        raise Http404("Unknown file")
+    return spec
+
+
+def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
+    """Create the keys that are new, restore the ones removed earlier.
+
+    Returns (added, restored, already listed, narrowed). Keys arrive normalised
+    from the form or the upload parser, so they compare with what is stored.
+    They are matched folded (`fold_key`), the same way the run matches them
+    against the export, so `AB12` after `ab12` is "already listed" and not a
+    second entry that would look live and drop nothing.
+    """
+    now = timezone.now()
+    stored = {
+        fold_key((e.key_1, e.key_2)): e
+        for e in FileException.objects.filter(report=report)
+    }
+    existing = dict(stored)
+    to_create: list[FileException] = []
+    to_restore: list[FileException] = []
+    to_narrow: list[FileException] = []
+    already = 0
+    spoken_for = _bare_keys(keys)
+    for key in keys:
+        parts = (key[0], key[1] if len(key) > 1 else "")
+        folded = fold_key(parts)
+        entry = existing.get(folded)
+        if entry is None:
+            entry = FileException(
+                report=report, key_1=parts[0], key_2=parts[1],
+                created_at=now, created_by=actor,
+            )
+            existing[folded] = entry
+            to_create.append(entry)
+        elif entry.active:
+            already += 1
+        else:
+            # `created_at` keeps the day the key first went on the list. It used
+            # to be overwritten here, which is exactly what erased the removal
+            # in between; the log below is what carries "added again".
+            entry.removed_at = None
+            entry.removed_by = ""
+            to_restore.append(entry)
+        # An entry naming a client is dead weight while the bare key is also
+        # listed: `RowFilter.drops` tries the key with its optional parts
+        # blanked, so the wildcard drops the row whoever the client is, and the
+        # narrower entry changes nothing at all. Reading the upload as written
+        # means taking the wildcard off the list. Two things are left alone: a
+        # wildcard this same upload asks for, because a row with no client says
+        # "every client" in so many words and an upload does not get to argue
+        # with itself, and anything not already stored, which has no history to
+        # replace.
+        bare = fold_key((parts[0], ""))
+        if parts[1] and bare not in spoken_for:
+            wildcard = stored.get(bare)
+            if wildcard is not None and wildcard.active:
+                wildcard.removed_at = now
+                wildcard.removed_by = actor
+                to_narrow.append(wildcard)
+    # One transaction: the entries and their rows in the record of changes go in
+    # together or not at all. Without it a failure between the two leaves keys
+    # live —dropping rows from tomorrow's file— with nothing in the record
+    # saying they were added, and `exception_upload_confirm` tells the operator
+    # the upload failed while the list has in fact changed.
+    with transaction.atomic():
+        FileException.objects.bulk_create(to_create, batch_size=500)
+        if to_restore or to_narrow:
+            FileException.objects.bulk_update(
+                to_restore + to_narrow, ["removed_at", "removed_by"],
+                batch_size=500,
+            )
+        _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
+        _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
+        _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
+    return len(to_create), len(to_restore), already, len(to_narrow)
+
+
+def _log_changes(entries, action: str, actor: str, at) -> None:
+    """Append one row per entry to the record of changes (never updates)."""
+    if not entries:
+        return
+    FileExceptionChange.objects.bulk_create(
+        [
+            FileExceptionChange(
+                entry=e, report=e.report, action=action, at=at, by=actor
+            )
+            for e in entries
+        ],
+        batch_size=500,
+    )
+
+
+def _show_key(key) -> str:
+    """A key as Paul reads it: an empty optional part is not shown at all,
+    so a wildcard invoice entry stays the bare number it was typed as."""
+    return " / ".join(part for part in key if part)
+
+
+def _bare_keys(keys) -> set:
+    """The folded keys the batch asks for with no optional part filled in."""
+    return {
+        fold_key((key[0], ""))
+        for key in keys
+        if len(key) < 2 or not key[1]
+    }
+
+
+def _count_narrowing(report: str, spec, keys) -> int:
+    """How many listed wildcards this upload would take off the list.
+
+    Same rule as `_add_keys`, asked before anything is written so the preview
+    can say it. Counted per wildcard, not per key: two rows naming two clients
+    for one number retire that number once.
+    """
+    if spec.required >= len(spec.columns):
+        return 0
+    wanted = {
+        fold_key((key[0], "")) for key in keys if len(key) > 1 and key[1]
+    } - _bare_keys(keys)
+    if not wanted:
+        return 0
+    return sum(
+        1
+        for entry in FileException.objects.filter(
+            report=report, key_2="", removed_at__isnull=True
+        )
+        if fold_key((entry.key_1, "")) in wanted
+    )
+
+
+def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) -> str:
+    """The numbers of one upload, each under its own name.
+
+    They used to share two labels: the repeats inside Paul's own file were
+    added to the entries already on the list, so uploading the accruals export
+    against an EMPTY list read "7568 added, 262805 already listed" - none of
+    those 262,805 were on any list. Zero counts are left out rather than
+    printed, so the usual upload reads as one short sentence.
+    """
+    parts = [f"{added:,} added"]
+    if already:
+        parts.append(f"{already:,} already on your list")
+    if narrowed:
+        entries = "entry" if narrowed == 1 else "entries"
+        parts.append(
+            f"{narrowed:,} {entries} narrowed to the "
+            f"{spec.columns[spec.required]} in the file"
+        )
+    if parsed.duplicates:
+        parts.append(f"{parsed.duplicates:,} repeated in the file")
+    if parsed.blank:
+        rows = "row" if parsed.blank == 1 else "rows"
+        parts.append(
+            f"{parsed.blank:,} {rows} skipped for a missing "
+            + " or ".join(spec.columns[: spec.required])
+        )
+    if parsed.too_long:
+        rows = "row" if parsed.too_long == 1 else "rows"
+        parts.append(
+            f"{parsed.too_long:,} {rows} skipped for a value longer than "
+            f"{MAX_KEY_LENGTH} characters"
+        )
+    return ", ".join(parts) + "."
+
+
+@login_required
+def exceptions_home(request):
+    return redirect("exceptions_list", report="invoices")
+
+
+def _exceptions_context(request, spec, key_form=None) -> dict:
+    """Everything the page needs. Taken out of the list view so that a rejected
+    Add can render the page again with the values Paul typed still in it."""
+    report = spec.slug
+    q = request.GET.get("q", "").strip()
+    entries = FileException.objects.filter(report=report)
+    if q:
+        # A search reaches removed entries too. Remove is the only undo there
+        # is, and a removal drops off the capped list of recent changes as soon
+        # as 25 more changes happen, so search has to be able to find it.
+        entries = entries.filter(Q(key_1__icontains=q) | Q(key_2__icontains=q))
+    else:
+        entries = entries.filter(removed_at__isnull=True)
+    page = Paginator(entries, 50).get_page(request.GET.get("page"))
+    # The record of changes, latest first: one row per change, not per entry, so
+    # a key that was removed and added again shows both. `select_related` keeps
+    # this to one query for the 25 rows.
+    recent = (
+        FileExceptionChange.objects.filter(report=report)
+        .select_related("entry")[:25]
+    )
+    return {
+        "spec": spec,
+        "sections": list(REPORTS.values()),
+        "page": page,
+        "q": q,
+        "recent": recent,
+        "shared": _shared_on_list(report),
+        "key_form": key_form or FileExceptionKeyForm(spec),
+        "upload_form": FileExceptionUploadForm(),
+    }
+
+
+def _shared_on_list(report: str) -> list:
+    """(entry, [(client number, name), ...]) for each entry with no client whose
+    number the last run's file carries on more than one client's lines.
+
+    Read against the list as it is NOW, so a number Paul has just added shows up
+    at once, and one he has just narrowed is gone at once. On a list of
+    thousands a mark on the row would sit on page 60, so the page puts these on
+    top.
+    """
+    shared = {
+        s.key_1: s.client_list for s in SharedKey.objects.filter(report=report)
+    }
+    if not shared:
+        return []
+    entries = FileException.objects.filter(
+        report=report, key_2="", removed_at__isnull=True
+    ).annotate(folded=Lower("key_1")).filter(folded__in=list(shared))
+    return [(e, shared[e.folded]) for e in entries]
+
+
+@login_required
+def exceptions_list(request, report: str):
+    spec = _report_spec(report)
+    return render(request, "exceptions.html", _exceptions_context(request, spec))
+
+
+@login_required
+@require_POST
+def exception_add(request, report: str):
+    spec = _report_spec(report)
+    form = FileExceptionKeyForm(spec, request.POST)
+    if not form.is_valid():
+        # Render, do not redirect: a redirect throws away what he typed, so
+        # forgetting one of the two fields cleared both of them.
+        return render(
+            request, "exceptions.html", _exceptions_context(request, spec, form)
+        )
+    added, restored, already, narrowed = _add_keys(
+        report, [form.cleaned_key], request.user.username
+    )
+    shown = _show_key(form.cleaned_key)
+    if already:
+        messages.info(request, f"{shown} is already listed.")
+    elif narrowed:
+        messages.success(
+            request,
+            f"{shown} added, and {form.cleaned_key[0]} on its own was removed: "
+            f"it covered every {spec.columns[spec.required]}.",
+        )
+    else:
+        messages.success(request, f"{shown} added.")
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_upload(request, report: str):
+    spec = _report_spec(report)
+    form = FileExceptionUploadForm(request.POST, request.FILES)
+    if not form.is_valid():
+        first_error = next(iter(form.errors.values()))[0]
+        messages.error(request, first_error)
+        return redirect("exceptions_list", report=report)
+    upload = form.cleaned_data["file"]
+    try:
+        rows = (
+            python_calamine.CalamineWorkbook.from_filelike(upload)
+            .get_sheet_by_index(0)
+            .to_python(skip_empty_area=True)
+        )
+        parsed = parse_upload(rows, spec)
+    except Exception as exc:  # noqa: BLE001 - calamine raises its own family; the text is the message
+        messages.error(request, f"Could not read {upload.name}: {exc}")
+        return redirect("exceptions_list", report=report)
+    if not parsed.keys:
+        messages.error(
+            request,
+            f"{upload.name}: nothing to add. "
+            f"{_upload_counts(spec, 0, 0, parsed)}",
+        )
+        return redirect("exceptions_list", report=report)
+    # Nothing is written yet. Uploading the report itself instead of a list of
+    # exceptions reads fine and stores tens of thousands of keys, and the file
+    # that goes out next comes back with only its header. The way that becomes
+    # visible is the count on the button, so the write waits for a second click.
+    return render(
+        request,
+        "exceptions_preview.html",
+        {
+            "spec": spec,
+            "sections": list(REPORTS.values()),
+            "filename": upload.name,
+            "rows_read": f"{len(rows):,}",
+            "key_count": f"{len(parsed.keys):,}",
+            "parsed": parsed,
+            "first_key": _show_key(parsed.keys[0]),
+            "last_key": _show_key(parsed.keys[-1]),
+            # Confirming takes entries OFF the list as well as putting them on,
+            # and a removal is the half worth seeing first: those rows start
+            # coming through again in tomorrow's file.
+            "narrowing": _count_narrowing(report, spec, parsed.keys),
+            "narrowed_by": spec.columns[spec.required]
+            if spec.required < len(spec.columns)
+            else "",
+            # What the sheet actually gave, not what the report can take: the
+            # optional column is only named here when some row filled it in.
+            "read_columns": [
+                column
+                for i, column in enumerate(spec.columns)
+                if i < spec.required or any(key[i] for key in parsed.keys)
+            ],
+            "confirm_form": FileExceptionConfirmForm(
+                spec,
+                initial={
+                    "filename": upload.name,
+                    "keys": FileExceptionConfirmForm.pack(parsed.keys),
+                    "blank": parsed.blank,
+                    "duplicates": parsed.duplicates,
+                    "too_long": parsed.too_long,
+                },
+            ),
+        },
+    )
+
+
+@login_required
+@require_POST
+def exception_upload_confirm(request, report: str):
+    spec = _report_spec(report)
+    form = FileExceptionConfirmForm(spec, request.POST)
+    if not form.is_valid():
+        messages.error(request, "That upload could not be confirmed. Please try again.")
+        return redirect("exceptions_list", report=report)
+    parsed = form.parsed()
+    try:
+        added, restored, already, narrowed = _add_keys(
+            report, parsed.keys, request.user.username
+        )
+    except Exception as exc:  # noqa: BLE001 - a database error is not a read error
+        messages.error(
+            request,
+            f"Could not save the entries from {form.cleaned_data['filename']}: {exc}",
+        )
+        return redirect("exceptions_list", report=report)
+    report_message = messages.success if added + restored else messages.info
+    report_message(
+        request,
+        f"{form.cleaned_data['filename']}: "
+        f"{_upload_counts(spec, added + restored, already, parsed, narrowed)}",
+    )
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_narrow(request, report: str, pk: int):
+    """One click from the notice: keep the entry for the client(s) chosen, which
+    takes the number on its own off the list (`_add_keys`), so the other
+    clients' lines go back into the file.
+
+    Only clients the last run found on that number are accepted: the buttons
+    offer nothing else, and a notice left open across a run may be out of date.
+    """
+    _report_spec(report)
+    entry = get_object_or_404(FileException, pk=pk, report=report, key_2="")
+    offered = dict(
+        next(
+            (c for e, c in _shared_on_list(report) if e.pk == entry.pk), []
+        )
+    )
+    chosen = [c for c in request.POST.getlist("client") if c in offered]
+    if not chosen:
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} is no longer on more than one "
+            "client's lines, or no longer on the list on its own.",
+        )
+        return redirect("exceptions_list", report=report)
+    _add_keys(report, [(entry.key_1, c) for c in chosen], request.user.username)
+    names = "; ".join(f"{c} {offered[c]}".strip() for c in chosen)
+    # No full stop after the names: they end in one ("Burke, M.").
+    back = (
+        " — the other clients' lines go back into the file."
+        if len(chosen) < len(offered) else ""
+    )
+    messages.success(request, f"{entry.key_1} now leaves out only {names}{back}")
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_remove(request, report: str, pk: int):
+    _report_spec(report)
+    entry = get_object_or_404(FileException, pk=pk, report=report)
+    if entry.active:
+        now = timezone.now()
+        with transaction.atomic():
+            entry.removed_at = now
+            entry.removed_by = request.user.username
+            entry.save(update_fields=["removed_at", "removed_by"])
+            _log_changes([entry], FileExceptionChange.REMOVED,
+                         request.user.username, now)
+        messages.success(request, f"{entry.key_display} removed.")
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_restore(request, report: str, pk: int):
+    _report_spec(report)
+    entry = get_object_or_404(FileException, pk=pk, report=report)
+    if not entry.active:
+        # `created_at` is left alone: it is when the key first went on the list,
+        # and overwriting it here is what used to erase the removal being undone.
+        with transaction.atomic():
+            entry.removed_at = None
+            entry.removed_by = ""
+            entry.save(update_fields=["removed_at", "removed_by"])
+            _log_changes([entry], FileExceptionChange.RESTORED,
+                         request.user.username, timezone.now())
+        messages.success(request, f"{entry.key_display} restored.")
+    return redirect("exceptions_list", report=report)
+

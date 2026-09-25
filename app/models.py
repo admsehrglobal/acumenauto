@@ -1,4 +1,7 @@
 from django.db import models
+from django.utils import timezone
+
+from app.file_exceptions import REPORTS
 
 
 class Recipient(models.Model):
@@ -28,6 +31,10 @@ class Run(models.Model):
     filenames = models.TextField(blank=True, default="")
     error_message = models.TextField(blank=True)
     attempt_number = models.PositiveIntegerField(default=1)
+    # What the File Exceptions lists removed from the emailed files, e.g.
+    # "Invoices: 12 rows dropped (3 of 40 keys matched)". Empty when no list
+    # applied to the files of this run.
+    exceptions_summary = models.TextField(blank=True, default="", db_default="")
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"
@@ -121,6 +128,128 @@ class AppConfig(models.Model):
     def save(self, *args, **kwargs) -> None:
         self.pk = 1  # enforce singleton
         super().save(*args, **kwargs)
+
+
+class FileException(models.Model):
+    """One key the run drops from an emailed file (Paul, 2026-08-31 / 09-02).
+
+    `report` says which file; `key_1`/`key_2` hold the key parts in the order of
+    `app.file_exceptions.REPORTS[report].columns`. A part the report does not
+    require is stored empty: an invoice entry with no `Client Number` drops
+    every row carrying the number, which is what every entry made before
+    2026-09-21 does.
+    Keys are stored already normalised, so the unique constraint and the match
+    at run time agree on what "the same key" is.
+
+    A removed entry is not deleted: it keeps its row with `removed_at`/
+    `removed_by` set. That is the record of changes Rob asked for, and it is
+    what lets a removal be undone ("Restore"). Adding a key that was removed
+    earlier restores that row.
+    """
+
+    report = models.CharField(
+        max_length=20, choices=[(s.slug, s.label) for s in REPORTS.values()]
+    )
+    key_1 = models.CharField(max_length=100)
+    key_2 = models.CharField(max_length=100, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    created_by = models.CharField(max_length=150, blank=True, default="")
+    removed_at = models.DateTimeField(null=True, blank=True)
+    removed_by = models.CharField(max_length=150, blank=True, default="")
+    # What the last run that read this file did with this entry. Both are
+    # needed: without `last_checked_at` there is no telling "matched nothing"
+    # apart from "no run has opened that file since you added it". A key that
+    # is checked and never matches is a typo, and until now nothing said so.
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+    last_matched_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "key_1", "key_2"], name="uniq_file_exception_key"
+            )
+        ]
+        ordering = ["key_1", "key_2"]
+
+    def __str__(self) -> str:
+        return f"{self.report}: {self.key_display}"
+
+    @property
+    def active(self) -> bool:
+        return self.removed_at is None
+
+    @property
+    def key_display(self) -> str:
+        return f"{self.key_1} / {self.key_2}" if self.key_2 else self.key_1
+
+
+class FileExceptionChange(models.Model):
+    """One row per change to an entry. Never updated, never deleted.
+
+    Ev promised Rob in writing on 2026-08-31: "keep a record of those changes so
+    they can be reverted if needed". The entry itself could not be that record.
+    It carried a single `created_at`/`removed_at` pair, so any key touched twice
+    lost its history: add a key, remove it, add it again, and the removal was
+    overwritten — the page then showed the key as freshly added, with nothing
+    saying it had ever been taken off the list.
+
+    Append-only is the point. The entry still says what is true NOW (`active`,
+    who removed it, what the last run did with it); this says what happened, in
+    order. `report` is denormalised so the page reads one report's history
+    without a join.
+    """
+
+    ADDED = "added"
+    REMOVED = "removed"
+    RESTORED = "restored"
+    ACTIONS = [(ADDED, "Added"), (REMOVED, "Removed"), (RESTORED, "Restored")]
+
+    entry = models.ForeignKey(
+        FileException, on_delete=models.CASCADE, related_name="changes"
+    )
+    report = models.CharField(max_length=20)
+    action = models.CharField(max_length=10, choices=ACTIONS)
+    at = models.DateTimeField(default=timezone.now)
+    by = models.CharField(max_length=150, blank=True, default="")
+
+    class Meta:
+        # Newest first: the page shows the last 25 changes, so flipping this
+        # would freeze that panel on the first 25 changes ever made.
+        ordering = ["-at", "-id"]
+        indexes = [models.Index(fields=["report", "-at"])]
+
+    def __str__(self) -> str:
+        return f"{self.entry.key_display} {self.action} {self.at:%Y-%m-%d %H:%M}"
+
+
+class SharedKey(models.Model):
+    """A number the last run's file carries on more than one client's lines.
+
+    Replaced whole by every run that writes that file (see
+    `app.file_exceptions.Owners`). The page reads it so that such a number, put
+    on the list with no client, is flagged the moment it is added, with one
+    button per client, instead of dropping another client's lines unseen.
+    `key_1` is stored folded, the way the run compares keys.
+    """
+
+    report = models.CharField(max_length=20)
+    key_1 = models.CharField(max_length=100)
+    # One "Client Number<TAB>Client Name" per line, as the export spells them.
+    clients = models.TextField()
+    seen_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ["report", "key_1"]
+
+    def __str__(self) -> str:
+        return f"{self.report}: {self.key_1}"
+
+    @property
+    def client_list(self) -> list[tuple[str, str]]:
+        return [
+            tuple((line.split("\t", 1) + [""])[:2])
+            for line in self.clients.splitlines()
+        ]
 
 
 class PaSchedule(models.Model):

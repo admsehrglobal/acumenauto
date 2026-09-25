@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import os
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -27,11 +28,13 @@ import python_calamine
 import xlsxwriter
 from playwright.async_api import (
     BrowserContext,
+    Error as PlaywrightError,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
+from app.file_exceptions import DropSpec, RowFilter
 from app.invoice_split import (
     PILE_PAYABLE,
     PILE_REJECTED,
@@ -97,6 +100,18 @@ class ChunkedReport(NamedTuple):
     full_range: bool
     reset_slicers: tuple[str, ...] = ()
     invoice_split: bool = False
+    # The report's File Exceptions list (see app.file_exceptions), applied while
+    # the merged file is written. None = nothing to drop, every line runs as
+    # before the feature existed.
+    exceptions: DropSpec | None = None
+    # Otros tabs del MISMO reporte cuyas filas van al mismo archivo. Existe
+    # porque el 2026-09-03 el portal partio las filas del invoice file en dos
+    # pestañas: 'Vendor Entry Status' se quedo con todo menos los pagados
+    # (lleva un filtro fijo `Status is not Paid`) y los pagados se fueron a
+    # 'Paid Invoices'. Sin esto el archivo sale con el 8% de las filas que
+    # llevaba antes. Cada tab tiene su propio extent de fechas y su propio
+    # juego de columnas; los headers se normalizan antes de unir.
+    extra_tabs: tuple[str, ...] = ()
     # Columnas que el export TIENE que traer. No es el esquema completo a
     # proposito: el esquema deriva solo (R1 paso de 13 a 14 columnas en agosto)
     # y fijarlo entero seria una falla por mes. Van las que identifican al tab
@@ -107,8 +122,10 @@ class ChunkedReport(NamedTuple):
     required_columns: tuple[str, ...] = ()
 
 
-# R1 goes out as two files: the rejections first, the payable entries 20 minutes
-# later, so an invoice resubmitted to Acumen lands in ZipRide with the right final
+# R1 goes out as two files: the rejections first, the payable entries after the
+# gap set in `download_report.INVOICE_PILE_GAP_S` (the number is only written
+# down there, so the two cannot drift apart again), so an invoice resubmitted to
+# Acumen lands in ZipRide with the right final
 # status (Paul, 2026-08-25). `PILE_REJECTED` / `PILE_PAYABLE` travel in the display
 # name and are what the caller matches on to pick the subject and to hold the
 # payable pile back; they live in `invoice_split` with the rest of that contract.
@@ -126,6 +143,12 @@ async def download_reports(
     assemble_matrix=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
+
+    A simple report's File Exceptions list is applied by the caller inside
+    `on_report_ready`, not here: this loop runs BEFORE the chunked one, so a
+    failure while filtering used to abort the run before the invoice file had
+    even been downloaded. Chunked reports carry theirs in
+    `ChunkedReport.exceptions`, which is applied while their file is written.
 
     `reports` es la lista de reportes simples como (report_url, button_name).
     `chunked_reports` son los reportes que se descargan en N chunks por rango
@@ -171,6 +194,7 @@ async def download_reports(
             page = await context.new_page()
             await _login(page, username, password)
             report_page = await _open_reports_popup(page, username, password)
+            _trace_navigations(report_page)
 
             async def _ready(item: tuple[Path, str]) -> None:
                 # Corre en thread: el callback hace I/O bloqueante (email Brevo).
@@ -203,7 +227,9 @@ async def download_reports(
                     full_range=spec.full_range,
                     reset_slicers=spec.reset_slicers,
                     invoice_split=spec.invoice_split,
+                    exceptions=spec.exceptions,
                     required_columns=spec.required_columns,
+                    extra_tabs=spec.extra_tabs,
                 )
                 results.extend(chunked_items)
                 for item in chunked_items:
@@ -340,6 +366,35 @@ async def test_login(username: str, password: str) -> None:
             await browser.close()
 
 
+def _trace_navigations(page: Page) -> None:
+    """Loguea el ciclo de vida de cada navegacion de documento del tab de reportes.
+
+    El unico dato que falta para cerrar el diagnostico del click bloqueado: un
+    `[NAV] req .../report/<uuid>` sin su `[NAV] commit` ni su `[NAV] failed` es
+    el portal dejando un document request colgado, que es lo que traba los
+    pre-checks de `Locator.click`. Ver `_open_report_iframe`.
+
+    Solo loguea, no espera nada y no puede fallar la corrida: son handlers
+    sincronicos sobre datos que Playwright ya tiene en memoria.
+    """
+
+    def _req(request) -> None:
+        if request.is_navigation_request():
+            logger.warning("[NAV] req %s", request.url)
+
+    def _failed(request) -> None:
+        if request.is_navigation_request():
+            logger.warning("[NAV] failed %s (%s)", request.url, request.failure)
+
+    def _committed(frame) -> None:
+        if frame == page.main_frame:
+            logger.warning("[NAV] commit %s", frame.url)
+
+    page.on("request", _req)
+    page.on("requestfailed", _failed)
+    page.on("framenavigated", _committed)
+
+
 async def _open_report_iframe(
     page: Page,
     button_name: str,
@@ -349,45 +404,124 @@ async def _open_report_iframe(
 ):
     """Click el boton del reporte y devuelve el content_frame del iframe de PBI.
 
-    Power BI a veces no inserta el iframe 'Embedded report' en el DOM (timeout
-    intermitente — ~1/3 de las corridas del cron fallaban asi, jun 2026). Subir
-    el timeout solo hace el fallo mas lento; en cambio reintentamos: recargamos
-    la pagina y re-clickeamos el boton hasta `attempts` veces. El segundo intento
-    casi siempre monta el iframe.
+    Dos fallas intermitentes distintas viven en esta funcion, y durante seis
+    semanas se confundieron porque el log decia lo mismo para las dos:
+
+    1. **PBI no inserta el iframe 'Embedded report'** (~1/3 de las corridas del
+       cron, jun 2026). Subir el timeout solo hace el fallo mas lento; en cambio
+       reintentamos hasta `attempts` veces y el segundo intento casi siempre lo
+       monta.
+    2. **El click al boton se queda esperando una navegacion que no termina**
+       (~1 de cada 8 corridas desde ago 2026; mato la entrega del accrual el
+       2026-09-11). `Locator.click` corre los pre-checks de accion ANTES de
+       resolver el selector, y si el frame principal tiene un document request
+       pendiente se bloquea ahi: el click nunca se despacha. El log de
+       Playwright lo dice con `waiting for "<url>" navigation to finish` y sin
+       ninguna linea `locator resolved to`.
+
+    Por eso la recuperacion es un `goto` al `group_url` y no un `reload`: el
+    reload re-pide lo que commiteo ULTIMO, que despues de un click que navego es
+    el documento del reporte — y ahi el boton de la lista no existe, asi que el
+    re-click no podia acertar nunca. El goto emite su propio documentId, supera
+    el request colgado, y nos deja en la pagina que si tiene el boton.
+
+    `step` existe para que el log nombre el paso que fallo, y `botones=` para
+    poder distinguir "Playwright se nego a actuar" de "el boton no esta en esta
+    pagina" en la primera ocurrencia.
 
     El hover fuerza que PBI renderice el menu "..." del visual (en headless, sin
     hover, el boton visual-more-options-btn puede no aparecer).
     """
     iframe_element = page.locator('iframe[title="Embedded report"]')
+    # The URL the caller navigated to, captured BEFORE any click: the page that
+    # HAS the report button. `page.reload()` re-requests whatever committed
+    # LAST, which after a click that navigated is the report document — and the
+    # report document does not carry the report list, so the re-click could
+    # never hit. Recovery has to go back to this URL instead.
+    group_url = page.url
     for attempt in range(1, attempts + 1):
+        step = "click al boton"
         try:
-            await page.get_by_role("button", name=button_name).click()
+            # Explicit, y del tamaño de la cadena de OAuth, no mas corto.
+            #
+            # Sin el kwarg heredaba los 60s del context default y no el
+            # `timeout_ms` de esta funcion, asi que conviene que sea explicito.
+            # Pero el numero NO puede bajar: el `[NAV]` del 12-sep 04:03 UTC
+            # mostro que el portal **se re-autentica solo en medio de la
+            # corrida** — despues de commitear la pagina del grupo se va al
+            # root y hace toda la cadena federada (authorize → Account/Login →
+            # signin-oidc → ?code= → vuelta al grupo → al reporte), unas 14
+            # navegaciones cross-domain. Mientras eso pasa SIEMPRE hay un
+            # document pendiente, asi que el pre-check del click se bloquea ahi.
+            # Esa corrida entro igual y termino bien: el click gana la carrera
+            # si la cadena cierra dentro del budget.
+            #
+            # Con 25s una corrida fallo y la siguiente, con la misma cadena,
+            # paso — o sea que un budget corto convierte una re-auth
+            # sobrevivible en una falla. El propio proyecto ya lo tenia medido
+            # en el comentario del `set_default_timeout` de arriba: esa cadena
+            # "puede tardar > 30s".
+            await page.get_by_role("button", name=button_name).click(timeout=60000)
+            step = "iframe 'Embedded report'"
             await iframe_element.wait_for(timeout=timeout_ms)
+            step = "hover del iframe"
             await iframe_element.hover()
             return iframe_element.content_frame
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as exc:
+            # `count()` goes through Frame.queryCount, which runs none of the
+            # action pre-checks, so it answers even on a page where every
+            # action blocks: botones>=1 means Playwright refused to act on a
+            # button that was right there, botones=0 means the button is not on
+            # this page at all. Wrapped because an error path must never raise
+            # — a bare await here would replace the TimeoutError and void the
+            # retry.
+            try:
+                buttons = await asyncio.wait_for(
+                    page.get_by_role("button", name=button_name).count(), 5
+                )
+            except (PlaywrightError, TimeoutError):
+                buttons = -1
             logger.warning(
-                "[REPORT] iframe 'Embedded report' no aparecio en %ds (intento %d/%d)%s",
-                timeout_ms // 1000, attempt, attempts,
-                ", recargando y reintentando" if attempt < attempts else " — abortando",
+                "[REPORT] fallo esperando %s (intento %d/%d): url=%s botones=%d | %s%s",
+                step, attempt, attempts, page.url, buttons,
+                str(exc).splitlines()[0],
+                ", volviendo al grupo y reintentando" if attempt < attempts
+                else " — abortando",
             )
             if attempt >= attempts:
                 raise
-            # Reset del estado de PBI antes de re-clickear. domcontentloaded (no
-            # "load"): en esta SPA pesada el evento load puede tardar >60s y hacer
-            # fallar el propio reload (default 60s); el click siguiente ya espera
-            # a que el boton sea accionable. Usamos el mismo budget que el iframe.
+            # Volver al grupo con un goto, no con un reload. El goto emite su
+            # propio document request y su propio documentId, asi que el request
+            # al reporte que quedo colgado queda superado y se limpia al
+            # commitear — y ademas nos deja en la pagina que SI tiene el boton.
+            # domcontentloaded (no "load"): en esta SPA pesada el evento load
+            # puede tardar >60s y hacer fallar el propio goto; el click siguiente
+            # ya espera a que el boton sea accionable. Mismo budget que el iframe.
             try:
-                await page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
-            except PlaywrightTimeoutError:
+                await page.goto(
+                    group_url, wait_until="domcontentloaded", timeout=timeout_ms
+                )
+            except PlaywrightError as exc:
                 # A page too wedged to mount the PBI iframe is often too wedged to
-                # reload either, so both timeouts fire together. Letting the reload
-                # error escape would kill the run on attempt 1 and void the retry.
-                # Burn the attempt and re-click anyway.
+                # navigate either. Letting the recovery error escape would kill the
+                # run on attempt 1 and void the retry. Burn the attempt and
+                # re-click.
+                #
+                # PlaywrightError, not PlaywrightTimeoutError: the recovery does
+                # not only time out. Run #757 (2026-08-27 14:00) died on
+                # `Page.reload: net::ERR_ABORTED; maybe frame was detached?`, which
+                # is a plain Error — it escaped the narrower except and killed the
+                # run on the first attempt, with the other two never happening. The
+                # goto has the same two loud modes: `net::ERR_ABORTED`, and
+                # `Navigation to ... is interrupted by another navigation`, which is
+                # exactly what a stalled document request produces. TimeoutError
+                # subclasses Error, so this still covers the slow navigation.
+                # Deliberately NOT `except Exception`: Celery's
+                # SoftTimeLimitExceeded and a cancellation have to keep propagating.
                 logger.warning(
-                    "[REPORT] recovery reload timed out after %ds, "
-                    "re-clicking anyway (attempt %d/%d)",
-                    timeout_ms // 1000, attempt, attempts,
+                    "[REPORT] recovery goto failed (%s), re-clicking anyway "
+                    "(attempt %d/%d)",
+                    type(exc).__name__, attempt, attempts,
                 )
 
 
@@ -415,6 +549,56 @@ async def _export_excel(
     return target
 
 
+def require_known_columns(
+    path: Path, label: str, expected: tuple[str, ...]
+) -> None:
+    """Abort when a column ZipRide loads by name is no longer in the export.
+
+    The files we email are consumed by name, not by position, so a heading the
+    consumer does not recognise is a column it silently stops reading. Acumen
+    renames its own headings without notice — twice in the eight days to
+    2026-09-10 — and until now those renames travelled straight through to the
+    file we send, because the merge writes whatever header the export gave it.
+
+    A missing known column is therefore a stop, not a warning: not delivering is
+    recoverable in hours, a file quietly missing a column is not. A column we do
+    not know about is the opposite case — it is added data, so it goes out and is
+    only logged.
+    """
+    header = [str(c).strip() for c in _read(path)[0]]
+    missing = [c for c in expected if c not in header]
+    if missing:
+        raise ValueError(
+            f"{label}: el export ya no trae {missing} — renombradas o quitadas. "
+            f"Trae {header}"
+        )
+    unknown = [c for c in header if c and c not in expected]
+    if unknown:
+        logger.warning(
+            "[REPORT] %s: columnas nuevas en el export, se entregan igual: %s",
+            label, unknown,
+        )
+
+
+def _apply_exceptions_in_place(path: Path, drop: DropSpec) -> None:
+    """Rewrite a simple report's raw download without its excepted rows.
+
+    R2 was always emailed exactly as Power BI produced it; this is the first
+    time it is opened. In place, because everything downstream (`_send`, the
+    deferred list, `Run.filenames`, the attachment name) holds this same Path.
+    The sheet keeps its original name; what does change is what any pass
+    through `_merge_xlsx_files` changes: the 'Applied filters:' footer goes and
+    dates are written in the merge's display format.
+    """
+    sheet_name = python_calamine.CalamineWorkbook.from_path(str(path)).sheet_names[0]
+    filtered = path.with_name(f"{path.stem}.filtered{path.suffix}")
+    _merge_xlsx_files([path], filtered, None, drop, sheet_name=sheet_name)
+    os.replace(filtered, path)
+    if filtered in drop.emptied:
+        # The merge marked the temporary name; everything downstream holds the
+        # original Path, and that is the one the command checks before emailing.
+        drop.emptied.discard(filtered)
+        drop.emptied.add(path)
 async def _export_matrix_visual(page, iframe, target: Path) -> bool:
     """Export the matrix visual as 'Summarized data'. True if a file landed.
 
@@ -541,6 +725,87 @@ async def _export_matrix_report(
     return parts
 
 
+async def _prepare_tab(
+    page: Page,
+    iframe,
+    tab_name: str | None,
+    *,
+    single_slicer: bool,
+    reset_slicers: tuple[str, ...],
+):
+    """Select a tab, clear its dropdown slicers, and read its date slicer.
+
+    Extracted so the same preparation can run for a second tab of the same
+    report without duplicating it: since 2026-09-03 the invoice file's rows are
+    split across two tabs, and each carries its own slicers and its own date
+    extent — the payment activity report's two tabs ended 8/31 and 8/27 on the
+    same day.
+
+    Returns (date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt).
+    """
+    # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
+    # totales). Switch al tab con detalle PA + schedule semanal.
+    if tab_name is not None:
+        await iframe.get_by_role("tab", name=tab_name).click()
+        await asyncio.sleep(3)
+
+    # Los dropdown slicers arrastran la seleccion que dejo el ultimo humano en el
+    # portal; los limpiamos antes de exportar (ver _clear_slicer_filter).
+    for slicer_label in reset_slicers:
+        await _clear_slicer_filter(page, iframe, slicer_label)
+
+    # Esperamos a que carguen todos los date inputs antes de leer el slicer.
+    # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
+    # Date) carga unos segundos despues del A, leer antes identifica mal.
+    # R1: 1 slicer x 2 textboxes = 2 inputs.
+    needed_inputs = 2 if single_slicer else 4
+    date_inputs = iframe.locator("input[aria-label*='Available input range']")
+    deadline = asyncio.get_event_loop().time() + 30
+    while True:
+        count = await date_inputs.count()
+        if count >= needed_inputs:
+            break
+        if asyncio.get_event_loop().time() > deadline:
+            raise TimeoutError(
+                f"Only {count} date inputs after 30s (needed {needed_inputs})"
+            )
+        await asyncio.sleep(0.5)
+
+    if single_slicer:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _read_single_slicer(date_inputs)
+        )
+    else:
+        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+            await _identify_accrual_slicer(date_inputs)
+        )
+    return date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt
+
+
+def _require_non_empty_tab(
+    label: str, paths: list[Path], part_meta: dict
+) -> None:
+    """Abort when a whole tab exported zero rows.
+
+    `_merge_xlsx_files` has a report-level zero-row guard, but it sums the parts
+    of every tab at once. Since the invoice file started merging two tabs, the
+    rows of 'Paid Invoices' are enough to keep that total above zero even when
+    the tab carrying the rejections comes back completely empty — the run stays
+    SUCCESS and ZipRide gets a header-only pile, which is the shape of the
+    2026-09-05 incident. Counting per tab gives back the protection the
+    single-tab version had.
+
+    An individual chunk with no rows stays legitimate (adaptive chunking
+    produces them); this only fires when a tab contributes nothing at all.
+    """
+    rows = sum(part_meta[path][2] for path in paths if path in part_meta)
+    if rows == 0:
+        raise ValueError(
+            f"Tab {label!r}: export vacio ({len(paths)} chunks, 0 data rows) — "
+            "filtro no aplicado o sesion caida"
+        )
+
+
 async def _export_chunked_report(
     page: Page,
     button_name: str,
@@ -554,7 +819,9 @@ async def _export_chunked_report(
     full_range: bool = False,
     reset_slicers: tuple[str, ...] = (),
     invoice_split: bool = False,
+    exceptions: DropSpec | None = None,
     required_columns: tuple[str, ...] = (),
+    extra_tabs: tuple[str, ...] = (),
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -586,44 +853,12 @@ async def _export_chunked_report(
     """
     iframe = await _open_report_iframe(page, button_name)
 
-    # R3 abre por default en el tab 'Estimated Accrual Balances' (que solo tiene
-    # totales). Switch al tab con detalle PA + schedule semanal. R1 no tiene
-    # tabs (tab_name=None) → se saltea.
-    if tab_name is not None:
-        await iframe.get_by_role("tab", name=tab_name).click()
-
-    # Los dropdown slicers arrastran la seleccion que dejo el ultimo humano en el
-    # portal; los limpiamos antes de exportar (ver _clear_slicer_filter).
-    for slicer_label in reset_slicers:
-        await _clear_slicer_filter(page, iframe, slicer_label)
-
-    # Esperamos a que carguen todos los date inputs antes de leer el slicer.
-    # R3: 2 slicers x 2 textboxes = 4 inputs; el slicer B (Accrual Schedule
-    # Date) carga unos segundos despues del A, leer antes identifica mal.
-    # R1: 1 slicer x 2 textboxes = 2 inputs.
-    needed_inputs = 2 if single_slicer else 4
-    date_inputs = iframe.locator(
-        "input[aria-label*='Available input range']"
+    date_inputs, start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+        await _prepare_tab(
+            page, iframe, tab_name,
+            single_slicer=single_slicer, reset_slicers=reset_slicers,
+        )
     )
-    deadline = asyncio.get_event_loop().time() + 30
-    while True:
-        count = await date_inputs.count()
-        if count >= needed_inputs:
-            break
-        if asyncio.get_event_loop().time() > deadline:
-            raise TimeoutError(
-                f"Only {count} date inputs after 30s (needed {needed_inputs})"
-            )
-        await asyncio.sleep(0.5)
-
-    if single_slicer:
-        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
-            await _read_single_slicer(date_inputs)
-        )
-    else:
-        start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
-            await _identify_accrual_slicer(date_inputs)
-        )
     start_date = slicer_min
     # R3 (full_range=True): chunkeamos la PA End Date hasta slicer_max tal cual.
     # Asi entran TODOS los PAs (incluso los que terminan a futuro) y TODOS sus
@@ -646,10 +881,22 @@ async def _export_chunked_report(
         start_date, end_date, today, slicer_max, full_range,
     )
 
-    start_input = date_inputs.nth(start_idx)
-    end_input = date_inputs.nth(end_idx)
-
     slug = "_".join(button_name.lower().split())
+
+    # Contexto de la pestaña que se esta exportando. Es mutable a proposito: el
+    # exporter de abajo lo lee en cada chunk, y el loop lo reescribe al pasar al
+    # tab siguiente, que tiene sus propios inputs de fecha, su propio extent y
+    # sus propias columnas. Con `extra_tabs` vacio se escribe una sola vez y
+    # todo se comporta igual que antes.
+    tab = {
+        "start_input": date_inputs.nth(start_idx),
+        "end_input": date_inputs.nth(end_idx),
+        "fmt": date_fmt,
+        "min": slicer_min,
+        "max": slicer_max,
+        "required_columns": required_columns,
+        "prefix": "",
+    }
 
     # (start, end, data_rows) per exported part. `_split_for_email` needs it to
     # group parts into files that fit an email and to label each file with its
@@ -671,14 +918,16 @@ async def _export_chunked_report(
         logger.warning("[REPORT chunked] Exporting part %d (%s)", seq, label)
 
         part_path = output_dir / (
-            f"{slug}_part_{seq:03d}"
+            f"{slug}{tab['prefix']}_part_{seq:03d}"
             f"_{chunk_start.isoformat()}_to_{chunk_end.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
         # Un chunk que cubre el extent entero del slicer no deja rastro en el
         # footer (no hay filtro que restatear), asi que ahi no hay nada que
         # verificar; en cualquier otro caso el footer tiene que confirmarlo.
-        covers_everything = chunk_start <= slicer_min and chunk_end >= slicer_max
+        covers_everything = (
+            chunk_start <= tab["min"] and chunk_end >= tab["max"]
+        )
         expected = (None, None) if covers_everything else (chunk_start, chunk_end)
 
         async def _download_once():
@@ -720,12 +969,14 @@ async def _export_chunked_report(
 
         for attempt in range(1, _FILTER_ATTEMPTS + 1):
             await _set_date_filter(
-                start_input, end_input, chunk_start, chunk_end, date_fmt
+                tab["start_input"], tab["end_input"],
+                chunk_start, chunk_end, tab["fmt"],
             )
             await _download_once()
             try:
                 rows = _validate_chunk_xlsx(
-                    part_path, *expected, required_columns=required_columns
+                    part_path, *expected,
+                    required_columns=tab["required_columns"],
                 )
                 break
             except AppliedFilterMismatch as exc:
@@ -751,6 +1002,48 @@ async def _export_chunked_report(
         threshold=_RESPLIT_THRESHOLD,
         max_parts=_MAX_PARTS,
     )
+    _require_non_empty_tab(tab_name or button_name, part_paths, part_meta)
+
+    # Los demas tabs que aportan filas al mismo archivo. Cada uno se prepara de
+    # cero: tiene sus propios inputs de fecha (los del tab anterior quedan
+    # detached al cambiar de pestaña), su propio extent y sus propias columnas.
+    for index, extra in enumerate(extra_tabs, start=1):
+        (
+            extra_inputs, extra_start_idx, extra_end_idx,
+            extra_min, extra_max, extra_fmt,
+        ) = await _prepare_tab(
+            page, iframe, extra,
+            single_slicer=single_slicer,
+            # Los slicers de `reset_slicers` son los del tab principal; pedirlos
+            # aca colgaria 60s esperando un locator que este tab no tiene.
+            reset_slicers=(),
+        )
+        tab.update({
+            "start_input": extra_inputs.nth(extra_start_idx),
+            "end_input": extra_inputs.nth(extra_end_idx),
+            "fmt": extra_fmt,
+            "min": extra_min,
+            "max": extra_max,
+            # `required_columns` identifica al tab principal; este tab, por
+            # definicion, no las tiene todas.
+            "required_columns": (),
+            "prefix": f"_tab{index}",
+        })
+        extra_end = extra_max if full_range else min(today, extra_max)
+        logger.warning(
+            "[REPORT chunked] Tab extra %r: %s a %s", extra, extra_min, extra_end,
+        )
+        extra_paths = await _export_ranges_adaptive(
+            _export_one_range,
+            _chunk_date_range(extra_min, extra_end, n_chunks),
+            threshold=_RESPLIT_THRESHOLD,
+            max_parts=_MAX_PARTS,
+        )
+        _require_non_empty_tab(extra, extra_paths, part_meta)
+        part_paths += extra_paths
+
+    if extra_tabs:
+        _normalise_part_headers(part_paths)
 
     # One pile for a plain chunked report (R3), two for the invoice file (R1).
     # The pile goes into the slug: both piles cover the same date range, so
@@ -775,7 +1068,11 @@ async def _export_chunked_report(
             f"{pile_slug}_{start_date.isoformat()}_to_{end_date.isoformat()}"
             f"_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(part_paths, merged_path, keep_entry_ids)
+        # The exceptions are applied here, at write time, and not before the
+        # invoice split: `classify` decides per invoice with no state shared
+        # between invoices, so leaving a whole invoice out at write time gives
+        # every other invoice exactly the pile it would have had anyway.
+        _merge_xlsx_files(part_paths, merged_path, keep_entry_ids, exceptions)
         outputs = _split_for_email(
             merged_path,
             part_paths,
@@ -785,6 +1082,7 @@ async def _export_chunked_report(
             pile_slug,
             timestamp_label,
             keep_entry_ids,
+            exceptions,
         )
         items.extend(
             (path, f"{pile_name} ({first.isoformat()} to {last.isoformat()})")
@@ -1000,10 +1298,69 @@ def _classify_invoice_piles(
     return split, _meta_for(split.rejected), _meta_for(split.payable)
 
 
+def _normalise_part_headers(paths: list[Path]) -> None:
+    """Give every part the same columns, so parts from two tabs can be merged.
+
+    The two tabs the invoice file now comes from do not carry the same columns:
+    the one with the rejections has `Rejected Reason` and `Aging`, and the one
+    with the paid entries does not. `_merge_xlsx_files` refuses a header that
+    does not match the first chunk's, and rightly so — that check is what would
+    catch a real schema drift.
+
+    So the parts are reconciled here instead, once, before anything reads them:
+    the first part's columns are the shape, every other part is rewritten to it
+    matching by column NAME, and a column a part does not have is left empty.
+    Columns are never dropped: a part carrying a column the first one lacks is
+    a real difference and stops the run rather than losing data quietly.
+    """
+    if not paths:
+        return
+    canonical = [str(c).strip() if c is not None else "" for c in _read(paths[0])[0]]
+    for path in paths[1:]:
+        rows = _read(path)
+        header = [str(c).strip() if c is not None else "" for c in rows[0]]
+        if header == canonical:
+            continue
+        unknown = [c for c in header if c and c not in canonical]
+        if unknown:
+            raise ValueError(
+                f"{path.name}: trae columnas que el primer chunk no tiene "
+                f"({unknown}) — no las tiro en silencio"
+            )
+        source = {name: i for i, name in enumerate(header) if name}
+        logger.warning(
+            "[REPORT chunked] %s: normalizando %d columnas a %d (faltan %s)",
+            path.name, len(header), len(canonical),
+            [c for c in canonical if c not in source] or "ninguna",
+        )
+        rewritten = path.with_name(f"{path.stem}.norm{path.suffix}")
+        workbook = xlsxwriter.Workbook(str(rewritten))
+        sheet = workbook.add_worksheet()
+        fmt_datetime = workbook.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+        fmt_date = workbook.add_format({"num_format": "yyyy-mm-dd"})
+        sheet.write_row(0, 0, canonical)
+        out_row = 1
+        for row in _data_rows(rows):
+            for col, name in enumerate(canonical):
+                i = source.get(name)
+                value = row[i] if i is not None and i < len(row) else None
+                if isinstance(value, dt.datetime):
+                    sheet.write_datetime(out_row, col, value, fmt_datetime)
+                elif isinstance(value, dt.date):
+                    sheet.write_datetime(out_row, col, value, fmt_date)
+                else:
+                    sheet.write(out_row, col, value)
+            out_row += 1
+        workbook.close()
+        rewritten.replace(path)
+
+
 def _merge_xlsx_files(
     paths: list[Path],
     output_path: Path,
     keep_entry_ids: frozenset | None = None,
+    drop: DropSpec | None = None,
+    sheet_name: str | None = None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
@@ -1036,11 +1393,23 @@ def _merge_xlsx_files(
     `keep_entry_ids` (optional) writes only the rows whose `Entry ID` is in the
     set, which is how R1 is cut into its two piles without a second download and
     without this function growing a second code path: passing None leaves every
-    line below identical to what R3 has always run. A filter that matches nothing
+    line below identical to what R3 has always run. Passing it also deduplicates
+    by `Entry ID`, keeping the last row seen — see the write loop for why the
+    two tabs can hand us the same entry twice. The dedup only sees the paths of
+    one call, which is every part of the report on the merge that matters; a
+    per-group re-merge in `_split_for_email` works on already-merged rows. A filter that matches nothing
     writes a header-only file rather than failing — a day with no rejected-only
-    invoices is a legitimate empty pile, not a broken report, and the zero-row
-    guard below still fires on the case it was written for, which is the export
-    itself coming back empty.
+    invoices is a legitimate empty pile, not a broken report. The zero-row guard
+    below covers the whole merge; with more than one tab it can no longer tell
+    which tab came back empty, so `_require_non_empty_tab` checks each tab at
+    export time and this stays as the last line of defence.
+
+    `drop` (optional) is the report's File Exceptions list: rows whose key is in
+    it are left out, with the key columns resolved by name from the merged
+    header (a missing REQUIRED column fails the run loudly, same policy as the
+    split; an optional one simply reads as empty).
+    What was dropped is recorded on the spec itself, per output file.
+    `sheet_name` (optional) names the output sheet; the default is xlsxwriter's.
     """
     if not paths:
         raise ValueError("No paths to merge")
@@ -1049,18 +1418,30 @@ def _merge_xlsx_files(
     # so a bad chunk aborts before we produce a half-written file.
     canonical_header: list | None = None
     total_rows = 0
+    # Resolved by header name from the merged header, so the split follows the
+    # export's column drift (13 columns in May, 14 in August) for free.
+    entry_id_col: int | None = None
+    # Veces que aparece cada Entry ID. El loop de escritura lo decrementa y
+    # solo escribe cuando llega a cero, o sea en la ULTIMA aparicion.
+    entry_id_seen: dict = {}
     for path in paths:
         rows = _read(path)
         if not rows or not any(c not in (None, "") for c in rows[0]):
             raise ValueError(f"{path.name}: archivo vacio (sin header)")
         if canonical_header is None:
             canonical_header = rows[0]
+            if keep_entry_ids is not None:
+                entry_id_col = resolve_columns(canonical_header).entry_id
         elif rows[0] != canonical_header:
             raise ValueError(
                 f"{path.name}: header no matchea con el primer chunk "
                 f"({rows[0]!r} vs {canonical_header!r})"
             )
-        total_rows += sum(1 for _ in _data_rows(rows))
+        for row in _data_rows(rows):
+            total_rows += 1
+            if entry_id_col is not None:
+                eid = row[entry_id_col]
+                entry_id_seen[eid] = entry_id_seen.get(eid, 0) + 1
 
     # Guard a nivel reporte: sub-rangos vacios individuales son validos (el
     # chunking adaptativo puede generarlos), pero un merge con 0 filas en TOTAL
@@ -1070,16 +1451,10 @@ def _merge_xlsx_files(
             f"{output_path.name}: merge produjo 0 data rows — reporte vacio"
         )
 
-    # Resolved by header name from the merged header, so the split follows the
-    # export's column drift (13 columns in May, 14 in August) for free.
-    entry_id_col = (
-        resolve_columns(canonical_header).entry_id
-        if keep_entry_ids is not None
-        else None
-    )
+    row_filter = RowFilter(canonical_header, drop) if drop is not None else None
 
     out_wb = xlsxwriter.Workbook(str(output_path))
-    out_ws = out_wb.add_worksheet()
+    out_ws = out_wb.add_worksheet(sheet_name)
     # Replicamos el formato de fecha que aplicaba openpyxl por default, para que
     # Paul no vea un cambio de presentacion en las columnas de fecha.
     fmt_datetime = out_wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
@@ -1101,7 +1476,20 @@ def _merge_xlsx_files(
     written = 0
     for path in paths:
         for row in _data_rows(_read(path)):
-            if entry_id_col is not None and row[entry_id_col] not in keep_entry_ids:
+            if entry_id_col is not None:
+                eid = row[entry_id_col]
+                if eid not in keep_entry_ids:
+                    continue
+                # Los dos tabs se exportan con minutos de diferencia contra
+                # datos vivos: un invoice que el portal marca como pagado en esa
+                # ventana vuelve en los dos, con el mismo Entry ID, y sin esto
+                # su Amount se contaria dos veces. Se conserva la ultima — el
+                # tab de pagados se exporta al final, asi que es el dato mas
+                # fresco y es la fila que `classify` ya habia elegido.
+                entry_id_seen[eid] -= 1
+                if entry_id_seen[eid] > 0:
+                    continue
+            if row_filter is not None and row_filter.drops(row):
                 continue
             _write_row(row)
             written += 1
@@ -1112,6 +1500,13 @@ def _merge_xlsx_files(
         len(paths), output_path.name, written, len(canonical_header),
         output_path.stat().st_size / 1048576,
     )
+    if row_filter is not None:
+        drop.record(output_path, row_filter, written)
+        logger.warning(
+            "[EXCEPTIONS] %s: dropped %d rows from %s (%d of %d keys matched)",
+            drop.label, row_filter.dropped, output_path.name,
+            len(row_filter.matched), len(drop.keys),
+        )
     if entry_id_col is not None and written == 0:
         logger.warning(
             "[REPORT chunked] %s quedo solo con el header: ninguna de las %d filas "
@@ -1144,6 +1539,7 @@ def _split_for_email(
     slug: str,
     timestamp_label: str,
     keep_entry_ids: frozenset | None = None,
+    drop: DropSpec | None = None,
 ) -> list[tuple[Path, dt.date, dt.date]]:
     """Return the files to email as [(path, range_start, range_end)].
 
@@ -1156,7 +1552,9 @@ def _split_for_email(
 
     Splitting by chunk (not by row) is what keeps each file self-describing:
     its date range goes into the filename and into the email subject, exactly
-    in the format a single-file run already uses.
+    in the format a single-file run already uses. The filename also carries the
+    group's position, because two groups can legitimately cover the same span
+    once the report is merged from more than one tab.
 
     Costs a second merge pass over the data (~2x the merge time), which only
     happens on the runs that would otherwise be rejected by Brevo outright.
@@ -1207,16 +1605,27 @@ def _split_for_email(
     )
 
     outputs: list[tuple[Path, dt.date, dt.date]] = []
-    for group in groups:
-        group_start = part_meta[group[0]][0]
-        group_end = part_meta[group[-1]][1]
+    for idx, group in enumerate(groups, 1):
+        # min/max over the group, not first/last: `parts` is only chronological
+        # while the report comes from a single tab. With two tabs it is two
+        # sequences over the same range laid end to end, so a group straddling
+        # the seam would otherwise be labelled with an end date months before
+        # its start. The group index keeps two groups covering the same span
+        # from resolving to one path and silently overwriting each other; it
+        # stays out of the subject, which is what ZipRide matches on.
+        group_start = min(part_meta[p][0] for p in group)
+        group_end = max(part_meta[p][1] for p in group)
         out_path = output_dir / (
             f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
-            f"_{timestamp_label}.xlsx"
+            f"_{idx:02d}_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(group, out_path, keep_entry_ids)
+        _merge_xlsx_files(group, out_path, keep_entry_ids, drop)
         outputs.append((out_path, group_start, group_end))
     merged_path.unlink(missing_ok=True)
+    if drop is not None:
+        # The big merge never goes out; its drop count must not be added to
+        # the counts of the files that replace it.
+        drop.forget(merged_path)
     return outputs
 
 

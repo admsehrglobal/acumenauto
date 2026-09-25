@@ -6,6 +6,7 @@ RecipientForm valida un email para agregar a la lista de destinatarios.
 """
 from django import forms
 
+from app.file_exceptions import ParsedUpload, ReportSpec, normalize_key
 from app.models import AppConfig, Recipient
 
 
@@ -140,3 +141,96 @@ class DCICredentialsForm(forms.ModelForm):
         if commit:
             obj.save()
         return obj
+
+
+class FileExceptionKeyForm(forms.Form):
+    """Add one File Exceptions entry by hand; one field per key column."""
+
+    def __init__(self, spec: ReportSpec, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec = spec
+        for i, column in enumerate(spec.columns, start=1):
+            optional = i > spec.required
+            self.fields[f"key_{i}"] = forms.CharField(
+                label=f"{column} (optional)" if optional else column,
+                required=not optional,
+                max_length=100,
+                widget=forms.TextInput(
+                    attrs={"class": _INPUT_CLASS, "placeholder": column}
+                ),
+            )
+
+    def clean(self):
+        """Build the normalised key. The required fields have already reported
+        themselves under their own label by now; an optional one left empty is
+        the wildcard, and stays the empty string."""
+        data = super().clean()
+        key = tuple(
+            normalize_key(data.get(f"key_{i}", ""))
+            for i in range(1, len(self.spec.columns) + 1)
+        )
+        if all(key[: self.spec.required]):
+            self.cleaned_key = key
+        return data
+
+
+class FileExceptionConfirmForm(forms.Form):
+    """The keys read from an upload, carried to the confirming POST.
+
+    The uploaded file cannot be read a second time - calamine consumes the
+    stream - so the page that asks "add these?" hands the keys themselves back
+    rather than the file. The counts travel with them so the message after the
+    write says the same numbers the page showed.
+    """
+
+    filename = forms.CharField(max_length=255, widget=forms.HiddenInput)
+    keys = forms.CharField(widget=forms.HiddenInput)
+    blank = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
+    duplicates = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
+    too_long = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
+
+    def __init__(self, spec: ReportSpec, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.spec = spec
+
+    @staticmethod
+    def pack(keys) -> str:
+        return "\n".join("\t".join(key) for key in keys)
+
+    def parsed(self) -> ParsedUpload:
+        # maxsplit keeps a tab inside the last part from splitting the key.
+        width = len(self.spec.columns)
+        keys = [
+            tuple(line.split("\t", width - 1))
+            for line in self.cleaned_data["keys"].splitlines()
+            if line
+        ]
+        return ParsedUpload(
+            keys,
+            self.cleaned_data["blank"],
+            self.cleaned_data["duplicates"],
+            self.cleaned_data["too_long"],
+        )
+
+
+class FileExceptionUploadForm(forms.Form):
+    file = forms.FileField(
+        label="Excel file",
+        widget=forms.FileInput(
+            attrs={
+                "accept": ".xlsx,.xlsm,.xls",
+                "class": "block w-full text-sm text-slate-600 file:mr-3 file:px-3 "
+                         "file:py-1.5 file:rounded file:border file:border-slate-300 "
+                         "file:bg-white file:text-sm hover:file:bg-slate-100",
+            }
+        ),
+    )
+
+    def clean_file(self):
+        upload = self.cleaned_data["file"]
+        if not upload.name.lower().endswith((".xlsx", ".xlsm", ".xls")):
+            raise forms.ValidationError(
+                "Please upload an Excel file (.xlsx). A .csv has to be opened "
+                "in Excel and saved as .xlsx first."
+            )
+        return upload

@@ -8,13 +8,65 @@ from zoneinfo import ZoneInfo
 import xlsxwriter
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 from django.utils import timezone
 
-from app.accrual_rebuild import OUTPUT_COLUMNS, PaFacts, as_date, rebuild
+from app.accrual_rebuild import (
+    OUTPUT_COLUMNS,
+    PaFacts,
+    as_date,
+    rebuild,
+    scan_funded_spans,
+)
+
+# Las columnas que ZipRide carga POR NOMBRE de cada archivo. Medidas sobre los
+# exports reales, no declaradas de memoria: R1 contra el par del 2026-08-28 y el
+# del 2026-09-10 (identicos), R2 contra el del 2026-09-05.
+#
+# Existen para que un renombre de Acumen no viaje al archivo que mandamos. El
+# accrual file no las necesita porque se arma con `OUTPUT_COLUMNS` fijas; estos
+# dos se reenvian tal como bajan, asi que hay que mirarlos.
+INVOICE_COLUMNS = (
+    "Urgency", "Entry ID", "PA Number", "Invoice #", "Client Name",
+    "Client DDDID", "Client Number", "Service Code", "Status",
+    "Rejected Reason", "Date Of Service", "Entry Creation Date", "Amount",
+    "Aging",
+)
+AUTH_COLUMNS = (
+    "Authorization ID", "PA Number", "Client Name", "Client ID",
+    "Client DDDID", "Service Code", "Plan", "Outcome", "Service",
+    "Total Units", "Rate ($)", "Approve Date", "Approved By", "Start Date",
+    "End Date", "Expiration Date", "Initial Balance", "Remaining Balance",
+    "Maximum Daily Billable Units", "Hold Amount", "Available",
+    "Billing Rate", "Monthly Max", "Weekly Max", "Daily Max", "Daily Rate",
+    "Billing Unit", "Non Billable", "Billing Hold", "Status", "Created By",
+)
 from app.email_utils import send_error_report, send_reports_email, verify_delivery
-from app.models import AppConfig, PaSchedule, Recipient, Run
+from app.file_exceptions import (
+    REPORTS,
+    DropSpec,
+    RowFilter,
+    fold_key,
+    make_drop_spec,
+    summarize,
+)
+from app.models import (
+    AppConfig,
+    FileException,
+    PaSchedule,
+    Recipient,
+    Run,
+    SharedKey,
+)
 from app.invoice_split import PILE_PAYABLE, subject_override_for
-from app.scraper import ChunkedReport, MatrixReport, _read, download_reports
+from app.scraper import (
+    ChunkedReport,
+    MatrixReport,
+    _apply_exceptions_in_place,
+    _read,
+    download_reports,
+    require_known_columns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +76,25 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 
 # Gap between the rejected pile and the payable one. Paul loads the rejections
 # first so an invoice resubmitted to Acumen ends up with the right final status
-# in ZipRide; Juan asked for 20 minutes on 2026-08-27 (he had been offered 5).
+# in ZipRide.
+#
+# Settled by the two people it affects, on the thread of 2026-09-07: Juan asked
+# for 20 minutes (his import wants the first file finished before the second
+# arrives), Paul answered that his side takes 2 to 3 minutes and asked for 5,
+# and Juan closed it at 10. Nobody gets to change this one alone — it is their
+# agreement, not our tuning knob.
 #
 # The wait sits in this command, after Playwright has closed and inside the try,
 # which is what keeps it honest: a run that overruns is marked FAILED by Celery's
-# soft limit instead of leaving a zombie holding the worker. It fits — the daily
-# run measured between 48s and 567s over the last month, so the worst case is
-# about 29.5 minutes against a 38 minute soft limit. The margin is 8.5 minutes
-# rather than the 28 we had, and a deploy landing inside the window costs the
-# payable pile for that run.
-INVOICE_PILE_GAP_S = 20 * 60
+# soft limit instead of leaving a zombie holding the worker. The work either side
+# of the wait measured between 48s and 567s over the month before the invoice
+# file went back to reading two tabs, so the worst case here is about 19.5
+# minutes against a 38 minute soft limit. Reading the second tab roughly doubles
+# the chunk exports, so that 567s is the number to re-measure after the deploy —
+# if the work alone ever approaches 28 minutes, this constant is the lever, not
+# the chunk count. A deploy landing inside the window still costs the payable
+# pile for that run.
+INVOICE_PILE_GAP_S = 10 * 60
 
 
 
@@ -135,12 +196,31 @@ def _pa_lookup() -> dict:
     }
 
 
-def _assemble_accrual(parts, button_name, output_dir, timestamp_label):
-    """Los chunks de la matriz -> el accrual file de siempre, siete columnas."""
+def _assemble_accrual(parts, button_name, output_dir, timestamp_label, drop=None):
+    """Los chunks de la matriz -> el accrual file de siempre, siete columnas.
+
+    `drop` es la lista de File Exceptions de accruals. Se aplica ACA y no en el
+    spec del reporte como los otros dos: este archivo ya no sale de un merge de
+    chunks sino que se arma fila por fila, y la clave (Client DDDID + PA Number)
+    recien existe una vez armada, porque el export de la matriz no trae el
+    Client DDDID.
+    """
     lookup = _pa_lookup()
+
+    # The funded span of a PA the lookup cannot date has to be measured over
+    # EVERY slice before any of them is rebuilt. Measured inside one slice it
+    # ends at that slice's own last funded week, and the zero weeks past it fall
+    # out: on 2026-09-12 that left 100 weeks missing across 14 authorizations,
+    # every one of them on a seam between two slices. Reading the parts twice is
+    # the cost; holding all of them in memory at once is not an option on a 2 GB
+    # machine.
+    spans: dict = {}
+    for part in parts:
+        scan_funded_spans(_read(part), lookup, into=spans)
+
     rows, unmatched = [], set()
     for part in parts:
-        result = rebuild(_read(part), lookup)
+        result = rebuild(_read(part), lookup, funded_span=spans)
         rows.extend(result.rows)
         unmatched |= result.unmatched_pas
 
@@ -148,6 +228,15 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label):
         raise ValueError(
             "accrual: la matriz no devolvio ni una fila — no mando un archivo vacio"
         )
+
+    if drop is not None:
+        row_filter = RowFilter(list(OUTPUT_COLUMNS), drop)
+        rows = [r for r in rows if not row_filter.drops(r)]
+        if not rows:
+            raise ValueError(
+                "accrual: la lista de excepciones se llevo TODAS las filas — "
+                "no mando un archivo vacio"
+            )
 
     slug = "_".join(button_name.lower().split())
     dates = [r[5] for r in rows if r[5] is not None]
@@ -170,6 +259,16 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label):
                 sheet.write(r, c, value)
     workbook.close()
 
+    if drop is not None:
+        # Never zero here: the guard above already refused to write a file the
+        # list had emptied, so this path can never land in `drop.emptied`.
+        drop.record(path, row_filter, len(rows))
+        logger.warning(
+            "[EXCEPTIONS] %s: dropped %d rows from %s (%d of %d keys matched)",
+            drop.label, row_filter.dropped, path.name,
+            len(row_filter.matched), len(drop.keys),
+        )
+
     blank = sum(1 for r in rows if not r[1])
     logger.warning(
         "[REPORT matrix] %s: %d filas; %d (%.2f%%) sin Client DDDID / fechas, "
@@ -191,6 +290,90 @@ def _notify_failure(run: Run) -> None:
         send_error_report(run, "scheduled run")
     except Exception:  # noqa: BLE001 - el fallo real ya quedo en run.error_message
         logger.exception("[email] no pude avisar del fallo del Run #%s", run.pk)
+
+
+def _load_exceptions() -> dict[str, DropSpec | None]:
+    """The File Exceptions lists, one spec per file (None when the list is empty).
+
+    Read once here, in the main thread, like AppConfig and the recipients: the
+    scraper stays Django-free and `on_report_ready` runs in a worker thread.
+    """
+    specs: dict[str, DropSpec | None] = {}
+    for slug in REPORTS:
+        rows = FileException.objects.filter(
+            report=slug, removed_at__isnull=True
+        ).values_list("key_1", "key_2")
+        specs[slug] = make_drop_spec(slug, rows)
+    return specs
+
+
+def _stamp_matches(
+    exceptions: dict[str, DropSpec | None], when, complete: bool = True
+) -> None:
+    """Record, per entry, that this run read its file and whether it matched.
+
+    Only for the files this run actually wrote: the daily invocation is
+    `--reports=1,2` and the long one `--reports=3`, so stamping unconditionally
+    would mark the accruals entries "checked" on a run that never opened that
+    export. `DropSpec.stats` is empty exactly when no file was written, which
+    is the same guard `summarize` uses.
+
+    `complete` is False on the failure path. A run that died between the
+    rejected and the payable pile has seen part of the invoice file only, and
+    the rejected pile holds one line per number, so its picture of the numbers
+    on several clients' lines is empty: it would take every one of them off the
+    page. The last complete run's picture is kept instead.
+    """
+    for slug, spec in exceptions.items():
+        if spec is None:
+            # An empty list builds no picture at all, so the stored one would
+            # only get older. None is better than one of an old file.
+            if REPORTS[slug].optional_columns:
+                SharedKey.objects.filter(report=slug).delete()
+            continue
+        if not spec.stats:
+            continue
+        matched: set = set()
+        for _, keys in spec.stats.values():
+            matched |= keys
+        # `matched` holds keys at the report's width, so a one-part key is a
+        # 1-tuple there and has to be built the same way from the entry.
+        width = len(spec.columns)
+        entries = FileException.objects.filter(report=slug, removed_at__isnull=True)
+        hit = [
+            e.pk for e in entries
+            if fold_key((e.key_1, e.key_2)[:width]) in matched
+        ]
+        entries.update(last_checked_at=when)
+        FileException.objects.filter(pk__in=hit).update(last_matched_at=when)
+        if complete and spec.owners is not None:
+            _replace_shared(slug, spec.shared(), when)
+
+
+def _replace_shared(slug: str, shared: dict, when) -> None:
+    """Swap in what this run's file says about numbers on several clients'
+    lines. Whole, so a number drops off as soon as the file stops sharing it."""
+    with transaction.atomic():
+        SharedKey.objects.filter(report=slug).delete()
+        SharedKey.objects.bulk_create([
+            SharedKey(
+                report=slug,
+                key_1=head[0],
+                clients="\n".join(f"{shown[0]}\t{name}" for shown, name in owners),
+                seen_at=when,
+            )
+            for head, owners in shared.items()
+        ])
+
+
+def _stamp_matches_safely(
+    exceptions: dict[str, DropSpec | None], complete: bool = True
+) -> None:
+    """Bookkeeping, not delivery: never let it fail a run whose files are out."""
+    try:
+        _stamp_matches(exceptions, timezone.now(), complete)
+    except Exception:  # noqa: BLE001 - the run's own outcome is already decided
+        logger.exception("[exceptions] no pude sellar las entradas")
 
 
 class Command(BaseCommand):
@@ -226,6 +409,7 @@ class Command(BaseCommand):
         subject_label = nj_started.strftime("%Y-%m-%d %H:%M NJ")
 
         config = AppConfig.load()
+        exceptions = _load_exceptions()
         if options["reports"]:
             filter_ids = {int(s) for s in options["reports"].split(",") if s.strip()}
         else:
@@ -260,11 +444,22 @@ class Command(BaseCommand):
                     reset_slicers=("Aging Category", "Status"),
                     # R1 es el invoice file: sale como dos entregas.
                     invoice_split=True,
-                    # Las dos que distinguen el tab bueno del default: el invoice
-                    # split solo necesita Entry ID / Invoice # / Status / Amount,
-                    # y esas cuatro tambien estan en 'Paid Invoices', asi que sin
-                    # esto un cambio de tab pasa como si nada.
-                    required_columns=("Rejected Reason", "Aging"),
+                    exceptions=exceptions["invoices"],
+                    # Las 14 que el archivo lleva y ZipRide carga por nombre.
+                    # Antes eran solo 'Rejected Reason' y 'Aging', las dos que
+                    # distinguen el tab bueno del default —el invoice split solo
+                    # necesita Entry ID / Invoice # / Status / Amount, y esas
+                    # cuatro tambien estan en 'Paid Invoices'—. Pedirlas todas
+                    # cubre ademas el renombre: si Acumen le cambia el nombre a
+                    # cualquiera de las 14, la corrida para en vez de entregar un
+                    # archivo con una columna que el importador ya no encuentra.
+                    required_columns=INVOICE_COLUMNS,
+                    # 'Vendor Entry Status' lleva un filtro fijo del reporte,
+                    # `Status is not Paid`, asi que por si solo entrega el 8% de
+                    # las filas que el archivo llevaba antes del 2026-09-03:
+                    # 2.420 contra 100.462, porque los 96.660 pagados se fueron
+                    # a esta otra pestaña. Las dos se exportan y se unen.
+                    extra_tabs=("Paid Invoices",),
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.
@@ -272,7 +467,6 @@ class Command(BaseCommand):
             reports.append(
                 (settings.DCI_REPORT_URL_2, settings.DCI_REPORT_BUTTON_NAME_2)
             )
-        # R3 (Vendor Auth Accrual): tab con detalle PA + 2 date slicers.
         # R3 (Vendor Auth Accrual). Salia del tab 'PA Details and Schedule by
         # Client' hasta que el portal, el 2026-09-03, lo dejo devolviendo cero
         # filas salvo que se elija UN PA a mano — y son ~6.000. Ahora se arma
@@ -333,7 +527,26 @@ class Command(BaseCommand):
         # is closed, so the wait costs a sleeping worker and not a live session.
         deferred: list[tuple[Path, str]] = []
 
+        def _emptied_by(path: Path):
+            """The list that left this file with no data rows, if any."""
+            for spec in exceptions.values():
+                if spec is not None and path in spec.emptied:
+                    return spec
+            return None
+
         def _send(path: Path, display_name: str) -> None:
+            # Juan Pablo, 2026-09-07: "If an exclusion leaves a file with no data
+            # rows, I would not send it." Only that case — a pile that was empty
+            # before any exception is still emailed, because on those days the
+            # empty file is the answer.
+            emptied_by = _emptied_by(path)
+            if emptied_by is not None:
+                logger.warning(
+                    "[EXCEPTIONS] %s no se envia: la lista de %s lo dejo sin "
+                    "una sola fila", display_name, emptied_by.label,
+                )
+                path.unlink(missing_ok=True)
+                return
             subject_override = subject_override_for(
                 display_name, subject_label, settings.DCI_REPORT_BUTTON_NAME_3
             )
@@ -358,7 +571,44 @@ class Command(BaseCommand):
             # autorizaciones es la unica fuente fresca del lookup de PAs que el
             # accrual necesita, y corre en otra invocacion que el accrual.
             if display_name == settings.DCI_REPORT_BUTTON_NAME_2:
+                # Antes que nada: si el export ya no trae alguna de las columnas
+                # que ZipRide carga por nombre, este archivo no sale. R2 es un
+                # reenvio directo de lo que baja del portal, asi que sin esto un
+                # renombre de Acumen viaja hasta el importador, que deja de leer
+                # esa columna sin decir nada — y del lado nuestro el run sale
+                # verde. Se retiene igual que un fallo del filtro: se pierde R2,
+                # el invoice file sale igual.
+                try:
+                    require_known_columns(path, display_name, AUTH_COLUMNS)
+                except Exception as exc:
+                    logger.exception(
+                        "[REPORT] columnas inesperadas en %s", display_name
+                    )
+                    send_errors.append(f"{display_name}: {exc}")
+                    path.unlink(missing_ok=True)
+                    return
+                # El refresh va con el archivo ENTERO, antes de filtrarlo: una
+                # excepcion de auths saca la fila del mail, no del lookup, y si
+                # se filtrara primero ese PA quedaria congelado en la tabla que
+                # alimenta el accrual.
                 _refresh_pa_schedules(path)
+                drop = exceptions["auths"]
+                if drop is not None:
+                    try:
+                        _apply_exceptions_in_place(path, drop)
+                    except Exception as exc:
+                        # Este filtro corria dentro del loop de reportes simples
+                        # del scraper, que va ANTES del chunked: un rename de
+                        # columna en R2 mataba la corrida entera y no salia ni
+                        # el invoice file. Aca se pierde solo R2. No se manda sin
+                        # filtrar —serian filas que Paul saco— y el run queda
+                        # FAILED con aviso, no verde en silencio.
+                        logger.exception(
+                            "[EXCEPTIONS] no se pudo filtrar %s", display_name
+                        )
+                        send_errors.append(f"{display_name}: {exc}")
+                        path.unlink(missing_ok=True)
+                        return
             if no_email:
                 # --no-email: dejamos el archivo en output_dir para inspeccion.
                 sent.append(path.name)
@@ -381,7 +631,8 @@ class Command(BaseCommand):
                     on_report_ready=on_report_ready,
                     matrix_reports=matrix_reports,
                     assemble_matrix=lambda parts, name: _assemble_accrual(
-                        parts, name, output_dir, timestamp_label
+                        parts, name, output_dir, timestamp_label,
+                        exceptions["accruals"],
                     ),
                 )
             )
@@ -403,7 +654,7 @@ class Command(BaseCommand):
             if deferred:
                 # The payable pile is a delivery of its own. Losing it to a later
                 # failure — R3 timing out, or the soft limit landing inside the
-                # 20 minute wait — leaves the client holding rejections with no
+                # wait above — leaves the client holding rejections with no
                 # payables, and that has to be said out loud rather than hidden
                 # behind whatever raised.
                 messages.append(
@@ -411,6 +662,8 @@ class Command(BaseCommand):
                     + ", ".join(name for _, name in deferred)
                 )
             run.error_message = " | ".join(messages)
+            run.exceptions_summary = summarize(exceptions.values())
+            _stamp_matches_safely(exceptions, complete=False)
             run.finished_at = timezone.now()
             run.save()
             _notify_failure(run)
@@ -428,6 +681,8 @@ class Command(BaseCommand):
             logger.error("[email] %s", problem)
 
         run.filenames = ";".join(sent)
+        run.exceptions_summary = summarize(exceptions.values())
+        _stamp_matches_safely(exceptions)
         failures = send_errors + delivery_problems
         if failures:
             run.status = Run.Status.FAILED

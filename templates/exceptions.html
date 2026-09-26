@@ -25,13 +25,22 @@
       {{ shared|length }} invoice number{{ shared|length|pluralize }} on your list {{ shared|length|pluralize:"is,are" }} on more than one client&rsquo;s lines, and all of those lines are left out of the file
     </p>
     <p class="mt-1">
-      Click the client each one is meant for; the other clients&rsquo; lines go back into the file.
+      Go by what ZipRide&rsquo;s report said about the number.
+      &ldquo;Invoice not found in system&rdquo;: click <span class="font-medium">Every client</span>, and it stays out for all of them, including clients that turn up on it later.
+      &ldquo;Client mismatch&rdquo;: click <span class="font-medium">Only</span> the client after &ldquo;got&rdquo;, and the other clients&rsquo; lines go back into the file.
     </p>
     <ul class="mt-3 space-y-3">
       {% for e, clients in shared %}
         <li>
           <span class="font-mono font-medium">{{ e.key_1 }}</span>
           <div class="mt-1 flex flex-wrap gap-2">
+            <form method="post" action="{% url 'exception_keep_all' spec.slug e.pk %}" class="inline" onsubmit="this.querySelector('button').disabled = true;">
+              {% csrf_token %}
+              <button type="submit"
+                      class="text-xs px-2 py-1 rounded border border-amber-400 bg-white hover:bg-amber-100">
+                Every client, now and later
+              </button>
+            </form>
             {% for number, name in clients %}
               <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline" onsubmit="this.querySelector('button').disabled = true;">
                 {% csrf_token %}
@@ -42,14 +51,6 @@
                 </button>
               </form>
             {% endfor %}
-            <form method="post" action="{% url 'exception_narrow' spec.slug e.pk %}" class="inline" onsubmit="this.querySelector('button').disabled = true;">
-              {% csrf_token %}
-              {% for number, name in clients %}<input type="hidden" name="client" value="{{ number }}">{% endfor %}
-              <button type="submit"
-                      class="text-xs px-2 py-1 rounded border border-amber-400 bg-white hover:bg-amber-100">
-                All of them, as now
-              </button>
-            </form>
             <form method="post" action="{% url 'exception_remove' spec.slug e.pk %}" class="inline"
                   onsubmit="if (!confirm('Remove {{ e.key_display|escapejs }}?')) return false; this.querySelector('button').disabled = true;">
               {% csrf_token %}
@@ -202,7 +203,7 @@
       <p class="text-sm text-slate-600 mb-4">
         An Excel file whose first sheet has a column header named
         {% for column in spec.required_columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}.
-        {% if spec.optional_columns %}If the sheet also has a <span class="font-mono">{{ spec.optional_columns.0 }}</span> column it is used, and each entry is narrowed to that client.{% endif %}
+        {% if spec.optional_columns %}If the sheet also has a <span class="font-mono">{{ spec.optional_columns.0 }}</span> column it is used, and each entry is narrowed to that client &mdash; except the rows ZipRide&rsquo;s report refused for the number itself (&ldquo;Invoice not found in system&rdquo;, or an invalid invoice number), which stay out for every client.{% endif %}
         {% if spec.required == 1 %}A single column of numbers with nothing above it works too.{% endif %}
         Other columns are ignored. You see what was read before anything is saved.
       </p>

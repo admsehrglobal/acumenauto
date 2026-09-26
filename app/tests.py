@@ -21,6 +21,7 @@ from django.utils.html import escape
 from openpyxl import Workbook
 
 from app import scraper
+from app.file_exceptions import RowFilter
 from app.management.commands.download_report import _load_exceptions, _stamp_matches
 from app.models import FileException, FileExceptionChange, Run, SharedKey
 
@@ -566,11 +567,125 @@ class FileExceptionsPagesTests(TestCase):
         self._submit("Only NJ00006730 Burke, M.")
         self.assertEqual(self._active(), [("119344", "NJ00006730")])
 
-    def test_all_of_them_as_rendered_keeps_every_client(self):
+    def test_every_client_as_rendered_keeps_the_number_for_every_client(self):
         self._shared_119344()
-        self._submit("All of them, as now")
+        response = self._submit("Every client, now and later")
+        self.assertContains(
+            response,
+            "119344 stays out of the file for every client, including any that "
+            "turn up later.",
+        )
+        self.assertNotContains(response, self.NOTICE)
+        self.assertEqual(self._active(), [("119344", "")])
+        self.assertIsNotNone(FileException.objects.get().every_client_at)
         self.assertEqual(
-            self._active(), [("119344", "NJ00006516"), ("119344", "NJ00006730")]
+            list(
+                FileExceptionChange.objects.filter(action="kept")
+                .values_list("entry__key_1", "by")
+            ),
+            [("119344", "paul")],
+        )
+
+    def test_a_number_kept_for_every_client_drops_a_client_no_run_has_seen(self):
+        """What 'All of them, as now' got wrong: it named the clients of the
+        day and left the number open to the next one, unflagged."""
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        spec = _load_exceptions()["invoices"]
+        row_filter = RowFilter(["Invoice #", "Client Number"], spec)
+        self.assertTrue(row_filter.drops(["119344", "NJ99999999"]))
+        self.assertEqual(spec.every_client, frozenset({("119344",)}))
+
+    def test_naming_a_client_leaves_a_number_kept_for_every_client_alone(self):
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        response = self._add("invoices", key_1="119344", key_2="NJ00006730")
+        self.assertContains(response, "119344 / NJ00006730 added.")
+        self.assertEqual(
+            self._active(), [("119344", ""), ("119344", "NJ00006730")]
+        )
+
+    def test_an_upload_naming_a_client_does_not_announce_replacing_it(self):
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        content = _xlsx([
+            ["External Invoice Number", "Client Number"],
+            ["119344", "NJ00006730"],
+        ])
+        preview, _ = self._confirm("invoices", content)
+        self.assertNotContains(preview, "applies to every Client Number")
+        self.assertEqual(
+            self._active(), [("119344", ""), ("119344", "NJ00006730")]
+        )
+
+    def test_a_removed_number_forgets_every_client_and_is_asked_about_again(self):
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        entry.refresh_from_db()
+        self.assertIsNone(entry.every_client_at)
+
+        response = self._add("invoices", key_1="119344")
+        self.assertContains(response, self.NOTICE)
+
+    def test_every_client_only_takes_an_entry_with_no_client(self):
+        self._add("invoices", key_1="119344", key_2="NJ00006730")
+        entry = FileException.objects.get()
+        response = self.client.post(
+            reverse("exception_keep_all", args=["invoices", entry.pk])
+        )
+        self.assertEqual(response.status_code, 404)
+        entry.refresh_from_db()
+        self.assertIsNone(entry.every_client_at)
+
+    def test_only_a_client_names_every_client_still_left_out(self):
+        """A client with its own entry for the number stays out after the
+        click; the message used to tell Paul its lines go back."""
+        self._add("invoices", key_1="119344", key_2="NJ00006516")
+        self._add("invoices", key_1="119344")
+        self._run_saw({"119344": [self.BURKE, self.BURKERT]})
+        response = self._submit("Only NJ00006730 Burke, M.")
+        self.assertContains(
+            response,
+            "119344 now leaves out only NJ00006516 Burkert, H.; NJ00006730 Burke, M.",
+        )
+        self.assertNotContains(response, "go back into the file")
+
+    def test_zipride_s_refusals_uploaded_as_they_come_stay_for_every_client(self):
+        """ZipRide's 2026-09-03 report as it comes out. Read with its client,
+        each number was narrowed to the one client the report names; 423 of its
+        428 are on the live list with no client."""
+        self._add("invoices", key_1="26")
+        content = _xlsx([
+            ["Row", "External Invoice Number", "Client Number", "Client Name",
+             "Review Reason", "Error Description"],
+            [941, "26", "NJ00007458", "Larsen, M.", "", "Invoice not found in system"],
+            [942, "TCG1", "NJ00000107", "Moore, A.", "",
+             "External Invoice Number has invalid format"],
+        ])
+        preview, response = self._confirm("invoices", content)
+        self.assertContains(preview, "2 of these ZipRide refused for the number itself")
+        self.assertNotContains(preview, "applies to every Client Number")
+        self.assertContains(
+            response,
+            "list.xlsx: 1 added, 1 already on your list, 2 for every Client Number "
+            "(refused by ZipRide for the number itself).",
+        )
+        self.assertEqual(self._active(), [("26", ""), ("TCG1", "")])
+        self.assertEqual(
+            sorted(
+                FileException.objects.filter(every_client_at__isnull=False)
+                .values_list("key_1", flat=True)
+            ),
+            ["26", "TCG1"],
+        )
+        self.assertEqual(
+            sorted(
+                FileExceptionChange.objects.filter(action="kept")
+                .values_list("entry__key_1", flat=True)
+            ),
+            ["26", "TCG1"],
         )
 
     def test_none_as_rendered_takes_the_number_off(self):

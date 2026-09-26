@@ -278,7 +278,9 @@ def _report_spec(report: str):
     return spec
 
 
-def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
+def _add_keys(
+    report: str, keys, actor: str, every_client=()
+) -> tuple[int, int, int, int]:
     """Create the keys that are new, restore the ones removed earlier.
 
     Returns (added, restored, already listed, narrowed). Keys arrive normalised
@@ -286,6 +288,10 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     They are matched folded (`fold_key`), the same way the run matches them
     against the export, so `AB12` after `ab12` is "already listed" and not a
     second entry that would look live and drop nothing.
+
+    `every_client` are keys of this batch, with no client, to mark as meant for
+    every client (`FileException.every_client_at`): an upload of ZipRide's
+    report sends the numbers it refused for the number itself.
     """
     now = timezone.now()
     stored = {
@@ -296,8 +302,10 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     to_create: list[FileException] = []
     to_restore: list[FileException] = []
     to_narrow: list[FileException] = []
+    to_keep: list[FileException] = []
     already = 0
     spoken_for = _bare_keys(keys)
+    keep = {fold_key((key[0], "")) for key in every_client}
     for key in keys:
         parts = (key[0], key[1] if len(key) > 1 else "")
         folded = fold_key(parts)
@@ -318,6 +326,9 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
             entry.removed_at = None
             entry.removed_by = ""
             to_restore.append(entry)
+        if folded in keep and entry.every_client_at is None:
+            entry.every_client_at = now
+            to_keep.append(entry)
         # An entry naming a client is dead weight while the bare key is also
         # listed: `RowFilter.drops` tries the key with its optional parts
         # blanked, so the wildcard drops the row whoever the client is, and the
@@ -326,11 +337,16 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
         # wildcard this same upload asks for, because a row with no client says
         # "every client" in so many words and an upload does not get to argue
         # with itself, and anything not already stored, which has no history to
-        # replace.
+        # replace. Nor one meant for every client: a client named next to it
+        # adds nothing it does not already cover.
         bare = fold_key((parts[0], ""))
         if parts[1] and bare not in spoken_for:
             wildcard = stored.get(bare)
-            if wildcard is not None and wildcard.active:
+            if (
+                wildcard is not None
+                and wildcard.active
+                and wildcard.every_client_at is None
+            ):
                 wildcard.removed_at = now
                 wildcard.removed_by = actor
                 to_narrow.append(wildcard)
@@ -339,6 +355,7 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     # live —dropping rows from tomorrow's file— with nothing in the record
     # saying they were added, and `exception_upload_confirm` tells the operator
     # the upload failed while the list has in fact changed.
+    kept_existing = [e for e in to_keep if e.pk is not None]
     with transaction.atomic():
         FileException.objects.bulk_create(to_create, batch_size=500)
         if to_restore or to_narrow:
@@ -346,9 +363,14 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
                 to_restore + to_narrow, ["removed_at", "removed_by"],
                 batch_size=500,
             )
+        if kept_existing:
+            FileException.objects.bulk_update(
+                kept_existing, ["every_client_at"], batch_size=500
+            )
         _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
         _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
         _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
+        _log_changes(to_keep, FileExceptionChange.KEPT, actor, now)
     return len(to_create), len(to_restore), already, len(to_narrow)
 
 
@@ -399,7 +421,8 @@ def _count_narrowing(report: str, spec, keys) -> int:
     return sum(
         1
         for entry in FileException.objects.filter(
-            report=report, key_2="", removed_at__isnull=True
+            report=report, key_2="", removed_at__isnull=True,
+            every_client_at__isnull=True,
         )
         if fold_key((entry.key_1, "")) in wanted
     )
@@ -422,6 +445,11 @@ def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) ->
         parts.append(
             f"{narrowed:,} {entries} narrowed to the "
             f"{spec.columns[spec.required]} in the file"
+        )
+    if parsed.every_client:
+        parts.append(
+            f"{len(parsed.every_client):,} for every "
+            f"{spec.columns[spec.required]} (refused by ZipRide for the number itself)"
         )
     if parsed.duplicates:
         parts.append(f"{parsed.duplicates:,} repeated in the file")
@@ -485,7 +513,7 @@ def _shared_on_list(report: str) -> list:
     Read against the list as it is NOW, so a number Paul has just added shows up
     at once, and one he has just narrowed is gone at once. On a list of
     thousands a mark on the row would sit on page 60, so the page puts these on
-    top.
+    top. An entry meant for every client is not asked about again.
     """
     shared = {
         s.key_1: s.client_list for s in SharedKey.objects.filter(report=report)
@@ -493,7 +521,8 @@ def _shared_on_list(report: str) -> list:
     if not shared:
         return []
     entries = FileException.objects.filter(
-        report=report, key_2="", removed_at__isnull=True
+        report=report, key_2="", removed_at__isnull=True,
+        every_client_at__isnull=True,
     ).annotate(folded=Lower("key_1")).filter(folded__in=list(shared))
     return [(e, shared[e.folded]) for e in entries]
 
@@ -597,6 +626,7 @@ def exception_upload(request, report: str):
                     "blank": parsed.blank,
                     "duplicates": parsed.duplicates,
                     "too_long": parsed.too_long,
+                    "every_client": FileExceptionConfirmForm.pack(parsed.every_client),
                 },
             ),
         },
@@ -614,7 +644,7 @@ def exception_upload_confirm(request, report: str):
     parsed = form.parsed()
     try:
         added, restored, already, narrowed = _add_keys(
-            report, parsed.keys, request.user.username
+            report, parsed.keys, request.user.username, parsed.every_client
         )
     except Exception as exc:  # noqa: BLE001 - a database error is not a read error
         messages.error(
@@ -657,13 +687,51 @@ def exception_narrow(request, report: str, pk: int):
         )
         return redirect("exceptions_list", report=report)
     _add_keys(report, [(entry.key_1, c) for c in chosen], request.user.username)
-    names = "; ".join(f"{c} {offered[c]}".strip() for c in chosen)
+    # What is left out is what the list now names, not only what was clicked: a
+    # client with its own entry for this number stays out after the click.
+    named = {
+        client.lower()
+        for client in FileException.objects.filter(
+            report=report, removed_at__isnull=True
+        )
+        .annotate(folded=Lower("key_1"))
+        .filter(folded=entry.key_1.lower())
+        .exclude(key_2="")
+        .values_list("key_2", flat=True)
+    }
+    out = [c for c in offered if c.lower() in named]
+    names = "; ".join(f"{c} {offered[c]}".strip() for c in out)
     # No full stop after the names: they end in one ("Burke, M.").
     back = (
         " — the other clients' lines go back into the file."
-        if len(chosen) < len(offered) else ""
+        if len(out) < len(offered) else ""
     )
     messages.success(request, f"{entry.key_1} now leaves out only {names}{back}")
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_keep_all(request, report: str, pk: int):
+    """'Every client' from the notice: the entry with no client stays, for the
+    clients on the number today and for any that turn up later, and the notice
+    stops asking about it."""
+    _report_spec(report)
+    entry = get_object_or_404(
+        FileException, pk=pk, report=report, key_2="", removed_at__isnull=True
+    )
+    if entry.every_client_at is None:
+        now = timezone.now()
+        with transaction.atomic():
+            entry.every_client_at = now
+            entry.save(update_fields=["every_client_at"])
+            _log_changes([entry], FileExceptionChange.KEPT,
+                         request.user.username, now)
+    messages.success(
+        request,
+        f"{entry.key_1} stays out of the file for every client, "
+        "including any that turn up later.",
+    )
     return redirect("exceptions_list", report=report)
 
 
@@ -677,7 +745,10 @@ def exception_remove(request, report: str, pk: int):
         with transaction.atomic():
             entry.removed_at = now
             entry.removed_by = request.user.username
-            entry.save(update_fields=["removed_at", "removed_by"])
+            # Taken off, it is no longer meant for anyone: added back later,
+            # the notice asks about it again.
+            entry.every_client_at = None
+            entry.save(update_fields=["removed_at", "removed_by", "every_client_at"])
             _log_changes([entry], FileExceptionChange.REMOVED,
                          request.user.username, now)
         messages.success(request, f"{entry.key_display} removed.")

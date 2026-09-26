@@ -162,6 +162,14 @@ class FileException(models.Model):
     # is checked and never matches is a typo, and until now nothing said so.
     last_checked_at = models.DateTimeField(null=True, blank=True)
     last_matched_at = models.DateTimeField(null=True, blank=True)
+    # Set on an entry with no client that is meant for every client, now and
+    # later. ZipRide's "Invoice not found in system" is a verdict on the number,
+    # not on one client's line: on 2026-09-25 narrowing five such numbers to the
+    # client the report named sent six other clients' lines to ZipRide, and
+    # naming every client instead left the number open to any client that
+    # turns up later. The notice leaves such an entry alone, and nothing that
+    # names a client takes it off the list.
+    every_client_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -202,7 +210,13 @@ class FileExceptionChange(models.Model):
     ADDED = "added"
     REMOVED = "removed"
     RESTORED = "restored"
-    ACTIONS = [(ADDED, "Added"), (REMOVED, "Removed"), (RESTORED, "Restored")]
+    KEPT = "kept"
+    ACTIONS = [
+        (ADDED, "Added"),
+        (REMOVED, "Removed"),
+        (RESTORED, "Restored"),
+        (KEPT, "Kept for every client"),
+    ]
 
     entry = models.ForeignKey(
         FileException, on_delete=models.CASCADE, related_name="changes"

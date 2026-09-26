@@ -85,7 +85,11 @@ class LateEntryTests(unittest.TestCase):
 
         def _filter(**kwargs):
             query = mock.Mock()
-            query.values_list.side_effect = lambda *a: list(self.live[kwargs["report"]])
+            if "every_client_at__isnull" in kwargs:
+                # No entry here is meant for every client.
+                query.values_list.side_effect = lambda *a, **kw: []
+            else:
+                query.values_list.side_effect = lambda *a: list(self.live[kwargs["report"]])
             return query
 
         config = mock.Mock(report_1_enabled=True, report_2_enabled=False,

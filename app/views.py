@@ -325,11 +325,8 @@ def _add_keys(
             # in between; the log below is what carries "added again".
             entry.removed_at = None
             entry.removed_by = ""
-            # Added back by hand, the number is asked about again; only a batch
-            # that says "every client" keeps the mark. (Restore on the page is
-            # the undo of a removal and brings the mark back as it was.)
-            if folded not in keep:
-                entry.every_client_at = None
+            # An every-client mark comes back with the row, as with Restore: it
+            # belongs to the entry, and the list shows it.
             to_restore.append(entry)
         if folded in keep and entry.every_client_at is None:
             entry.every_client_at = now
@@ -365,21 +362,29 @@ def _add_keys(
         FileException.objects.bulk_create(to_create, batch_size=500)
         if to_restore or to_narrow:
             FileException.objects.bulk_update(
-                to_restore + to_narrow,
-                ["removed_at", "removed_by", "every_client_at"],
+                to_restore + to_narrow, ["removed_at", "removed_by"],
                 batch_size=500,
             )
         if kept_existing:
             FileException.objects.bulk_update(
                 kept_existing, ["every_client_at"], batch_size=500
             )
-        # The marks first: the page shows the latest 25 changes, and an upload
-        # of ZipRide's report marks hundreds of entries at once, which would
-        # otherwise push the few that were added or came back off the panel.
-        _log_changes(to_keep, FileExceptionChange.KEPT, actor, now)
+        # Marks on entries that were already on the list go first: the page
+        # shows the latest 25 changes, and an upload of ZipRide's report marks
+        # hundreds at once, which would push what was added or came back off
+        # the panel. An entry added or restored here is marked after it is.
+        returning = {id(e) for e in to_create + to_restore}
+        _log_changes(
+            [e for e in to_keep if id(e) not in returning],
+            FileExceptionChange.KEPT, actor, now,
+        )
         _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
         _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
         _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
+        _log_changes(
+            [e for e in to_keep if id(e) in returning],
+            FileExceptionChange.KEPT, actor, now,
+        )
     return len(to_create), len(to_restore), already, len(to_narrow)
 
 
@@ -441,6 +446,8 @@ def _kept_numbers(report: str, keys) -> set:
     """The numbers this batch names a client for while the list keeps the
     number on its own for every client: naming the client changes nothing in
     the file, and Paul has to be told, not shown a plain "added"."""
+    if not REPORTS[report].optional_columns:
+        return set()
     named = {
         fold_key((key[0], "")) for key in keys if len(key) > 1 and key[1]
     } - _bare_keys(keys)
@@ -457,6 +464,14 @@ def _kept_numbers(report: str, keys) -> set:
         )
         if folded in named
     }
+
+
+def _kept_note(spec, number: str) -> str:
+    column = spec.columns[spec.required]
+    return (
+        f"{number} on its own stays on the list for every {column}, so the file "
+        f"does not change. To leave out only this {column}, remove {number}."
+    )
 
 
 def _upload_counts(
@@ -592,16 +607,15 @@ def exception_add(request, report: str):
         report, [form.cleaned_key], request.user.username
     )
     shown = _show_key(form.cleaned_key)
-    if already:
+    if already and kept:
+        messages.info(
+            request, f"{shown} is already listed. But {_kept_note(spec, form.cleaned_key[0])}"
+        )
+    elif already:
         messages.info(request, f"{shown} is already listed.")
     elif kept:
-        number = form.cleaned_key[0]
-        column = spec.columns[spec.required]
         messages.info(
-            request,
-            f"{shown} added, but {number} on its own stays on the list for every "
-            f"{column}, so the file does not change. To leave out only this "
-            f"{column}, remove {number}.",
+            request, f"{shown} added, but {_kept_note(spec, form.cleaned_key[0])}"
         )
     elif narrowed:
         messages.success(
@@ -749,6 +763,11 @@ def exception_narrow(request, report: str, pk: int):
             "client's lines, or no longer on the list on its own.",
         )
         return redirect("exceptions_list", report=report)
+    if set(chosen) == set(offered):
+        # What the old 'All of them, as now' button posted, from a page left
+        # open across the release: naming every client of the day left the
+        # number open to the next one, so it is taken as every client.
+        return _keep_for_every_client(request, report, entry)
     _add_keys(report, [(entry.key_1, c) for c in chosen], request.user.username)
     # What is left out is what the list now names, not only what was clicked: a
     # client with its own entry for this number stays out after the click.
@@ -789,6 +808,10 @@ def exception_keep_all(request, report: str, pk: int):
             f"Nothing changed: {entry.key_1} is no longer on the list on its own.",
         )
         return redirect("exceptions_list", report=report)
+    return _keep_for_every_client(request, report, entry)
+
+
+def _keep_for_every_client(request, report: str, entry: FileException):
     if entry.every_client_at is None:
         now = timezone.now()
         with transaction.atomic():
@@ -838,6 +861,13 @@ def exception_restore(request, report: str, pk: int):
             entry.save(update_fields=["removed_at", "removed_by"])
             _log_changes([entry], FileExceptionChange.RESTORED,
                          request.user.username, timezone.now())
-        messages.success(request, f"{entry.key_display} restored.")
+        spec = REPORTS[report]
+        if entry.key_2 and _kept_numbers(report, [(entry.key_1, entry.key_2)]):
+            messages.info(
+                request,
+                f"{entry.key_display} restored, but {_kept_note(spec, entry.key_1)}",
+            )
+        else:
+            messages.success(request, f"{entry.key_display} restored.")
     return redirect("exceptions_list", report=report)
 

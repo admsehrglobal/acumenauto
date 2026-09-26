@@ -105,7 +105,7 @@
                   <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">{{ e.key_1 }}</td>
                   {% if spec.columns|length > 1 %}
                     <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">
-                      {% if e.key_2 %}{{ e.key_2 }}{% elif e.every_client_at %}<span class="text-slate-500 font-sans">every client, now and later</span>{% else %}<span class="text-slate-400 font-sans">any</span>{% endif %}
+                      {% if e.key_2 %}{{ e.key_2 }}{% elif e.every_client_at %}<span class="text-slate-400 font-sans" title="Marked 'Every client': the notice does not ask about it again">any &middot; kept for every client</span>{% else %}<span class="text-slate-400 font-sans">any</span>{% endif %}
                     </td>
                   {% endif %}
                   <td class="px-4 py-2 text-slate-500 text-xs whitespace-nowrap">

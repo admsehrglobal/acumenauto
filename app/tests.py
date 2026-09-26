@@ -484,22 +484,27 @@ class FileExceptionsPagesTests(TestCase):
             [("", "added"), ("", "removed"), ("NJ00006730", "added")],
         )
 
-    def test_all_of_them_keeps_every_client_by_name(self):
+    def test_naming_every_client_of_the_day_means_every_client(self):
+        """What the old 'All of them, as now' button posted, from a page open
+        across the release: it named the day's clients and left the number open
+        to the next one. Taken as 'Every client' instead."""
         self._add("invoices", key_1="119344")
         self._run_saw({"119344": [self.BURKE, self.BURKERT]})
         wildcard = FileException.objects.get(key_1="119344", key_2="")
 
         response = self._narrow(wildcard, "NJ00006730", "NJ00006516")
 
-        self.assertNotContains(response, "go back into the file")
+        self.assertContains(response, "119344 stays out of the file for every client")
         self.assertNotContains(response, self.NOTICE)
         self.assertEqual(
             sorted(
                 FileException.objects.filter(removed_at__isnull=True)
                 .values_list("key_1", "key_2")
             ),
-            [("119344", "NJ00006516"), ("119344", "NJ00006730")],
+            [("119344", "")],
         )
+        wildcard.refresh_from_db()
+        self.assertIsNotNone(wildcard.every_client_at)
 
     def test_a_client_the_run_did_not_see_changes_nothing(self):
         """The buttons offer only what the last run found; a stale page or a
@@ -633,20 +638,49 @@ class FileExceptionsPagesTests(TestCase):
 
     def test_the_list_shows_a_number_kept_for_every_client(self):
         self._shared_119344()
-        self.assertNotContains(self._page(), "every client, now and later")
+        self.assertNotContains(self._page(), "any &middot; kept for every client")
         self._submit("Every client, now and later")
-        self.assertContains(self._page(), "every client, now and later")
+        self.assertContains(self._page(), "any &middot; kept for every client")
 
-    def test_a_number_added_back_by_hand_is_asked_about_again(self):
+    def test_a_number_added_back_by_hand_keeps_its_mark(self):
+        """The mark belongs to the entry, whichever way it comes back."""
         self._shared_119344()
         self._submit("Every client, now and later")
         entry = FileException.objects.get()
         self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
 
         response = self._add("invoices", key_1="119344")
-        self.assertContains(response, self.NOTICE)
+        self.assertNotContains(response, self.NOTICE)
         entry.refresh_from_db()
-        self.assertIsNone(entry.every_client_at)
+        self.assertTrue(entry.active)
+        self.assertIsNotNone(entry.every_client_at)
+
+    def test_an_entry_already_listed_under_a_kept_number_says_so(self):
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        self._add("invoices", key_1="119344", key_2="NJ00006730")
+        response = self._add("invoices", key_1="119344", key_2="NJ00006730")
+        self.assertContains(
+            response,
+            "119344 / NJ00006730 is already listed. But 119344 on its own stays on "
+            "the list for every Client Number",
+        )
+
+    def test_restoring_an_entry_under_a_kept_number_says_so(self):
+        self._add("invoices", key_1="119344", key_2="NJ00006730")
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        named = FileException.objects.get(key_2="NJ00006730")
+        self.client.post(reverse("exception_remove", args=["invoices", named.pk]))
+
+        response = self.client.post(
+            reverse("exception_restore", args=["invoices", named.pk]), follow=True
+        )
+        self.assertContains(
+            response,
+            "119344 / NJ00006730 restored, but 119344 on its own stays on the list "
+            "for every Client Number",
+        )
 
     def test_restore_brings_the_mark_back_as_it_was(self):
         """Restore is the page's undo of a removal."""
@@ -734,9 +768,18 @@ class FileExceptionsPagesTests(TestCase):
             "list.xlsx: 1 added, 1 already on your list. 2 of them stay out for "
             "every Client Number: ZipRide refused the number itself.",
         )
-        # The panel shows the latest 25 changes: what was added sorts above
-        # the marks, which an upload of the whole report makes by the hundred.
-        self.assertEqual(FileExceptionChange.objects.first().action, "added")
+        # The panel shows the latest 25 changes: marks on entries already listed
+        # (an upload of the whole report makes them by the hundred) sort below
+        # what was added; a new entry is marked after it is added.
+        log = FileExceptionChange.objects.order_by("id")
+        self.assertEqual(
+            list(log.filter(entry__key_1="TCG1").values_list("action", flat=True)),
+            ["added", "kept"],
+        )
+        self.assertLess(
+            log.get(entry__key_1="26", action="kept").id,
+            log.get(entry__key_1="TCG1", action="added").id,
+        )
         self.assertEqual(self._active(), [("26", ""), ("TCG1", "")])
         self.assertEqual(
             sorted(

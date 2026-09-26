@@ -326,16 +326,32 @@ class UploadAliasTests(unittest.TestCase):
         rows = [
             self.ZIPRIDE_HEADER,
             [941, "1", "NJ00007458", "Larsen, M.", "", "Invoice not found in system"],
-            [7, "Smith 12", "NJ00000107", "Moore, A.", "",
-             "External Invoice Number has invalid format"],
+            # The real shape of a format refusal: number and client cells empty,
+            # the value quoted in the reason (674 of 674 on 2026-09-03).
+            [4213, "", "", "Tomkievicz, R.", "",
+             "External Invoice Number has invalid format: 'TCG83BF8D8'"],
             [9447, "99004", "NJ00006544", "Lee, B.",
              "Client mismatch: expected NJ00013618, got NJ00006544", ""],
         ]
         parsed = parse_upload(rows, REPORTS["invoices"])
         self.assertEqual(
-            parsed.keys, [("1", ""), ("Smith 12", ""), ("99004", "NJ00006544")]
+            parsed.keys, [("1", ""), ("TCG83BF8D8", ""), ("99004", "NJ00006544")]
         )
-        self.assertEqual(parsed.every_client, (("1", ""), ("Smith 12", "")))
+        self.assertEqual(parsed.every_client, (("1", ""), ("TCG83BF8D8", "")))
+        self.assertEqual(parsed.blank, 0)
+
+    def test_a_format_refusal_keeps_a_name_as_it_is_quoted(self):
+        rows = [
+            self.ZIPRIDE_HEADER,
+            [5, "", "", "Sakala, C.", "",
+             "External Invoice Number has invalid format: 'Sakala Corinne'"],
+            # Without the quoted value there is nothing to add: still skipped.
+            [6, "", "", "X", "", "External Invoice Number has invalid format"],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("Sakala Corinne", "")])
+        self.assertEqual(parsed.every_client, (("Sakala Corinne", ""),))
+        self.assertEqual(parsed.blank, 1)
 
     def test_one_number_refused_under_two_clients_is_one_entry(self):
         rows = [

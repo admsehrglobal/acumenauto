@@ -325,6 +325,11 @@ def _add_keys(
             # in between; the log below is what carries "added again".
             entry.removed_at = None
             entry.removed_by = ""
+            # Added back by hand, the number is asked about again; only a batch
+            # that says "every client" keeps the mark. (Restore on the page is
+            # the undo of a removal and brings the mark back as it was.)
+            if folded not in keep:
+                entry.every_client_at = None
             to_restore.append(entry)
         if folded in keep and entry.every_client_at is None:
             entry.every_client_at = now
@@ -360,17 +365,21 @@ def _add_keys(
         FileException.objects.bulk_create(to_create, batch_size=500)
         if to_restore or to_narrow:
             FileException.objects.bulk_update(
-                to_restore + to_narrow, ["removed_at", "removed_by"],
+                to_restore + to_narrow,
+                ["removed_at", "removed_by", "every_client_at"],
                 batch_size=500,
             )
         if kept_existing:
             FileException.objects.bulk_update(
                 kept_existing, ["every_client_at"], batch_size=500
             )
+        # The marks first: the page shows the latest 25 changes, and an upload
+        # of ZipRide's report marks hundreds of entries at once, which would
+        # otherwise push the few that were added or came back off the panel.
+        _log_changes(to_keep, FileExceptionChange.KEPT, actor, now)
         _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
         _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
         _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
-        _log_changes(to_keep, FileExceptionChange.KEPT, actor, now)
     return len(to_create), len(to_restore), already, len(to_narrow)
 
 
@@ -428,14 +437,40 @@ def _count_narrowing(report: str, spec, keys) -> int:
     )
 
 
-def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) -> str:
+def _kept_numbers(report: str, keys) -> set:
+    """The numbers this batch names a client for while the list keeps the
+    number on its own for every client: naming the client changes nothing in
+    the file, and Paul has to be told, not shown a plain "added"."""
+    named = {
+        fold_key((key[0], "")) for key in keys if len(key) > 1 and key[1]
+    } - _bare_keys(keys)
+    if not named:
+        return set()
+    return {
+        folded
+        for folded in (
+            fold_key((entry.key_1, ""))
+            for entry in FileException.objects.filter(
+                report=report, key_2="", removed_at__isnull=True,
+                every_client_at__isnull=False,
+            )
+        )
+        if folded in named
+    }
+
+
+def _upload_counts(
+    spec, added: int, already: int, parsed, narrowed: int = 0, kept: int = 0
+) -> str:
     """The numbers of one upload, each under its own name.
 
     They used to share two labels: the repeats inside Paul's own file were
     added to the entries already on the list, so uploading the accruals export
     against an EMPTY list read "7568 added, 262805 already listed" - none of
     those 262,805 were on any list. Zero counts are left out rather than
-    printed, so the usual upload reads as one short sentence.
+    printed, so the usual upload reads as one short sentence. What applies to
+    entries already counted (the every-client ones) follows as its own
+    sentence, so it is not read as more entries.
     """
     parts = [f"{added:,} added"]
     if already:
@@ -445,11 +480,6 @@ def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) ->
         parts.append(
             f"{narrowed:,} {entries} narrowed to the "
             f"{spec.columns[spec.required]} in the file"
-        )
-    if parsed.every_client:
-        parts.append(
-            f"{len(parsed.every_client):,} for every "
-            f"{spec.columns[spec.required]} (refused by ZipRide for the number itself)"
         )
     if parsed.duplicates:
         parts.append(f"{parsed.duplicates:,} repeated in the file")
@@ -465,7 +495,20 @@ def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) ->
             f"{parsed.too_long:,} {rows} skipped for a value longer than "
             f"{MAX_KEY_LENGTH} characters"
         )
-    return ", ".join(parts) + "."
+    message = ", ".join(parts) + "."
+    column = spec.columns[spec.required] if spec.required < len(spec.columns) else ""
+    if parsed.every_client:
+        message += (
+            f" {len(parsed.every_client):,} of them stay out for every {column}: "
+            "ZipRide refused the number itself."
+        )
+    if kept:
+        numbers = "number" if kept == 1 else "numbers"
+        message += (
+            f" Naming a {column} changes nothing for {kept:,} {numbers} your list "
+            f"keeps for every {column}."
+        )
+    return message
 
 
 @login_required
@@ -544,12 +587,22 @@ def exception_add(request, report: str):
         return render(
             request, "exceptions.html", _exceptions_context(request, spec, form)
         )
+    kept = _kept_numbers(report, [form.cleaned_key])
     added, restored, already, narrowed = _add_keys(
         report, [form.cleaned_key], request.user.username
     )
     shown = _show_key(form.cleaned_key)
     if already:
         messages.info(request, f"{shown} is already listed.")
+    elif kept:
+        number = form.cleaned_key[0]
+        column = spec.columns[spec.required]
+        messages.info(
+            request,
+            f"{shown} added, but {number} on its own stays on the list for every "
+            f"{column}, so the file does not change. To leave out only this "
+            f"{column}, remove {number}.",
+        )
     elif narrowed:
         messages.success(
             request,
@@ -608,6 +661,7 @@ def exception_upload(request, report: str):
             # and a removal is the half worth seeing first: those rows start
             # coming through again in tomorrow's file.
             "narrowing": _count_narrowing(report, spec, parsed.keys),
+            "kept": len(_kept_numbers(report, parsed.keys)),
             "narrowed_by": spec.columns[spec.required]
             if spec.required < len(spec.columns)
             else "",
@@ -643,6 +697,7 @@ def exception_upload_confirm(request, report: str):
         return redirect("exceptions_list", report=report)
     parsed = form.parsed()
     try:
+        kept = len(_kept_numbers(report, parsed.keys))
         added, restored, already, narrowed = _add_keys(
             report, parsed.keys, request.user.username, parsed.every_client
         )
@@ -656,7 +711,7 @@ def exception_upload_confirm(request, report: str):
     report_message(
         request,
         f"{form.cleaned_data['filename']}: "
-        f"{_upload_counts(spec, added + restored, already, parsed, narrowed)}",
+        f"{_upload_counts(spec, added + restored, already, parsed, narrowed, kept)}",
     )
     return redirect("exceptions_list", report=report)
 
@@ -679,6 +734,14 @@ def exception_narrow(request, report: str, pk: int):
         )
     )
     chosen = [c for c in request.POST.getlist("client") if c in offered]
+    if not chosen and entry.active and entry.every_client_at is not None:
+        # A notice left open after 'Every client' was clicked elsewhere.
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} stays out for every client. To "
+            f"leave out only one client, remove {entry.key_1} first.",
+        )
+        return redirect("exceptions_list", report=report)
     if not chosen:
         messages.info(
             request,
@@ -717,9 +780,15 @@ def exception_keep_all(request, report: str, pk: int):
     clients on the number today and for any that turn up later, and the notice
     stops asking about it."""
     _report_spec(report)
-    entry = get_object_or_404(
-        FileException, pk=pk, report=report, key_2="", removed_at__isnull=True
-    )
+    entry = get_object_or_404(FileException, pk=pk, report=report, key_2="")
+    if not entry.active:
+        # A notice left open after 'Only' or 'None' was clicked: say so, as
+        # `exception_narrow` does, rather than show a bare error page.
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} is no longer on the list on its own.",
+        )
+        return redirect("exceptions_list", report=report)
     if entry.every_client_at is None:
         now = timezone.now()
         with transaction.atomic():
@@ -745,10 +814,10 @@ def exception_remove(request, report: str, pk: int):
         with transaction.atomic():
             entry.removed_at = now
             entry.removed_by = request.user.username
-            # Taken off, it is no longer meant for anyone: added back later,
-            # the notice asks about it again.
-            entry.every_client_at = None
-            entry.save(update_fields=["removed_at", "removed_by", "every_client_at"])
+            # The every-client mark stays on the row: nothing reads it while the
+            # entry is off the list, and Restore, the undo, brings it back as it
+            # was. Adding the number again by hand clears it (`_add_keys`).
+            entry.save(update_fields=["removed_at", "removed_by"])
             _log_changes([entry], FileExceptionChange.REMOVED,
                          request.user.username, now)
         messages.success(request, f"{entry.key_display} removed.")

@@ -597,10 +597,17 @@ class FileExceptionsPagesTests(TestCase):
         self.assertEqual(spec.every_client, frozenset({("119344",)}))
 
     def test_naming_a_client_leaves_a_number_kept_for_every_client_alone(self):
+        """And says so: a plain 'added' told Paul his correction went in while
+        every client's line stayed out."""
         self._shared_119344()
         self._submit("Every client, now and later")
         response = self._add("invoices", key_1="119344", key_2="NJ00006730")
-        self.assertContains(response, "119344 / NJ00006730 added.")
+        self.assertContains(
+            response,
+            "119344 / NJ00006730 added, but 119344 on its own stays on the list "
+            "for every Client Number, so the file does not change. To leave out "
+            "only this Client Number, remove 119344.",
+        )
         self.assertEqual(
             self._active(), [("119344", ""), ("119344", "NJ00006730")]
         )
@@ -612,22 +619,76 @@ class FileExceptionsPagesTests(TestCase):
             ["External Invoice Number", "Client Number"],
             ["119344", "NJ00006730"],
         ])
-        preview, _ = self._confirm("invoices", content)
+        preview, response = self._confirm("invoices", content)
         self.assertNotContains(preview, "applies to every Client Number")
+        self.assertContains(preview, "1 number your list")
+        self.assertContains(
+            response,
+            "Naming a Client Number changes nothing for 1 number your list keeps "
+            "for every Client Number.",
+        )
         self.assertEqual(
             self._active(), [("119344", ""), ("119344", "NJ00006730")]
         )
 
-    def test_a_removed_number_forgets_every_client_and_is_asked_about_again(self):
+    def test_the_list_shows_a_number_kept_for_every_client(self):
+        self._shared_119344()
+        self.assertNotContains(self._page(), "every client, now and later")
+        self._submit("Every client, now and later")
+        self.assertContains(self._page(), "every client, now and later")
+
+    def test_a_number_added_back_by_hand_is_asked_about_again(self):
         self._shared_119344()
         self._submit("Every client, now and later")
         entry = FileException.objects.get()
         self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
-        entry.refresh_from_db()
-        self.assertIsNone(entry.every_client_at)
 
         response = self._add("invoices", key_1="119344")
         self.assertContains(response, self.NOTICE)
+        entry.refresh_from_db()
+        self.assertIsNone(entry.every_client_at)
+
+    def test_restore_brings_the_mark_back_as_it_was(self):
+        """Restore is the page's undo of a removal."""
+        self._shared_119344()
+        self._submit("Every client, now and later")
+        entry = FileException.objects.get()
+        self.client.post(reverse("exception_remove", args=["invoices", entry.pk]))
+        self.client.post(reverse("exception_restore", args=["invoices", entry.pk]))
+
+        entry.refresh_from_db()
+        self.assertTrue(entry.active)
+        self.assertIsNotNone(entry.every_client_at)
+        self.assertNotContains(self._page(), self.NOTICE)
+
+    def test_every_client_from_an_outdated_notice_says_nothing_changed(self):
+        self._shared_119344()
+        stale = self._notice_forms()
+        self._submit("Only NJ00006730 Burke, M.")
+
+        action, _ = stale["Every client, now and later"]
+        response = self.client.post(action, follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response, "Nothing changed: 119344 is no longer on the list on its own."
+        )
+        self.assertEqual(self._active(), [("119344", "NJ00006730")])
+
+    def test_only_from_an_outdated_notice_on_a_kept_number_says_why(self):
+        self._shared_119344()
+        stale = self._notice_forms()
+        self._submit("Every client, now and later")
+
+        action, clients = stale["Only NJ00006730 Burke, M."]
+        response = self.client.post(action, {"client": clients}, follow=True)
+
+        self.assertContains(
+            response,
+            "Nothing changed: 119344 stays out for every client. To leave out "
+            "only one client, remove 119344 first.",
+        )
+        self.assertEqual(self._active(), [("119344", "")])
 
     def test_every_client_only_takes_an_entry_with_no_client(self):
         self._add("invoices", key_1="119344", key_2="NJ00006730")
@@ -661,17 +722,21 @@ class FileExceptionsPagesTests(TestCase):
             ["Row", "External Invoice Number", "Client Number", "Client Name",
              "Review Reason", "Error Description"],
             [941, "26", "NJ00007458", "Larsen, M.", "", "Invoice not found in system"],
-            [942, "TCG1", "NJ00000107", "Moore, A.", "",
-             "External Invoice Number has invalid format"],
+            # A format refusal as ZipRide writes it: the value only in the reason.
+            [4213, "", "", "Moore, A.", "",
+             "External Invoice Number has invalid format: 'TCG1'"],
         ])
         preview, response = self._confirm("invoices", content)
         self.assertContains(preview, "2 of these ZipRide refused for the number itself")
         self.assertNotContains(preview, "applies to every Client Number")
         self.assertContains(
             response,
-            "list.xlsx: 1 added, 1 already on your list, 2 for every Client Number "
-            "(refused by ZipRide for the number itself).",
+            "list.xlsx: 1 added, 1 already on your list. 2 of them stay out for "
+            "every Client Number: ZipRide refused the number itself.",
         )
+        # The panel shows the latest 25 changes: what was added sorts above
+        # the marks, which an upload of the whole report makes by the hundred.
+        self.assertEqual(FileExceptionChange.objects.first().action, "added")
         self.assertEqual(self._active(), [("26", ""), ("TCG1", "")])
         self.assertEqual(
             sorted(

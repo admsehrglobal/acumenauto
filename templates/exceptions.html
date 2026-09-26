@@ -26,8 +26,9 @@
     </p>
     <p class="mt-1">
       Go by what ZipRide&rsquo;s report said about the number.
-      &ldquo;Invoice not found in system&rdquo;: click <span class="font-medium">Every client</span>, and it stays out for all of them, including clients that turn up on it later.
-      &ldquo;Client mismatch&rdquo;: click <span class="font-medium">Only</span> the client after &ldquo;got&rdquo;, and the other clients&rsquo; lines go back into the file.
+      &ldquo;Invoice not found in system&rdquo; (Error Description): click <span class="font-medium">Every client</span>, and it stays out for all of them, including clients that turn up on it later.
+      &ldquo;Client mismatch&rdquo; (Review Reason): click <span class="font-medium">Only</span> the client after &ldquo;got&rdquo;, and the other clients&rsquo; lines go back into the file.
+      Anything else: click <span class="font-medium">Only</span> the client the invoice belongs to.
     </p>
     <ul class="mt-3 space-y-3">
       {% for e, clients in shared %}
@@ -104,7 +105,7 @@
                   <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">{{ e.key_1 }}</td>
                   {% if spec.columns|length > 1 %}
                     <td class="px-4 py-2 font-mono {% if not e.active %}text-slate-400 line-through{% endif %}">
-                      {% if e.key_2 %}{{ e.key_2 }}{% else %}<span class="text-slate-400 font-sans">any</span>{% endif %}
+                      {% if e.key_2 %}{{ e.key_2 }}{% elif e.every_client_at %}<span class="text-slate-500 font-sans">every client, now and later</span>{% else %}<span class="text-slate-400 font-sans">any</span>{% endif %}
                     </td>
                   {% endif %}
                   <td class="px-4 py-2 text-slate-500 text-xs whitespace-nowrap">
@@ -178,7 +179,7 @@
     <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
       <h2 class="text-lg font-medium text-slate-900 mb-1">Add an entry</h2>
       <p class="text-sm text-slate-600 mb-4">
-        {% if spec.optional_columns %}Leave {{ spec.optional_columns.0 }} empty and every row with this {{ spec.columns.0 }} is dropped. Fill it in and only that client&rsquo;s row is.{% elif spec.columns|length > 1 %}Both values must match the row for it to be dropped.{% else %}Every row with this {{ spec.columns.0 }} is dropped.{% endif %}
+        {% if spec.optional_columns %}Leave {{ spec.optional_columns.0 }} empty and every row with this {{ spec.columns.0 }} is dropped. Fill it in and only that client&rsquo;s row is &mdash; unless the {{ spec.columns.0 }} is on the list for every client, which stays as it is until you remove it.{% elif spec.columns|length > 1 %}Both values must match the row for it to be dropped.{% else %}Every row with this {{ spec.columns.0 }} is dropped.{% endif %}
       </p>
       <form method="post" action="{% url 'exception_add' spec.slug %}" class="space-y-3">
         {% csrf_token %}
@@ -203,7 +204,7 @@
       <p class="text-sm text-slate-600 mb-4">
         An Excel file whose first sheet has a column header named
         {% for column in spec.required_columns %}<span class="font-mono">{{ column }}</span>{% if not forloop.last %} and {% endif %}{% endfor %}.
-        {% if spec.optional_columns %}If the sheet also has a <span class="font-mono">{{ spec.optional_columns.0 }}</span> column it is used, and each entry is narrowed to that client &mdash; except the rows ZipRide&rsquo;s report refused for the number itself (&ldquo;Invoice not found in system&rdquo;, or an invalid invoice number), which stay out for every client.{% endif %}
+        {% if spec.optional_columns %}If the sheet also has a <span class="font-mono">{{ spec.optional_columns.0 }}</span> column it is used, and each entry is narrowed to that client &mdash; except the rows ZipRide&rsquo;s report refused for the number itself (&ldquo;Invoice not found in system&rdquo;, or &ldquo;External Invoice Number has invalid format&rdquo;), which stay out for every client.{% endif %}
         {% if spec.required == 1 %}A single column of numbers with nothing above it works too.{% endif %}
         Other columns are ignored. You see what was read before anything is saved.
       </p>

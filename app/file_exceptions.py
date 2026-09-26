@@ -20,6 +20,7 @@ would silently never match and nothing would be dropped.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable, NamedTuple, Sequence
 
 
@@ -400,6 +401,8 @@ NUMBER_REFUSALS = (
     "invoice not found in system",
     "external invoice number has invalid format",
 )
+# "External Invoice Number has invalid format: 'TCG83BF8D8'"
+QUOTED_REFUSED_VALUE = re.compile(r"invalid format:\s*'(.*)'\s*$", re.IGNORECASE)
 
 
 def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
@@ -504,6 +507,14 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             reason in " ".join(str(row[refusal]).lower().split())
             for reason in NUMBER_REFUSALS
         ):
+            if not key[0]:
+                # A format refusal leaves the number cell empty and quotes the
+                # value in the reason: all 674 of them on 2026-09-03 (418
+                # values, which on the 6 September files drop exactly those
+                # 674 lines and nothing else).
+                quoted = QUOTED_REFUSED_VALUE.search(str(row[refusal]))
+                if quoted:
+                    key = (normalize_key(quoted.group(1)),) + key[1:]
             key = key[: spec.required] + ("",) * (len(key) - spec.required)
             refused.add(fold_key(key))
         if not all(key[: spec.required]):

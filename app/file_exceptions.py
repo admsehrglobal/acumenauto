@@ -20,6 +20,7 @@ would silently never match and nothing would be dropped.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable, NamedTuple, Sequence
 
 
@@ -168,6 +169,9 @@ class DropSpec(NamedTuple):
     and silence is not. Only a file this list emptied is held back.
 
     `owners` is only there for a key with an optional part (see `Owners`).
+    `every_client` holds the required parts of the entries with no client that
+    are meant for every client (`FileException.every_client_at`): dropping
+    every owner's rows is what they are for, so they are not reported as shared.
     """
 
     label: str
@@ -178,6 +182,7 @@ class DropSpec(NamedTuple):
     required: int = 0  # 0 = every part, so the older two-part specs are unchanged
     name_column: str = ""
     owners: "Owners | None" = None
+    every_client: frozenset = frozenset()
 
     def record(self, output_path, row_filter: "RowFilter", written: int) -> None:
         self.stats[output_path] = (row_filter.dropped, set(row_filter.matched))
@@ -201,7 +206,7 @@ class DropSpec(NamedTuple):
         return {
             head: owners
             for head, owners in self.shared().items()
-            if head + blank in self.keys
+            if head + blank in self.keys and head not in self.every_client
         }
 
 
@@ -241,12 +246,15 @@ class Owners:
         }
 
 
-def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
+def make_drop_spec(
+    slug: str, raw_keys: Iterable[Sequence], every_client: Iterable[str] = ()
+) -> DropSpec | None:
     """Build the spec from stored (key_1, key_2) rows; None when there is
     nothing to drop, so a report with an empty list runs exactly as before.
 
     The keys go in folded (see `fold_key`), which is also why two stored
-    entries differing only by case count as one key here.
+    entries differing only by case count as one key here. `every_client` is
+    the key_1 of each entry meant for every client (see `DropSpec`).
     """
     spec = REPORTS[slug]
     width = len(spec.columns)
@@ -263,6 +271,7 @@ def make_drop_spec(slug: str, raw_keys: Iterable[Sequence]) -> DropSpec | None:
     return DropSpec(
         spec.label, spec.columns, frozenset(keys), {}, set(), spec.required,
         spec.name_column, Owners() if spec.optional_columns else None,
+        frozenset(fold_key((normalize_key(k),)) for k in every_client),
     )
 
 
@@ -369,10 +378,31 @@ class ParsedUpload(NamedTuple):
     blank: int  # rows with content but a missing key part
     duplicates: int  # repeats inside the file
     too_long: int = 0  # rows whose key does not fit MAX_KEY_LENGTH
+    # The keys (no client, all in `keys`) of rows ZipRide refused for the
+    # number itself; they go on the list for every client.
+    every_client: tuple[tuple[str, ...], ...] = ()
 
 
 def _fold(cell) -> str:
     return "".join(str(cell).lower().split())
+
+
+# ZipRide's import report - the invoice status export Paul uploads as it comes
+# out - says in this column why a line was refused. These two are about the
+# number, whoever the client: the 2026-09-03 report lists each such number once
+# (428 "not found" rows, 428 numbers) although our file carried some of them
+# on up to three clients' lines. Read with its client, an upload of that report
+# would take each number out for the one client named and send the others'
+# lines back to be refused again - what happened to five numbers on
+# 2026-09-25. "Client mismatch" is left as it is: it sits in 'Review Reason',
+# and there the client named is the one line to leave out.
+REFUSAL_COLUMN = "Error Description"
+NUMBER_REFUSALS = (
+    "invoice not found in system",
+    "external invoice number has invalid format",
+)
+# "External Invoice Number has invalid format: 'TCG83BF8D8'"
+QUOTED_REFUSED_VALUE = re.compile(r"invalid format:\s*'(.*)'\s*$", re.IGNORECASE)
 
 
 def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
@@ -393,6 +423,7 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
     }
     positions: list[int] | None = None
     start = 0
+    refusal: int | None = None
     for r, row in enumerate(rows[:20]):
         found: dict[str, int] = {}
         # Our own names first, then aliases for whatever they did not fill. Two
@@ -411,9 +442,19 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             # them, which is what makes Paul's own export work unchanged: his
             # invoice status file already has 'Client Number' next to the
             # number, so uploading it as it comes out narrows every entry to
-            # its own client without him editing anything.
+            # its own client without him editing anything - except the rows
+            # ZipRide refused for the number itself (`NUMBER_REFUSALS`).
             positions = [found.get(name) for name in spec.columns]
             start = r + 1
+            if spec.optional_columns:
+                refusal = next(
+                    (
+                        i for i, cell in enumerate(row)
+                        if cell not in (None, "")
+                        and _fold(cell) == _fold(REFUSAL_COLUMN)
+                    ),
+                    None,
+                )
             break
     if positions is None:
         used_width = max(
@@ -453,6 +494,7 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
 
     keys: list[tuple[str, ...]] = []
     seen: set[tuple[str, ...]] = set()
+    refused: set[tuple[str, ...]] = set()
     blank = 0
     duplicates = 0
     too_long = 0
@@ -461,6 +503,20 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             normalize_key(row[i]) if i is not None and i < len(row) else ""
             for i in positions
         )
+        if refusal is not None and refusal < len(row) and any(
+            reason in " ".join(str(row[refusal]).lower().split())
+            for reason in NUMBER_REFUSALS
+        ):
+            if not key[0]:
+                # A format refusal leaves the number cell empty and quotes the
+                # value in the reason: all 674 of them on 2026-09-03 (418
+                # values, which on the 6 September files drop exactly those
+                # 674 lines and nothing else).
+                quoted = QUOTED_REFUSED_VALUE.search(str(row[refusal]))
+                if quoted:
+                    key = (normalize_key(quoted.group(1)),) + key[1:]
+            key = key[: spec.required] + ("",) * (len(key) - spec.required)
+            refused.add(fold_key(key))
         if not all(key[: spec.required]):
             if any(cell not in (None, "") for cell in row):
                 blank += 1
@@ -474,4 +530,5 @@ def parse_upload(rows: Sequence[Sequence], spec: ReportSpec) -> ParsedUpload:
             continue
         seen.add(folded)
         keys.append(key)
-    return ParsedUpload(keys, blank, duplicates, too_long)
+    every_client = tuple(key for key in keys if fold_key(key) in refused)
+    return ParsedUpload(keys, blank, duplicates, too_long, every_client)

@@ -94,7 +94,11 @@ class ExceptionWiringTests(unittest.TestCase):
 
         def _filter(**kw):
             qs = mock.Mock()
-            qs.values_list.return_value = _ROWS.get(kw.get("report"), [])
+            # No entry here is meant for every client.
+            every_client = "every_client_at__isnull" in kw
+            qs.values_list.return_value = (
+                [] if every_client else _ROWS.get(kw.get("report"), [])
+            )
             qs.__iter__ = lambda self: iter([])
             qs.update.return_value = 0
             return qs

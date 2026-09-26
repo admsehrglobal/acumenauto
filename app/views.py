@@ -278,7 +278,9 @@ def _report_spec(report: str):
     return spec
 
 
-def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
+def _add_keys(
+    report: str, keys, actor: str, every_client=()
+) -> tuple[int, int, int, int]:
     """Create the keys that are new, restore the ones removed earlier.
 
     Returns (added, restored, already listed, narrowed). Keys arrive normalised
@@ -286,6 +288,10 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     They are matched folded (`fold_key`), the same way the run matches them
     against the export, so `AB12` after `ab12` is "already listed" and not a
     second entry that would look live and drop nothing.
+
+    `every_client` are keys of this batch, with no client, to mark as meant for
+    every client (`FileException.every_client_at`): an upload of ZipRide's
+    report sends the numbers it refused for the number itself.
     """
     now = timezone.now()
     stored = {
@@ -296,8 +302,10 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     to_create: list[FileException] = []
     to_restore: list[FileException] = []
     to_narrow: list[FileException] = []
+    to_keep: list[FileException] = []
     already = 0
     spoken_for = _bare_keys(keys)
+    keep = {fold_key((key[0], "")) for key in every_client}
     for key in keys:
         parts = (key[0], key[1] if len(key) > 1 else "")
         folded = fold_key(parts)
@@ -317,7 +325,12 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
             # in between; the log below is what carries "added again".
             entry.removed_at = None
             entry.removed_by = ""
+            # An every-client mark comes back with the row, as with Restore: it
+            # belongs to the entry, and the list shows it.
             to_restore.append(entry)
+        if folded in keep and entry.every_client_at is None:
+            entry.every_client_at = now
+            to_keep.append(entry)
         # An entry naming a client is dead weight while the bare key is also
         # listed: `RowFilter.drops` tries the key with its optional parts
         # blanked, so the wildcard drops the row whoever the client is, and the
@@ -326,11 +339,16 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
         # wildcard this same upload asks for, because a row with no client says
         # "every client" in so many words and an upload does not get to argue
         # with itself, and anything not already stored, which has no history to
-        # replace.
+        # replace. Nor one meant for every client: a client named next to it
+        # adds nothing it does not already cover.
         bare = fold_key((parts[0], ""))
         if parts[1] and bare not in spoken_for:
             wildcard = stored.get(bare)
-            if wildcard is not None and wildcard.active:
+            if (
+                wildcard is not None
+                and wildcard.active
+                and wildcard.every_client_at is None
+            ):
                 wildcard.removed_at = now
                 wildcard.removed_by = actor
                 to_narrow.append(wildcard)
@@ -339,6 +357,7 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
     # live —dropping rows from tomorrow's file— with nothing in the record
     # saying they were added, and `exception_upload_confirm` tells the operator
     # the upload failed while the list has in fact changed.
+    kept_existing = [e for e in to_keep if e.pk is not None]
     with transaction.atomic():
         FileException.objects.bulk_create(to_create, batch_size=500)
         if to_restore or to_narrow:
@@ -346,9 +365,26 @@ def _add_keys(report: str, keys, actor: str) -> tuple[int, int, int, int]:
                 to_restore + to_narrow, ["removed_at", "removed_by"],
                 batch_size=500,
             )
+        if kept_existing:
+            FileException.objects.bulk_update(
+                kept_existing, ["every_client_at"], batch_size=500
+            )
+        # Marks on entries that were already on the list go first: the page
+        # shows the latest 25 changes, and an upload of ZipRide's report marks
+        # hundreds at once, which would push what was added or came back off
+        # the panel. An entry added or restored here is marked after it is.
+        returning = {id(e) for e in to_create + to_restore}
+        _log_changes(
+            [e for e in to_keep if id(e) not in returning],
+            FileExceptionChange.KEPT, actor, now,
+        )
         _log_changes(to_create, FileExceptionChange.ADDED, actor, now)
         _log_changes(to_restore, FileExceptionChange.RESTORED, actor, now)
         _log_changes(to_narrow, FileExceptionChange.REMOVED, actor, now)
+        _log_changes(
+            [e for e in to_keep if id(e) in returning],
+            FileExceptionChange.KEPT, actor, now,
+        )
     return len(to_create), len(to_restore), already, len(to_narrow)
 
 
@@ -399,20 +435,57 @@ def _count_narrowing(report: str, spec, keys) -> int:
     return sum(
         1
         for entry in FileException.objects.filter(
-            report=report, key_2="", removed_at__isnull=True
+            report=report, key_2="", removed_at__isnull=True,
+            every_client_at__isnull=True,
         )
         if fold_key((entry.key_1, "")) in wanted
     )
 
 
-def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) -> str:
+def _kept_numbers(report: str, keys) -> set:
+    """The numbers this batch names a client for while the list keeps the
+    number on its own for every client: naming the client changes nothing in
+    the file, and Paul has to be told, not shown a plain "added"."""
+    if not REPORTS[report].optional_columns:
+        return set()
+    named = {
+        fold_key((key[0], "")) for key in keys if len(key) > 1 and key[1]
+    } - _bare_keys(keys)
+    if not named:
+        return set()
+    return {
+        folded
+        for folded in (
+            fold_key((entry.key_1, ""))
+            for entry in FileException.objects.filter(
+                report=report, key_2="", removed_at__isnull=True,
+                every_client_at__isnull=False,
+            )
+        )
+        if folded in named
+    }
+
+
+def _kept_note(spec, number: str) -> str:
+    column = spec.columns[spec.required]
+    return (
+        f"{number} on its own stays on the list for every {column}, so the file "
+        f"does not change. To leave out only this {column}, remove {number}."
+    )
+
+
+def _upload_counts(
+    spec, added: int, already: int, parsed, narrowed: int = 0, kept: int = 0
+) -> str:
     """The numbers of one upload, each under its own name.
 
     They used to share two labels: the repeats inside Paul's own file were
     added to the entries already on the list, so uploading the accruals export
     against an EMPTY list read "7568 added, 262805 already listed" - none of
     those 262,805 were on any list. Zero counts are left out rather than
-    printed, so the usual upload reads as one short sentence.
+    printed, so the usual upload reads as one short sentence. What applies to
+    entries already counted (the every-client ones) follows as its own
+    sentence, so it is not read as more entries.
     """
     parts = [f"{added:,} added"]
     if already:
@@ -437,7 +510,20 @@ def _upload_counts(spec, added: int, already: int, parsed, narrowed: int = 0) ->
             f"{parsed.too_long:,} {rows} skipped for a value longer than "
             f"{MAX_KEY_LENGTH} characters"
         )
-    return ", ".join(parts) + "."
+    message = ", ".join(parts) + "."
+    column = spec.columns[spec.required] if spec.required < len(spec.columns) else ""
+    if parsed.every_client:
+        message += (
+            f" {len(parsed.every_client):,} of them stay out for every {column}: "
+            "ZipRide refused the number itself."
+        )
+    if kept:
+        numbers = "number" if kept == 1 else "numbers"
+        message += (
+            f" Naming a {column} changes nothing for {kept:,} {numbers} your list "
+            f"keeps for every {column}."
+        )
+    return message
 
 
 @login_required
@@ -485,7 +571,7 @@ def _shared_on_list(report: str) -> list:
     Read against the list as it is NOW, so a number Paul has just added shows up
     at once, and one he has just narrowed is gone at once. On a list of
     thousands a mark on the row would sit on page 60, so the page puts these on
-    top.
+    top. An entry meant for every client is not asked about again.
     """
     shared = {
         s.key_1: s.client_list for s in SharedKey.objects.filter(report=report)
@@ -493,7 +579,8 @@ def _shared_on_list(report: str) -> list:
     if not shared:
         return []
     entries = FileException.objects.filter(
-        report=report, key_2="", removed_at__isnull=True
+        report=report, key_2="", removed_at__isnull=True,
+        every_client_at__isnull=True,
     ).annotate(folded=Lower("key_1")).filter(folded__in=list(shared))
     return [(e, shared[e.folded]) for e in entries]
 
@@ -515,12 +602,21 @@ def exception_add(request, report: str):
         return render(
             request, "exceptions.html", _exceptions_context(request, spec, form)
         )
+    kept = _kept_numbers(report, [form.cleaned_key])
     added, restored, already, narrowed = _add_keys(
         report, [form.cleaned_key], request.user.username
     )
     shown = _show_key(form.cleaned_key)
-    if already:
+    if already and kept:
+        messages.info(
+            request, f"{shown} is already listed. But {_kept_note(spec, form.cleaned_key[0])}"
+        )
+    elif already:
         messages.info(request, f"{shown} is already listed.")
+    elif kept:
+        messages.info(
+            request, f"{shown} added, but {_kept_note(spec, form.cleaned_key[0])}"
+        )
     elif narrowed:
         messages.success(
             request,
@@ -579,6 +675,7 @@ def exception_upload(request, report: str):
             # and a removal is the half worth seeing first: those rows start
             # coming through again in tomorrow's file.
             "narrowing": _count_narrowing(report, spec, parsed.keys),
+            "kept": len(_kept_numbers(report, parsed.keys)),
             "narrowed_by": spec.columns[spec.required]
             if spec.required < len(spec.columns)
             else "",
@@ -597,6 +694,7 @@ def exception_upload(request, report: str):
                     "blank": parsed.blank,
                     "duplicates": parsed.duplicates,
                     "too_long": parsed.too_long,
+                    "every_client": FileExceptionConfirmForm.pack(parsed.every_client),
                 },
             ),
         },
@@ -613,8 +711,9 @@ def exception_upload_confirm(request, report: str):
         return redirect("exceptions_list", report=report)
     parsed = form.parsed()
     try:
+        kept = len(_kept_numbers(report, parsed.keys))
         added, restored, already, narrowed = _add_keys(
-            report, parsed.keys, request.user.username
+            report, parsed.keys, request.user.username, parsed.every_client
         )
     except Exception as exc:  # noqa: BLE001 - a database error is not a read error
         messages.error(
@@ -626,7 +725,7 @@ def exception_upload_confirm(request, report: str):
     report_message(
         request,
         f"{form.cleaned_data['filename']}: "
-        f"{_upload_counts(spec, added + restored, already, parsed, narrowed)}",
+        f"{_upload_counts(spec, added + restored, already, parsed, narrowed, kept)}",
     )
     return redirect("exceptions_list", report=report)
 
@@ -649,6 +748,14 @@ def exception_narrow(request, report: str, pk: int):
         )
     )
     chosen = [c for c in request.POST.getlist("client") if c in offered]
+    if not chosen and entry.active and entry.every_client_at is not None:
+        # A notice left open after 'Every client' was clicked elsewhere.
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} stays out for every client. To "
+            f"leave out only one client, remove {entry.key_1} first.",
+        )
+        return redirect("exceptions_list", report=report)
     if not chosen:
         messages.info(
             request,
@@ -656,14 +763,67 @@ def exception_narrow(request, report: str, pk: int):
             "client's lines, or no longer on the list on its own.",
         )
         return redirect("exceptions_list", report=report)
+    if set(chosen) == set(offered):
+        # What the old 'All of them, as now' button posted, from a page left
+        # open across the release: naming every client of the day left the
+        # number open to the next one, so it is taken as every client.
+        return _keep_for_every_client(request, report, entry)
     _add_keys(report, [(entry.key_1, c) for c in chosen], request.user.username)
-    names = "; ".join(f"{c} {offered[c]}".strip() for c in chosen)
+    # What is left out is what the list now names, not only what was clicked: a
+    # client with its own entry for this number stays out after the click.
+    named = {
+        client.lower()
+        for client in FileException.objects.filter(
+            report=report, removed_at__isnull=True
+        )
+        .annotate(folded=Lower("key_1"))
+        .filter(folded=entry.key_1.lower())
+        .exclude(key_2="")
+        .values_list("key_2", flat=True)
+    }
+    out = [c for c in offered if c.lower() in named]
+    names = "; ".join(f"{c} {offered[c]}".strip() for c in out)
     # No full stop after the names: they end in one ("Burke, M.").
     back = (
         " — the other clients' lines go back into the file."
-        if len(chosen) < len(offered) else ""
+        if len(out) < len(offered) else ""
     )
     messages.success(request, f"{entry.key_1} now leaves out only {names}{back}")
+    return redirect("exceptions_list", report=report)
+
+
+@login_required
+@require_POST
+def exception_keep_all(request, report: str, pk: int):
+    """'Every client' from the notice: the entry with no client stays, for the
+    clients on the number today and for any that turn up later, and the notice
+    stops asking about it."""
+    _report_spec(report)
+    entry = get_object_or_404(FileException, pk=pk, report=report, key_2="")
+    if not entry.active:
+        # A notice left open after 'Only' or 'None' was clicked: say so, as
+        # `exception_narrow` does, rather than show a bare error page.
+        messages.info(
+            request,
+            f"Nothing changed: {entry.key_1} is no longer on the list on its own.",
+        )
+        return redirect("exceptions_list", report=report)
+    return _keep_for_every_client(request, report, entry)
+
+
+def _keep_for_every_client(request, report: str, entry: FileException):
+    if entry.every_client_at is None:
+        now = timezone.now()
+        with transaction.atomic():
+            entry.every_client_at = now
+            entry.save(update_fields=["every_client_at"])
+            _log_changes([entry], FileExceptionChange.KEPT,
+                         request.user.username, now)
+    messages.success(
+        request,
+        f"{entry.key_1} stays out of the file for every client, "
+        "including any that turn up later.",
+    )
     return redirect("exceptions_list", report=report)
 
 
@@ -677,6 +837,9 @@ def exception_remove(request, report: str, pk: int):
         with transaction.atomic():
             entry.removed_at = now
             entry.removed_by = request.user.username
+            # The every-client mark stays on the row: nothing reads it while the
+            # entry is off the list, and Restore, the undo, brings it back as it
+            # was. Adding the number again by hand clears it (`_add_keys`).
             entry.save(update_fields=["removed_at", "removed_by"])
             _log_changes([entry], FileExceptionChange.REMOVED,
                          request.user.username, now)
@@ -698,6 +861,13 @@ def exception_restore(request, report: str, pk: int):
             entry.save(update_fields=["removed_at", "removed_by"])
             _log_changes([entry], FileExceptionChange.RESTORED,
                          request.user.username, timezone.now())
-        messages.success(request, f"{entry.key_display} restored.")
+        spec = REPORTS[report]
+        if entry.key_2 and _kept_numbers(report, [(entry.key_1, entry.key_2)]):
+            messages.info(
+                request,
+                f"{entry.key_display} restored, but {_kept_note(spec, entry.key_1)}",
+            )
+        else:
+            messages.success(request, f"{entry.key_display} restored.")
     return redirect("exceptions_list", report=report)
 

@@ -312,6 +312,74 @@ class UploadAliasTests(unittest.TestCase):
             parsed.keys, [("99004", "NJ00006544"), ("100888", "NJ00006730")]
         )
 
+    ZIPRIDE_HEADER = [
+        "Row", "External Invoice Number", "Client Number", "Client Name",
+        "Review Reason", "Error Description",
+    ]
+
+    def test_a_number_zipride_refused_goes_on_for_every_client(self):
+        """ZipRide's report of 2026-09-03 lists each refused number once, with
+        one client, although our file carried some on up to three clients'
+        lines. Read with its client, the upload named that one client and let
+        the others' lines through to be refused again (2026-09-25). A "Client
+        mismatch" names the one line that is wrong, so it keeps its client."""
+        rows = [
+            self.ZIPRIDE_HEADER,
+            [941, "1", "NJ00007458", "Larsen, M.", "", "Invoice not found in system"],
+            # The real shape of a format refusal: number and client cells empty,
+            # the value quoted in the reason (674 of 674 on 2026-09-03).
+            [4213, "", "", "Tomkievicz, R.", "",
+             "External Invoice Number has invalid format: 'TCG83BF8D8'"],
+            [9447, "99004", "NJ00006544", "Lee, B.",
+             "Client mismatch: expected NJ00013618, got NJ00006544", ""],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(
+            parsed.keys, [("1", ""), ("TCG83BF8D8", ""), ("99004", "NJ00006544")]
+        )
+        self.assertEqual(parsed.every_client, (("1", ""), ("TCG83BF8D8", "")))
+        self.assertEqual(parsed.blank, 0)
+
+    def test_a_format_refusal_keeps_a_name_as_it_is_quoted(self):
+        rows = [
+            self.ZIPRIDE_HEADER,
+            [5, "", "", "Sakala, C.", "",
+             "External Invoice Number has invalid format: 'Sakala Corinne'"],
+            # Without the quoted value there is nothing to add: still skipped.
+            [6, "", "", "X", "", "External Invoice Number has invalid format"],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("Sakala Corinne", "")])
+        self.assertEqual(parsed.every_client, (("Sakala Corinne", ""),))
+        self.assertEqual(parsed.blank, 1)
+
+    def test_one_number_refused_under_two_clients_is_one_entry(self):
+        rows = [
+            self.ZIPRIDE_HEADER,
+            [1, "1", "NJ1", "", "", "Invoice not found in system"],
+            [2, "1", "NJ2", "", "", "Invoice not found in system"],
+        ]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("1", "")])
+        self.assertEqual(parsed.duplicates, 1)
+        self.assertEqual(parsed.every_client, (("1", ""),))
+
+    def test_a_sheet_without_zipride_s_reasons_reads_as_before(self):
+        rows = [["Invoice #", "Client Number"], ["1", "NJ1"]]
+        parsed = parse_upload(rows, REPORTS["invoices"])
+        self.assertEqual(parsed.keys, [("1", "NJ1")])
+        self.assertEqual(parsed.every_client, ())
+
+    def test_a_refusal_means_nothing_for_a_key_with_no_optional_part(self):
+        """Both accrual key parts are required: there is no client to drop."""
+        rows = [
+            ["DDD ID", "PA Number", "Error Description"],
+            ["D1", "PA1", "Invoice not found in system"],
+        ]
+        parsed = parse_upload(rows, REPORTS["accruals"])
+        self.assertEqual(parsed.keys, [("D1", "PA1")])
+        self.assertEqual(parsed.every_client, ())
+
     def test_a_row_with_no_client_is_a_wildcard_not_a_skipped_row(self):
         """Only the number is required, so a gap in the optional column costs
         precision, not the entry - it must not land in the 'skipped' count."""

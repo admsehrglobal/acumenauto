@@ -48,6 +48,23 @@
     </ul>
   {% endif %}
 
+  {% if parsed.every_client %}
+    <div class="text-sm bg-slate-50 border border-slate-200 rounded px-3 py-2 mb-4">
+      {{ parsed.every_client|length }} of these ZipRide refused for the number itself
+      (&ldquo;Invoice not found in system&rdquo;, or &ldquo;External Invoice Number has invalid
+      format&rdquo;). They go on the list with no {{ narrowed_by }}, so they stay out for every
+      {{ narrowed_by }}, including any that turns up on them later.
+    </div>
+  {% endif %}
+
+  {% if kept %}
+    <div class="text-sm bg-slate-50 border border-slate-200 rounded px-3 py-2 mb-4">
+      This file names a {{ narrowed_by }} for {{ kept }} number{{ kept|pluralize }} your list
+      keeps for every {{ narrowed_by }}. {{ kept|pluralize:"That number stays,Those numbers stay" }}
+      out for every {{ narrowed_by }}; to leave out only one, remove the number first.
+    </div>
+  {% endif %}
+
   {% if narrowing %}
     <div class="text-sm bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-4">
       {{ narrowing }} entr{{ narrowing|pluralize:"y,ies" }} on your list

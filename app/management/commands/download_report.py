@@ -306,7 +306,11 @@ def _load_list(slug: str) -> DropSpec | None:
     rows = FileException.objects.filter(
         report=slug, removed_at__isnull=True
     ).values_list("key_1", "key_2")
-    return make_drop_spec(slug, rows)
+    every_client = FileException.objects.filter(
+        report=slug, removed_at__isnull=True, key_2="",
+        every_client_at__isnull=False,
+    ).values_list("key_1", flat=True)
+    return make_drop_spec(slug, rows, every_client)
 
 
 def _drop_late_entries(
@@ -318,8 +322,8 @@ def _drop_late_entries(
     `INVOICE_PILE_GAP_S` after the rejections, 15 to 20 minutes later. On
     2026-09-17 Paul added 66 entries at 20:06 UTC to a run that had read the
     list at 20:03; the file ZipRide imported at 20:23 still carried all 66, and
-    to him the list was "not working". Of the 72 minutes in which the list
-    changed between 2026-09-10 and 2026-09-25, 12 fell inside an invoice run.
+    to him the list was "not working". Of the 17 minutes in which the invoice
+    list changed between 2026-09-10 and 2026-09-24, 5 fell inside an invoice run.
 
     `read_at_start` is what the merge applied, not the spec's current keys: an
     entry added before the rejections went out is new to the payable pile too.

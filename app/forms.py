@@ -188,6 +188,8 @@ class FileExceptionConfirmForm(forms.Form):
     blank = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
     duplicates = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
     too_long = forms.IntegerField(min_value=0, widget=forms.HiddenInput)
+    # Packed like `keys`: the ones ZipRide refused for the number itself.
+    every_client = forms.CharField(required=False, widget=forms.HiddenInput)
 
     def __init__(self, spec: ReportSpec, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -200,16 +202,20 @@ class FileExceptionConfirmForm(forms.Form):
     def parsed(self) -> ParsedUpload:
         # maxsplit keeps a tab inside the last part from splitting the key.
         width = len(self.spec.columns)
-        keys = [
-            tuple(line.split("\t", width - 1))
-            for line in self.cleaned_data["keys"].splitlines()
-            if line
-        ]
+
+        def unpack(packed: str) -> list:
+            return [
+                tuple(line.split("\t", width - 1))
+                for line in packed.splitlines()
+                if line
+            ]
+
         return ParsedUpload(
-            keys,
+            unpack(self.cleaned_data["keys"]),
             self.cleaned_data["blank"],
             self.cleaned_data["duplicates"],
             self.cleaned_data["too_long"],
+            tuple(unpack(self.cleaned_data["every_client"])),
         )
 
 

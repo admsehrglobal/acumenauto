@@ -447,6 +447,20 @@ class SharedNumberTests(unittest.TestCase):
             summarize([drop]),
         )
 
+    def test_a_number_kept_for_every_client_is_not_counted_as_shared(self):
+        """Dropping every client's lines is what that entry is for: ZipRide's
+        "Invoice not found in system" is about the number. The lines still go;
+        the run record just does not ask about it."""
+        drop = make_drop_spec(
+            "invoices", [("119344", ""), ("999", "")], every_client=["119344"]
+        )
+        self._merge(self._shared_rows(), drop)
+        self.assertEqual(list(drop.shared()), [("119344",)])
+        self.assertEqual(drop.shared_entries(), {})
+        summary = summarize([drop])
+        self.assertIn("Invoices: 3 rows dropped (2 of 2 keys matched)", summary)
+        self.assertNotIn("more than one", summary)
+
     def test_every_shared_number_is_known_whether_listed_or_not(self):
         """So the page can flag one the moment Paul adds it, not a run later."""
         drop = make_drop_spec("invoices", [("999", "")])

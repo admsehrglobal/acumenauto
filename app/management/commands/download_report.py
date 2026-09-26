@@ -63,6 +63,7 @@ from app.scraper import (
     ChunkedReport,
     MatrixReport,
     _apply_exceptions_in_place,
+    _data_rows,
     _read,
     download_reports,
     require_known_columns,
@@ -298,13 +299,61 @@ def _load_exceptions() -> dict[str, DropSpec | None]:
     Read once here, in the main thread, like AppConfig and the recipients: the
     scraper stays Django-free and `on_report_ready` runs in a worker thread.
     """
-    specs: dict[str, DropSpec | None] = {}
-    for slug in REPORTS:
-        rows = FileException.objects.filter(
-            report=slug, removed_at__isnull=True
-        ).values_list("key_1", "key_2")
-        specs[slug] = make_drop_spec(slug, rows)
-    return specs
+    return {slug: _load_list(slug) for slug in REPORTS}
+
+
+def _load_list(slug: str) -> DropSpec | None:
+    rows = FileException.objects.filter(
+        report=slug, removed_at__isnull=True
+    ).values_list("key_1", "key_2")
+    return make_drop_spec(slug, rows)
+
+
+def _drop_late_entries(
+    path: Path, exceptions: dict[str, DropSpec | None], read_at_start: frozenset
+) -> None:
+    """Take out of an invoice file what went on the list after the run read it.
+
+    The list is read once, when the run starts, and the payable pile goes out
+    `INVOICE_PILE_GAP_S` after the rejections, 15 to 20 minutes later. On
+    2026-09-17 Paul added 66 entries at 20:06 UTC to a run that had read the
+    list at 20:03; the file ZipRide imported at 20:23 still carried all 66, and
+    to him the list was "not working". Of the 72 minutes in which the list
+    changed between 2026-09-10 and 2026-09-25, 12 fell inside an invoice run.
+
+    `read_at_start` is what the merge applied, not the spec's current keys: an
+    entry added before the rejections went out is new to the payable pile too.
+    Only the invoice file: the auth file is filtered a minute or two after the
+    list is read, and the accrual file is written by its own code, which a
+    rewrite here would undo.
+    """
+    spec = exceptions["invoices"]
+    if spec is None or path not in spec.stats:
+        return
+    fresh = _load_list("invoices")
+    late = (fresh.keys if fresh is not None else frozenset()) - read_at_start
+    if not late:
+        return
+    # A file with no rows (a day with no rejections, or one the start list
+    # emptied) has nothing to take out, and the merge refuses a file with none.
+    if path in spec.emptied or not any(True for _ in _data_rows(_read(path))):
+        return
+    # No `owners`: the numbers on several clients' lines come from the merge,
+    # which saw every row, and this pass only sees what the merge left.
+    extra = fresh._replace(keys=late, stats={}, emptied=set(), owners=None)
+    _apply_exceptions_in_place(path, extra)
+    dropped = sum(n for n, _ in extra.stats.values())
+    matched = set().union(*(keys for _, keys in extra.stats.values()))
+    before, keys = spec.stats[path]
+    spec.stats[path] = (before + dropped, keys | matched)
+    if path in extra.emptied:
+        spec.emptied.add(path)
+    # The same stats and emptied objects, so the run record counts the new keys.
+    exceptions["invoices"] = spec._replace(keys=spec.keys | late)
+    logger.warning(
+        "[EXCEPTIONS] %s: %d entradas cargadas durante la corrida, %d filas mas",
+        path.name, len(late), dropped,
+    )
 
 
 def _stamp_matches(
@@ -410,6 +459,10 @@ class Command(BaseCommand):
 
         config = AppConfig.load()
         exceptions = _load_exceptions()
+        # What the invoice merge applies; see `_drop_late_entries`.
+        invoice_keys_read = (
+            exceptions["invoices"].keys if exceptions["invoices"] else frozenset()
+        )
         if options["reports"]:
             filter_ids = {int(s) for s in options["reports"].split(",") if s.strip()}
         else:
@@ -535,6 +588,13 @@ class Command(BaseCommand):
             return None
 
         def _send(path: Path, display_name: str) -> None:
+            try:
+                _drop_late_entries(path, exceptions, invoice_keys_read)
+            except Exception:  # noqa: BLE001 - it still goes out as the merge left it
+                logger.exception(
+                    "[EXCEPTIONS] no pude sacar de %s lo cargado durante la corrida",
+                    display_name,
+                )
             # Juan Pablo, 2026-09-07: "If an exclusion leaves a file with no data
             # rows, I would not send it." Only that case — a pile that was empty
             # before any exception is still emailed, because on those days the

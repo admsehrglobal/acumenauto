@@ -343,7 +343,9 @@ def summarize(specs: Iterable[DropSpec | None]) -> str:
             f"{spec.label}: {rows} rows dropped "
             f"({len(matched)} of {len(spec.keys)} keys matched)"
         )
-        shared = spec.shared_entries()
+        # Only the entries that took rows: one added mid-run and narrowed
+        # before its pile went out is on the spec but took nothing.
+        shared = spec._replace(keys=frozenset(matched)).shared_entries()
         if shared:
             optional = spec.columns[spec.required]
             line += (

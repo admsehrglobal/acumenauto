@@ -525,28 +525,115 @@ async def _open_report_iframe(
                 )
 
 
+# How long an export gets to hand its file over, per attempt. It is the value
+# the waiter always had (it inherited the context default set in
+# `download_reports`), written down so it cannot drift with that default.
+# Measured on the 2026-09-26 16:00 UTC run: the biggest export there is, the
+# unfiltered first attempt of 'Paid Invoices' (Power BI's 150k-row cap), went
+# from "Exporting part" to its logged result in 32 s, and that includes the
+# ~5.5 s the filter sleeps and reading the file back. Waiting longer would not
+# have saved run #954: when its wait gave up, the report canvas was blank.
+_DOWNLOAD_TIMEOUT_MS = 60000
+
+# Exports per file that may come back with nothing before the run gives up.
+# Counted apart from `_FILTER_ATTEMPTS`: the first chunk of every tab already
+# spends one attempt on the lost filter commit, so a shared budget would leave
+# that chunk a single retry.
+_DOWNLOAD_ATTEMPTS = 3
+
+
+class DownloadNotReceived(Exception):
+    """The export button was clicked and no download arrived in time.
+
+    Runs #183 (2026-05-29) and #954 (2026-09-26) each lost the invoice file to
+    one of these, with no retry. Its own class because it is the one export
+    failure that asking again can fix: the click went through (a click that
+    never dispatches raises `Locator.click` instead, and keeps doing so), so
+    the page is still there to ask.
+    """
+
+
+async def _click_and_save_download(
+    page: Page, export_btn, target: Path, what: str
+) -> None:
+    """Click `export_btn` and save the file it downloads to `target`.
+
+    The waiter hears only downloads that start after `expect_download()` is
+    called, takes the first one, and stops listening when it times out. So a
+    retry can be handed the file of the attempt that timed out, if that one
+    shows up late. For the same export under the same filter that is harmless;
+    a chunk's file under any other range fails the footer check in
+    `_validate_chunk_xlsx`.
+    """
+    clicked = False
+    try:
+        async with page.expect_download(
+            timeout=_DOWNLOAD_TIMEOUT_MS
+        ) as download_info:
+            await export_btn.click(force=True)
+            clicked = True
+    except PlaywrightTimeoutError as exc:
+        if not clicked:
+            # The click itself timed out: a different failure, with its own
+            # message, that a re-export does not fix.
+            raise
+        raise DownloadNotReceived(
+            f"{what}: export clicked, no file after "
+            f"{_DOWNLOAD_TIMEOUT_MS // 1000}s"
+        ) from exc
+    download = await download_info.value
+    await download.save_as(target)
+
+
+async def _count_or_minus_one(locator) -> int:
+    """`count()` runs none of the action pre-checks, so it answers even on a
+    page where every action blocks. -1 when even that fails: this runs on an
+    error path, and raising here would replace the error being handled."""
+    try:
+        return await asyncio.wait_for(locator.count(), 5)
+    except (PlaywrightError, TimeoutError):
+        return -1
+
+
 async def _export_excel(
     page: Page, report_button_name: str, output_dir: Path, timestamp_label: str
 ) -> Path:
     iframe = await _open_report_iframe(page, report_button_name)
 
-    more_btn = iframe.get_by_test_id("visual-more-options-btn")
-    await more_btn.wait_for(state="attached")
-    # force=True evita que tooltips de Power BI intercepten los clicks en headless.
-    await more_btn.click(force=True)
-    await iframe.get_by_test_id("pbimenu-item.Export data").click(force=True)
-    await iframe.get_by_text("Data with current layout").click(force=True)
-
-    async with page.expect_download() as download_info:
-        await iframe.get_by_test_id("export-btn").click(force=True)
-    download = await download_info.value
-
     # El portal siempre sugiere "data.xlsx" — derivamos del button_name + timestamp
     # para no pisar archivos y que cada run quede identificable en el inbox.
     slug = "_".join(report_button_name.lower().split())
     target = output_dir / f"{slug}_{timestamp_label}.xlsx"
-    await download.save_as(target)
-    return target
+
+    more_btn = iframe.get_by_test_id("visual-more-options-btn")
+    export_btn = iframe.get_by_test_id("export-btn")
+    # This report runs before the invoice file and has no try/except of its
+    # own, so a lost export here used to cost the invoice file too.
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        await more_btn.wait_for(state="attached")
+        # force=True evita que tooltips de Power BI intercepten los clicks en headless.
+        await more_btn.click(force=True)
+        await iframe.get_by_test_id("pbimenu-item.Export data").click(force=True)
+        await iframe.get_by_text("Data with current layout").click(force=True)
+        try:
+            await _click_and_save_download(
+                page, export_btn, target, report_button_name
+            )
+            return target
+        except DownloadNotReceived:
+            logger.warning(
+                "[REPORT] %s: no download (attempt %d/%d): url=%s "
+                "export_dialogs=%d%s",
+                report_button_name, attempt, _DOWNLOAD_ATTEMPTS, page.url,
+                await _count_or_minus_one(export_btn),
+                ", closing the dialog and exporting again"
+                if attempt < _DOWNLOAD_ATTEMPTS else " - giving up",
+            )
+            if attempt == _DOWNLOAD_ATTEMPTS:
+                raise
+            # A click that did nothing leaves the export dialog open.
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(2)
 
 
 def require_known_columns(
@@ -889,6 +976,8 @@ async def _export_chunked_report(
     # sus propias columnas. Con `extra_tabs` vacio se escribe una sola vez y
     # todo se comporta igual que antes.
     tab = {
+        "name": tab_name,
+        "reset_slicers": reset_slicers,
         "start_input": date_inputs.nth(start_idx),
         "end_input": date_inputs.nth(end_idx),
         "fmt": date_fmt,
@@ -902,6 +991,39 @@ async def _export_chunked_report(
     # group parts into files that fit an email and to label each file with its
     # own date range. Parts the adaptive driver discards stay here unused.
     part_meta: dict[Path, tuple[dt.date, dt.date, int]] = {}
+
+    # El tab nuevo tiene multiples visuals — scope al table visual via
+    # aria-label ("Row" lo distingue de los charts).
+    table_visual = iframe.get_by_role("group").filter(
+        has_text="Scroll left Scroll right Row"
+    )
+    more_btn = table_visual.get_by_test_id("visual-more-options-btn")
+    export_item = iframe.get_by_test_id("pbimenu-item.Export data")
+    export_btn = iframe.get_by_test_id("export-btn")
+
+    async def _recover_missing_download():
+        """Put the tab back the way the export needs it before asking again.
+
+        A click that did nothing leaves the export dialog open on top of the
+        date inputs the next attempt types into, hence the Escape. And run
+        #954's screenshot, taken when its wait gave up, showed the report canvas
+        blank: if Power BI reloaded the report, the tab and the slicers that
+        `reset_slicers` clears are back to their defaults, and the footer check
+        sees only the date range, not those slicers. Both steps are no-ops on a
+        tab that is already right; the date filter is re-applied by the
+        caller's loop.
+
+        Deliberately not a second `_prepare_tab`: it re-identifies the date
+        slicer from aria-labels, and those restate the current selection once a
+        filter is applied. The positional inputs in `tab` stay valid.
+        """
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(2)
+        if tab["name"] is not None:
+            await iframe.get_by_role("tab", name=tab["name"]).click()
+            await asyncio.sleep(3)
+        for slicer_label in tab["reset_slicers"]:
+            await _clear_slicer_filter(page, iframe, slicer_label)
 
     async def _export_one_range(chunk_start, chunk_end, seq):
         """Setea el filtro de fechas, exporta el visual a xlsx y devuelve
@@ -931,14 +1053,6 @@ async def _export_chunked_report(
         expected = (None, None) if covers_everything else (chunk_start, chunk_end)
 
         async def _download_once():
-            # El tab nuevo tiene multiples visuals — scope al table visual via
-            # aria-label ("Row" lo distingue de los charts).
-            table_visual = iframe.get_by_role("group").filter(
-                has_text="Scroll left Scroll right Row"
-            )
-            more_btn = table_visual.get_by_test_id("visual-more-options-btn")
-            export_item = iframe.get_by_test_id("pbimenu-item.Export data")
-
             # En iter >= 2 a veces el click sobre "..." no abre el menu (el
             # visual esta busy con el re-render del filtro nuevo). Retry con
             # Escape + hover entre intentos para limpiar el estado.
@@ -962,17 +1076,38 @@ async def _export_chunked_report(
             await export_item.click(force=True)
             await iframe.get_by_text("Data with current layout").click(force=True)
 
-            async with page.expect_download() as download_info:
-                await iframe.get_by_test_id("export-btn").click(force=True)
-            download = await download_info.value
-            await download.save_as(part_path)
+            await _click_and_save_download(
+                page, export_btn, part_path, f"Part {seq} ({label})"
+            )
 
-        for attempt in range(1, _FILTER_ATTEMPTS + 1):
+        # Two budgets, one per failure: a footer that does not confirm the
+        # range, and an export that never produced a file. Both re-apply the
+        # filter, so neither retry trusts the state the other one left.
+        mismatches = misses = 0
+        while True:
             await _set_date_filter(
                 tab["start_input"], tab["end_input"],
                 chunk_start, chunk_end, tab["fmt"],
             )
-            await _download_once()
+            try:
+                await _download_once()
+            except DownloadNotReceived:
+                misses += 1
+                # tables=0: the canvas was empty (run #954). export_dialogs=1:
+                # the dialog is still open, so the click did nothing.
+                logger.warning(
+                    "[REPORT chunked] Part %d (%s): no download (attempt %d/%d): "
+                    "url=%s tables=%d export_dialogs=%d%s",
+                    seq, label, misses, _DOWNLOAD_ATTEMPTS, page.url,
+                    await _count_or_minus_one(table_visual),
+                    await _count_or_minus_one(export_btn),
+                    ", re-preparing the tab and exporting again"
+                    if misses < _DOWNLOAD_ATTEMPTS else " - giving up",
+                )
+                if misses == _DOWNLOAD_ATTEMPTS:
+                    raise
+                await _recover_missing_download()
+                continue
             try:
                 rows = _validate_chunk_xlsx(
                     part_path, *expected,
@@ -980,12 +1115,13 @@ async def _export_chunked_report(
                 )
                 break
             except AppliedFilterMismatch as exc:
-                if attempt == _FILTER_ATTEMPTS:
+                mismatches += 1
+                if mismatches == _FILTER_ATTEMPTS:
                     raise
                 logger.warning(
                     "[REPORT chunked] Part %d (%s): %s — reaplicando el filtro "
                     "(intento %d/%d)",
-                    seq, label, exc, attempt, _FILTER_ATTEMPTS,
+                    seq, label, exc, mismatches, _FILTER_ATTEMPTS,
                 )
 
         part_meta[part_path] = (chunk_start, chunk_end, rows)
@@ -1019,6 +1155,8 @@ async def _export_chunked_report(
             reset_slicers=(),
         )
         tab.update({
+            "name": extra,
+            "reset_slicers": (),
             "start_input": extra_inputs.nth(extra_start_idx),
             "end_input": extra_inputs.nth(extra_end_idx),
             "fmt": extra_fmt,

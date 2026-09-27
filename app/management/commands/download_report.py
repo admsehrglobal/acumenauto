@@ -682,6 +682,13 @@ class Command(BaseCommand):
                 return
             _send(path, display_name)
 
+        def on_retry(label: str, reason: str) -> None:
+            # A report tried again in a new browser session. The attempt count
+            # is what stays: a retry that works leaves the run as green as any
+            # other, and the server's logs last only hours.
+            run.attempt_number += 1
+            run.save(update_fields=["attempt_number"])
+
         dci_username, dci_password = config.effective_dci_credentials()
         try:
             items = asyncio.run(
@@ -698,6 +705,7 @@ class Command(BaseCommand):
                         parts, name, output_dir, timestamp_label,
                         exceptions["accruals"],
                     ),
+                    on_retry=on_retry,
                 )
             )
             if deferred:

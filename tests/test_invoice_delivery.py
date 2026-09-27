@@ -39,9 +39,11 @@ class _FakeRun:
         self.error_message = ""
         self.filenames = ""
         self.finished_at = None
+        self.attempt_number = 1
+        self.saved_fields = []
 
-    def save(self):
-        pass
+    def save(self, update_fields=None):
+        self.saved_fields.append(update_fields)
 
 
 class DeliveryOrderTests(unittest.TestCase):
@@ -108,10 +110,12 @@ class DeliveryOrderTests(unittest.TestCase):
             (payable, f"R1 - {PILE_PAYABLE} (2025-06-08 to 2026-08-25)"),
         ]
 
-    def _run_command(self, fail_after=None):
+    def _run_command(self, fail_after=None, retried=()):
         items = self._piles()
 
         async def _fake_download(**kwargs):
+            for label in retried:
+                kwargs["on_retry"](label, "Locator.click: Timeout 60000ms exceeded.")
             ready = kwargs["on_report_ready"]
             for item in items:
                 ready(*item)
@@ -159,6 +163,18 @@ class DeliveryOrderTests(unittest.TestCase):
         self.assertIn(PILE_PAYABLE, self.run.error_message)
         self.assertFalse((self.tmp / "payable.xlsx").exists(),
                          "the undelivered pile must not be left behind")
+
+    def test_a_report_tried_again_leaves_its_trace_on_the_run(self):
+        """A retry that works leaves a green run like any other; the attempt
+        count is what the record keeps (the server's logs last hours)."""
+        self._run_command(retried=["R1"])
+        self.assertEqual(self.run.attempt_number, 2)
+        self.assertIn(["attempt_number"], self.run.saved_fields)
+        self.assertEqual(self.run.status, cmd.Run.Status.SUCCESS)
+
+    def test_a_run_with_no_retry_stays_at_attempt_one(self):
+        self._run_command()
+        self.assertEqual(self.run.attempt_number, 1)
 
 
 if __name__ == "__main__":

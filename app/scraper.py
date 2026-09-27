@@ -21,6 +21,7 @@ import datetime as dt
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -182,70 +183,78 @@ async def download_reports(
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            accept_downloads=True,
-            locale="en-US",
-        )
-        # Las paginas disparan una cadena federada de OAuth (xcore -> xcore-auth
-        # -> portal principal -> vuelta) que puede tardar > 30s default.
-        context.set_default_timeout(60000)
+        session = _Session(browser, username, password)
+        started = time.monotonic()
 
         try:
-            page = await context.new_page()
-            await _login(page, username, password)
-            report_page = await _open_reports_popup(page, username, password)
-            _trace_navigations(report_page)
+            await session.open()
 
             async def _ready(item: tuple[Path, str]) -> None:
                 # Corre en thread: el callback hace I/O bloqueante (email Brevo).
                 if on_report_ready is not None:
                     await asyncio.to_thread(on_report_ready, item[0], item[1])
 
+            async def _attempt(label: str, work):
+                return await _retry_in_new_session(
+                    session, label, work, started, output_dir
+                )
+
+            # Only the export is retried, never `_ready`: a report that has been
+            # handed over (emailed) is not asked for again.
             results: list[tuple[Path, str]] = []
             for report_url, button_name in reports:
-                await report_page.goto(report_url)
-                logger.warning("[REPORT] URL post-goto: %s", report_page.url)
-                path = await _export_excel(
-                    report_page, button_name, output_dir, timestamp_label
-                )
+                async def export_simple(page, report_url=report_url, button_name=button_name):
+                    await page.goto(report_url)
+                    logger.warning("[REPORT] URL post-goto: %s", page.url)
+                    return await _export_excel(
+                        page, button_name, output_dir, timestamp_label
+                    )
+
+                path = await _attempt(button_name, export_simple)
                 item = (path, button_name)
                 results.append(item)
                 await _ready(item)
 
             for spec in chunked_reports:
-                await report_page.goto(spec.url)
-                logger.warning("[REPORT chunked] URL post-goto: %s", report_page.url)
-                chunked_items = await _export_chunked_report(
-                    report_page,
-                    spec.button_name,
-                    spec.n_chunks,
-                    output_dir,
-                    timestamp_label,
-                    spec.today,
-                    tab_name=spec.tab_name,
-                    single_slicer=spec.single_slicer,
-                    full_range=spec.full_range,
-                    reset_slicers=spec.reset_slicers,
-                    invoice_split=spec.invoice_split,
-                    exceptions=spec.exceptions,
-                    required_columns=spec.required_columns,
-                    extra_tabs=spec.extra_tabs,
-                )
+                async def export_chunked(page, spec=spec):
+                    await page.goto(spec.url)
+                    logger.warning("[REPORT chunked] URL post-goto: %s", page.url)
+                    return await _export_chunked_report(
+                        page,
+                        spec.button_name,
+                        spec.n_chunks,
+                        output_dir,
+                        timestamp_label,
+                        spec.today,
+                        tab_name=spec.tab_name,
+                        single_slicer=spec.single_slicer,
+                        full_range=spec.full_range,
+                        reset_slicers=spec.reset_slicers,
+                        invoice_split=spec.invoice_split,
+                        exceptions=spec.exceptions,
+                        required_columns=spec.required_columns,
+                        extra_tabs=spec.extra_tabs,
+                    )
+
+                chunked_items = await _attempt(spec.button_name, export_chunked)
                 results.extend(chunked_items)
                 for item in chunked_items:
                     await _ready(item)
 
             for spec in matrix_reports:
-                await report_page.goto(spec.url)
-                logger.warning("[REPORT matrix] URL post-goto: %s", report_page.url)
-                parts = await _export_matrix_report(
-                    report_page,
-                    spec.button_name,
-                    spec.n_chunks,
-                    output_dir,
-                    timestamp_label,
-                    spec.floor_date,
-                )
+                async def export_matrix(page, spec=spec):
+                    await page.goto(spec.url)
+                    logger.warning("[REPORT matrix] URL post-goto: %s", page.url)
+                    return await _export_matrix_report(
+                        page,
+                        spec.button_name,
+                        spec.n_chunks,
+                        output_dir,
+                        timestamp_label,
+                        spec.floor_date,
+                    )
+
+                parts = await _attempt(spec.button_name, export_matrix)
                 try:
                     # El armado lee la base (el lookup de PAs), asi que vive en
                     # el caller: este modulo se mantiene Django-free.
@@ -259,11 +268,86 @@ async def download_reports(
                 await _ready(item)
             return results
         except Exception:
-            await _dump_debug(context, output_dir)
+            if session.context is not None:
+                await _dump_debug(session.context, output_dir)
             raise
         finally:
-            await context.close()
+            await session.close()
             await browser.close()
+
+
+class _Session:
+    """One logged-in browser context and the reports page it opened."""
+
+    def __init__(self, browser, username: str, password: str):
+        self._browser = browser
+        self._username = username
+        self._password = password
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
+
+    async def open(self) -> None:
+        self.context = await self._browser.new_context(
+            accept_downloads=True,
+            locale="en-US",
+        )
+        # Las paginas disparan una cadena federada de OAuth (xcore -> xcore-auth
+        # -> portal principal -> vuelta) que puede tardar > 30s default.
+        self.context.set_default_timeout(60000)
+        page = await self.context.new_page()
+        await _login(page, self._username, self._password)
+        self.page = await _open_reports_popup(page, self._username, self._password)
+        _trace_navigations(self.page)
+
+    async def close(self) -> None:
+        if self.context is not None:
+            context, self.context, self.page = self.context, None, None
+            await context.close()
+
+
+# A report the portal would not let us open or export is tried once more, in a
+# new browser session with a fresh login, instead of waiting for the next run.
+# Run #951 (2026-09-25 19:00 UTC) lost the invoice file that way: the reports
+# page stayed stuck mid-navigation through all three reloads of
+# `_open_report_iframe`, all in the same session, and the next file went out
+# three hours later. Only failures of the portal or the browser qualify: a
+# column the export no longer carries fails the same way twice, and still stops
+# the run at once. (Those failures are PlaywrightError, DownloadNotReceived and
+# AppliedFilterMismatch, named in the `except` below: the last two are defined
+# further down this module.)
+_REPORT_RETRY_PAUSE_S = 60
+# No second try once the run is this far in. #951 failed 10 minutes in; a retry
+# costs ~6 more, and the payable pile then waits `INVOICE_PILE_GAP_S` (10 min)
+# inside the same task, whose soft limit is 38 minutes.
+_REPORT_RETRY_WINDOW_S = 12 * 60
+
+
+async def _retry_in_new_session(session: _Session, label: str, work, started: float,
+                                output_dir: Path):
+    """Run `work(page)`; on a portal failure, once more in a new session."""
+    try:
+        return await work(session.page)
+    except (PlaywrightError, DownloadNotReceived, AppliedFilterMismatch) as exc:
+        elapsed = time.monotonic() - started
+        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if elapsed > _REPORT_RETRY_WINDOW_S:
+            logger.warning(
+                "[REPORT] %s failed %d min into the run, too late to try again: %s",
+                label, elapsed // 60, reason,
+            )
+            raise
+        logger.warning(
+            "[REPORT] %s failed (%s); trying once more in a new browser session "
+            "in %d s", label, reason, _REPORT_RETRY_PAUSE_S,
+        )
+        # Kept on the server (like any failed run's) to read what the page showed.
+        await _dump_debug(session.context, output_dir)
+        await session.close()
+        await asyncio.sleep(_REPORT_RETRY_PAUSE_S)
+        await session.open()
+        result = await work(session.page)
+        logger.warning("[REPORT] %s: the second try in a new session worked", label)
+        return result
 
 
 async def _login(page: Page, username: str, password: str) -> None:
@@ -527,7 +611,7 @@ async def _open_report_iframe(
 
 # How long an export gets to hand its file over, per attempt. It is the value
 # the waiter always had (it inherited the context default set in
-# `download_reports`), written down so it cannot drift with that default.
+# `_Session.open`), written down so it cannot drift with that default.
 # Measured on the 2026-09-26 16:00 UTC run: the biggest export there is, the
 # unfiltered first attempt of 'Paid Invoices' (Power BI's 150k-row cap), went
 # from "Exporting part" to its logged result in 32 s, and that includes the

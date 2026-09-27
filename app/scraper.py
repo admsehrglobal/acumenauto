@@ -142,6 +142,7 @@ async def download_reports(
     on_report_ready=None,
     matrix_reports: list["MatrixReport"] = (),
     assemble_matrix=None,
+    on_retry=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
@@ -175,6 +176,10 @@ async def download_reports(
     fallo en R3 no se lleva puesto el envio de R1/R2 que ya estaban listos. Se
     ejecuta en un thread para no bloquear el event loop de Playwright.
 
+    `on_retry(label, reason)` (opcional): se invoca, tambien en un thread, justo
+    antes de reintentar un reporte en una sesion nueva (ver
+    `_retry_in_new_session`), para que el caller lo deje registrado.
+
     Devuelve lista de (path, display_name) por archivo descargado — un tuple
     por reporte simple, N tuples por reporte chunked. El display_name va al
     subject del email.
@@ -196,7 +201,7 @@ async def download_reports(
 
             async def _attempt(label: str, work):
                 return await _retry_in_new_session(
-                    session, label, work, started, output_dir
+                    session, label, work, started, output_dir, on_retry
                 )
 
             # Only the export is retried, never `_ready`: a report that has been
@@ -304,13 +309,16 @@ class _Session:
             context, self.context, self.page = self.context, None, None
             await context.close()
 
+    def connected(self) -> bool:
+        return self._browser.is_connected()
+
 
 # A report the portal would not let us open or export is tried once more, in a
 # new browser session with a fresh login, instead of waiting for the next run.
 # Run #951 (2026-09-25 19:00 UTC) lost the invoice file that way: the reports
 # page stayed stuck mid-navigation through all three reloads of
 # `_open_report_iframe`, all in the same session, and the next file went out
-# three hours later. Only failures of the portal or the browser qualify: a
+# three hours later. Only failures of the portal or the page qualify: a
 # column the export no longer carries fails the same way twice, and still stops
 # the run at once. (Those failures are PlaywrightError, DownloadNotReceived and
 # AppliedFilterMismatch, named in the `except` below: the last two are defined
@@ -322,30 +330,59 @@ _REPORT_RETRY_PAUSE_S = 60
 _REPORT_RETRY_WINDOW_S = 12 * 60
 
 
+def _first_line(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text.splitlines()[0] if text else type(exc).__name__
+
+
 async def _retry_in_new_session(session: _Session, label: str, work, started: float,
-                                output_dir: Path):
-    """Run `work(page)`; on a portal failure, once more in a new session."""
+                                output_dir: Path, on_retry=None):
+    """Run `work(page)`; on a portal failure, once more in a new session.
+
+    `on_retry(label, reason)` hears about the retry before it starts, so the
+    run record keeps a trace of it: a retry that works leaves a run as green as
+    any other, and the server's logs last hours. A second failure is raised
+    naming both, so the record does not read like a run that never retried.
+    """
     try:
         return await work(session.page)
     except (PlaywrightError, DownloadNotReceived, AppliedFilterMismatch) as exc:
         elapsed = time.monotonic() - started
-        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        reason = _first_line(exc)
         if elapsed > _REPORT_RETRY_WINDOW_S:
             logger.warning(
                 "[REPORT] %s failed %d min into the run, too late to try again: %s",
                 label, elapsed // 60, reason,
             )
             raise
+        if not session.connected():
+            # The browser itself is gone (the worker killed it, say): a new
+            # session cannot be opened on it, and trying would only replace
+            # the real error with that one.
+            raise
         logger.warning(
             "[REPORT] %s failed (%s); trying once more in a new browser session "
             "in %d s", label, reason, _REPORT_RETRY_PAUSE_S,
         )
-        # Kept on the server (like any failed run's) to read what the page showed.
-        await _dump_debug(session.context, output_dir)
+        # Kept on the server under its own name, so the dump of a second
+        # failure cannot overwrite it or be mixed with it.
+        await _dump_debug(session.context, output_dir, prefix="retry")
+        if on_retry is not None:
+            await asyncio.to_thread(on_retry, label, reason)
         await session.close()
         await asyncio.sleep(_REPORT_RETRY_PAUSE_S)
-        await session.open()
-        result = await work(session.page)
+        try:
+            await session.open()
+            result = await work(session.page)
+        except Exception as second:
+            logger.warning(
+                "[REPORT] %s: the second try in a new session failed too: %s",
+                label, _first_line(second),
+            )
+            raise RuntimeError(
+                f"{label} failed in two browser sessions. First: {reason} | "
+                f"Second: {_first_line(second)}"
+            ) from second
         logger.warning("[REPORT] %s: the second try in a new session worked", label)
         return result
 
@@ -2114,18 +2151,20 @@ async def _read_single_slicer(
     return start_idx, end_idx, min_d, max_d, date_fmt
 
 
-async def _dump_debug(context: BrowserContext, output_dir: Path) -> None:
+async def _dump_debug(
+    context: BrowserContext, output_dir: Path, prefix: str = "error"
+) -> None:
     """En error, dump screenshot + HTML + URL de cada pagina del context."""
     for i, p in enumerate(context.pages):
         try:
             await p.screenshot(
-                path=str(output_dir / f"error_{i}.png"), full_page=True
+                path=str(output_dir / f"{prefix}_{i}.png"), full_page=True
             )
-            (output_dir / f"error_{i}.url").write_text(
+            (output_dir / f"{prefix}_{i}.url").write_text(
                 f"{p.url}\n{await p.title()}\n", encoding="utf-8"
             )
             html = await p.content()
-            (output_dir / f"error_{i}.html").write_text(html, encoding="utf-8")
+            (output_dir / f"{prefix}_{i}.html").write_text(html, encoding="utf-8")
             logger.error("Debug dump page %d: %s", i, p.url)
         except Exception as exc:
             logger.error("No pude capturar page %d: %s", i, exc)

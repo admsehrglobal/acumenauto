@@ -227,3 +227,29 @@ def send_error_report(run, reporter_username: str) -> None:
         "Error report sent for Run #%s. Brevo message_id=%s",
         run.pk, response.message_id,
     )
+
+
+def send_watchdog_alert(problems: list[str], process: str) -> None:
+    """Tell SUPPORT_EMAIL that scheduled runs are not happening (see app/watchdog.py)."""
+    text_content = (
+        "Scheduled runs are not happening:\n\n"
+        + "".join(f"- {p}\n" for p in problems)
+        + f"\nNoticed by the {process} process. Check `fly machines list -a acumenauto`.\n"
+    )
+    html_content = (
+        "<p><strong>Scheduled runs are not happening:</strong></p><ul>"
+        + "".join(f"<li>{p}</li>" for p in problems)
+        + f"</ul><p>Noticed by the {process} process. Check "
+        f"<code>fly machines list -a acumenauto</code>.</p>"
+    )
+    email = SendSmtpEmail(
+        sender=SendSmtpEmailSender(
+            name="Paul Blood", email=settings.DEFAULT_FROM_EMAIL
+        ),
+        to=[SendSmtpEmailTo(email=settings.SUPPORT_EMAIL)],
+        subject="[AcumenAuto] Scheduled runs are not happening",
+        html_content=html_content,
+        text_content=text_content,
+    )
+    response = _get_brevo_api_instance().send_transac_email(email)
+    logger.info("Watchdog alert sent. Brevo message_id=%s", response.message_id)

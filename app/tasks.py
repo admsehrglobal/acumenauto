@@ -21,6 +21,52 @@ def download_dci_reports_weekly():
     call_command("download_report", reports="3")
 
 
+@shared_task(
+    name="app.tasks.recheck_delivery",
+    autoretry_for=(Exception,),
+    max_retries=3,
+    default_retry_delay=60,
+)
+def recheck_delivery(run_id, unconfirmed):
+    """Second look at the mails a run sent but Brevo had not confirmed yet.
+
+    The run already finished as SUCCESS; it only flips to FAILED (and alerts) if
+    Brevo now shows a real failure or still shows nothing at all. Safe to run
+    twice (a retry, or Redis redelivering it after the visibility timeout while
+    a long run holds the only worker slot): only the run that flips the row
+    alerts.
+    """
+    import logging
+
+    from app.email_utils import unconfirmed_problems, verify_delivery
+    from app.management.commands.download_report import (
+        DELIVERY_RECHECK_S,
+        _notify_failure,
+    )
+    from app.models import Run
+
+    logger = logging.getLogger(__name__)
+    unconfirmed = [tuple(item) for item in unconfirmed]
+    # A short poll, not a single query, so one Brevo API error is not read as
+    # "still no event" (verify_delivery leaves an id it could not query pending).
+    problems, still = verify_delivery(unconfirmed, timeout_s=60, poll_s=15)
+    problems += unconfirmed_problems(still, f"{DELIVERY_RECHECK_S // 60} min")
+    if not problems:
+        logger.warning(
+            "[email] Run #%s: entrega confirmada en el segundo chequeo (%s)",
+            run_id, ", ".join(name for name, _ in unconfirmed),
+        )
+        return
+
+    for problem in problems:
+        logger.error("[email] Run #%s: %s", run_id, problem)
+    flipped = Run.objects.filter(pk=run_id, status=Run.Status.SUCCESS).update(
+        status=Run.Status.FAILED, error_message="[email] " + " | ".join(problems)
+    )
+    if flipped:
+        _notify_failure(Run.objects.get(pk=run_id))
+
+
 @shared_task(name="app.tasks.test_dci_login")
 def test_dci_login():
     """Test the effective DCI credentials (AppConfig with env fallback) by running

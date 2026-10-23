@@ -41,7 +41,12 @@ AUTH_COLUMNS = (
     "Billing Rate", "Monthly Max", "Weekly Max", "Daily Max", "Daily Rate",
     "Billing Unit", "Non Billable", "Billing Hold", "Status", "Created By",
 )
-from app.email_utils import send_error_report, send_reports_email, verify_delivery
+from app.email_utils import (
+    send_error_report,
+    send_reports_email,
+    unconfirmed_problems,
+    verify_delivery,
+)
 from app.file_exceptions import (
     REPORTS,
     DropSpec,
@@ -96,6 +101,14 @@ CLIENT_TZ = ZoneInfo("America/New_York")
 # the chunk count. A deploy landing inside the window still costs the payable
 # pile for that run.
 INVOICE_PILE_GAP_S = 10 * 60
+
+# How long to wait before asking Brevo again about a mail its event API did not
+# confirm within the run. The API lags the real delivery: Run #1080 (23-oct-2026)
+# was delivered 4 s after sending and still showed nothing at 90 s, and an
+# accrual mail on 22-oct showed nothing after 10 min. The Redis broker redelivers
+# an unacked task after an hour, so a worker restart does not lose the re-check
+# (and a duplicate is harmless: see `recheck_delivery`).
+DELIVERY_RECHECK_S = 30 * 60
 
 
 
@@ -748,7 +761,11 @@ class Command(BaseCommand):
 
         # Que Brevo acepte el mail no es que haya llegado: confirmamos contra sus
         # eventos antes de dar el run por bueno.
-        delivery_problems = verify_delivery(accepted)
+        delivery_problems, unconfirmed = verify_delivery(accepted)
+        recheck = bool(unconfirmed) and not (send_errors or delivery_problems)
+        if unconfirmed and not recheck:
+            # The run is failing and alerting anyway: say it all in one mail.
+            delivery_problems += unconfirmed_problems(unconfirmed, "90s")
         for problem in delivery_problems:
             logger.error("[email] %s", problem)
 
@@ -756,6 +773,21 @@ class Command(BaseCommand):
         run.exceptions_summary = summarize(exceptions.values())
         _stamp_matches_safely(exceptions)
         failures = send_errors + delivery_problems
+        if recheck:
+            from app.tasks import recheck_delivery
+
+            try:
+                recheck_delivery.apply_async(
+                    args=[run.pk, unconfirmed], countdown=DELIVERY_RECHECK_S
+                )
+                logger.warning(
+                    "[email] Run #%s: %d mail(s) sin confirmar todavia; "
+                    "re-chequeo en %d min", run.pk, len(unconfirmed),
+                    DELIVERY_RECHECK_S // 60,
+                )
+            except Exception:  # noqa: BLE001 - sin re-chequeo, avisamos ahora
+                logger.exception("[email] no pude programar el re-chequeo")
+                failures = unconfirmed_problems(unconfirmed, "90s")
         if failures:
             run.status = Run.Status.FAILED
             run.error_message = "[email] " + " | ".join(failures)
@@ -785,6 +817,11 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.SUCCESS(
                     f"Emailed {len(sent)} report(s) to "
-                    f"{', '.join(recipients)} (Run #{run.pk}), entrega confirmada."
+                    f"{', '.join(recipients)} (Run #{run.pk}), "
+                    + (
+                        f"entrega de {len(unconfirmed)} sin confirmar todavia "
+                        f"(re-chequeo en {DELIVERY_RECHECK_S // 60} min)."
+                        if recheck else "entrega confirmada."
+                    )
                 )
             )

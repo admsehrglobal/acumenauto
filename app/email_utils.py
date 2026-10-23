@@ -132,17 +132,23 @@ FAILURE_EVENTS = {
 
 def verify_delivery(
     sent: list[tuple[str, str]], timeout_s: int = 90, poll_s: int = 10
-) -> list[str]:
-    """Confirma contra Brevo que cada mail de `sent` llego, y devuelve la lista de
-    problemas (vacia = todo entregado).
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Confirma contra Brevo que cada mail de `sent` llego.
+
+    Devuelve `(problems, unconfirmed)`: `problems` son los mails con un evento de
+    falla real (rebote, bloqueo...); `unconfirmed` son los `(name, message_id)`
+    que todavia no muestran ningun evento terminal. Los dos vacios = todo entregado.
 
     Que `send_transac_email` no tire error solo significa que Brevo acepto el
     mensaje, no que el destinatario lo tenga. Consultamos el event report por
-    message_id hasta ver un evento terminal o agotar `timeout_s` (los eventos
-    tardan segundos en aparecer, por eso el poll).
+    message_id hasta ver un evento terminal o agotar `timeout_s`.
+
+    Unconfirmed is NOT a failure: Brevo's event API can lag many minutes behind
+    the actual delivery (Run #1080, 23-oct-2026: delivered 4 s after sending,
+    still invisible to the API at 90 s). The caller re-checks it later instead.
     """
     if not sent:
-        return []
+        return [], []
 
     api = _get_brevo_api_instance()
     pending = {mid: name for name, mid in sent}
@@ -175,12 +181,16 @@ def verify_delivery(
             break
         time.sleep(poll_s)
 
-    for message_id, name in pending.items():
-        problems.append(
-            f"{name}: sin confirmacion de entrega despues de {timeout_s}s "
-            f"(message_id={message_id}) — revisar en el panel de Brevo"
-        )
-    return problems
+    return problems, [(name, mid) for mid, name in pending.items()]
+
+
+def unconfirmed_problems(unconfirmed: list[tuple[str, str]], waited: str) -> list[str]:
+    """Describe the mails Brevo never confirmed, in the run's error format."""
+    return [
+        f"{name}: sin confirmacion de entrega despues de {waited} "
+        f"(message_id={message_id}) — revisar en el panel de Brevo"
+        for name, message_id in unconfirmed
+    ]
 
 
 def send_error_report(run, reporter_username: str) -> None:

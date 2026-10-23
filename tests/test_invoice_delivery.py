@@ -65,7 +65,7 @@ class DeliveryOrderTests(unittest.TestCase):
 
         self.patches = [
             mock.patch.object(cmd, "send_reports_email", _fake_send),
-            mock.patch.object(cmd, "verify_delivery", lambda accepted: []),
+            mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], [])),
             mock.patch.object(cmd.time, "sleep", _fake_sleep),
             mock.patch.object(cmd, "_notify_failure", lambda run: None),
         ]

@@ -72,7 +72,7 @@ class ExceptionWiringTests(unittest.TestCase):
         patches = [
             mock.patch.object(cmd, "send_reports_email",
                               lambda items, r, l, override=None: []),
-            mock.patch.object(cmd, "verify_delivery", lambda accepted: []),
+            mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], [])),
             mock.patch.object(cmd.time, "sleep", lambda s: None),
             mock.patch.object(cmd, "_notify_failure", lambda run: None),
         ]

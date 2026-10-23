@@ -102,7 +102,7 @@ class LateEntryTests(unittest.TestCase):
 
         for target, value in [
             ("send_reports_email", _fake_send),
-            ("verify_delivery", lambda accepted: []),
+            ("verify_delivery", lambda accepted: ([], [])),
             ("_notify_failure", lambda run: None),
             ("_stamp_matches_safely", _capture_stamp),
             ("Run", mock.Mock(objects=run_mgr, Status=cmd.Run.Status)),

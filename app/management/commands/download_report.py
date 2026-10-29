@@ -54,6 +54,7 @@ from app.file_exceptions import (
     RowFilter,
     fold_key,
     make_drop_spec,
+    normalize_key,
     summarize,
 )
 from app.models import (
@@ -63,6 +64,12 @@ from app.models import (
     Recipient,
     Run,
     SharedKey,
+)
+from app.gs_auths import (
+    NOT_IN_R2_STATUS,
+    parse_decimal,
+    push_gs_authorizations,
+    record_scheduled_weeks,
 )
 from app.gs_status import extract_gs_entries, push_gs_entries
 from app.invoice_split import PILE_PAYABLE, subject_override_for
@@ -137,6 +144,13 @@ def _refresh_pa_schedules(path: Path) -> int:
                 [n for n in needed if n not in index],
             )
             return 0
+
+        # The G&S billing facts (see app.gs_auths). By name, and empty when a
+        # column is missing: they never cost the accrual lookup above.
+        def cell(row, name):
+            n = index.get(name)
+            return row[n] if n is not None and n < len(row) else None
+
         seen: dict[str, PaSchedule] = {}
         for row in rows[1:]:
             first = row[0] if row else None
@@ -154,13 +168,31 @@ def _refresh_pa_schedules(path: Path) -> int:
                 start_date=as_date(row[index["Start Date"]]),
                 end_date=as_date(row[index["End Date"]]),
                 source="auth_report",
+                authorization_id=normalize_key(cell(row, "Authorization ID")),
+                client_id=normalize_key(cell(row, "Client ID")),
+                service_code=normalize_key(cell(row, "Service Code")),
+                rate=parse_decimal(cell(row, "Rate ($)")),
+                total_units=parse_decimal(cell(row, "Total Units")),
+                initial_balance=parse_decimal(cell(row, "Initial Balance")),
+                status=normalize_key(cell(row, "Status")),
             )
         PaSchedule.objects.bulk_create(
             list(seen.values()),
             update_conflicts=True,
-            update_fields=["client_dddid", "start_date", "end_date", "source"],
+            update_fields=[
+                "client_dddid", "start_date", "end_date", "source",
+                "authorization_id", "client_id", "service_code", "rate",
+                "total_units", "initial_balance", "status",
+            ],
             unique_fields=["pa_number"],
         )
+        # R2 lists only current authorizations: a G&S one it no longer has was
+        # cancelled or expired, and is sent to tcgservices as such (see
+        # app.gs_auths). A later R2 that lists it again restores its status.
+        if seen:
+            (PaSchedule.objects.exclude(service_code="")
+             .exclude(pa_number__in=list(seen))
+             .update(status=NOT_IN_R2_STATUS))
         logger.warning("[PA LOOKUP] %d PAs actualizados desde el reporte de auths",
                        len(seen))
         return len(seen)
@@ -244,6 +276,17 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label, drop=None
         raise ValueError(
             "accrual: la matriz no devolvio ni una fila — no mando un archivo vacio"
         )
+
+    # The week each G&S authorization bills in, for tcgservices (see
+    # app.gs_auths). Before the accruals list drops anything: a row Paul keeps
+    # out of ZipRide's file is still that authorization's schedule. Bookkeeping,
+    # so it never costs the accrual file.
+    try:
+        record_scheduled_weeks(rows)
+    except SoftTimeLimitExceeded:
+        raise
+    except Exception:  # noqa: BLE001 - the accrual file does not depend on it
+        logger.exception("[GS AUTHS] could not record the scheduled weeks")
 
     if drop is not None:
         row_filter = RowFilter(list(OUTPUT_COLUMNS), drop)
@@ -602,6 +645,10 @@ class Command(BaseCommand):
         # The invoice file's TCG rows, for tcgservices (see app.gs_status). Filled
         # by `on_invoice_parts`; empty = R1 did not get that far in this run.
         gs_status: dict = {}
+        # When this run refreshed the stored G&S authorizations from R2 or R3
+        # (see app.gs_auths); empty = it read neither. `r2_not_stored` = R2 came
+        # down but could not be stored.
+        gs_auths: dict = {}
 
         def _emptied_by(path: Path):
             """The list that left this file with no data rows, if any."""
@@ -674,7 +721,12 @@ class Command(BaseCommand):
                 # excepcion de auths saca la fila del mail, no del lookup, y si
                 # se filtrara primero ese PA quedaria congelado en la tabla que
                 # alimenta el accrual.
-                _refresh_pa_schedules(path)
+                # Only a refresh that stored something makes the stored
+                # authorizations this run's; otherwise the push says so.
+                if _refresh_pa_schedules(path):
+                    gs_auths["at"] = timezone.now()
+                else:
+                    gs_auths["r2_not_stored"] = True
                 drop = exceptions["auths"]
                 if drop is not None:
                     try:
@@ -737,6 +789,33 @@ class Command(BaseCommand):
                 logger.exception("[GS STATUS] no pude mandar el estado a tcgservices")
                 return f"not sent: {exc}"
 
+        def _assemble(parts, name):
+            item = _assemble_accrual(
+                parts, name, output_dir, timestamp_label, exceptions["accruals"],
+            )
+            gs_auths["at"] = timezone.now()
+            return item
+
+        def _push_gs_auths() -> str:
+            """Send the stored G&S authorizations when this run refreshed them;
+            the line for the run record. Same rules as `_push_gs_status`."""
+            if not gs_auths:
+                return ""
+            r2_note = ("authorization report not stored (see the log)"
+                       if gs_auths.get("r2_not_stored") else "")
+            if "at" not in gs_auths:
+                return f"not sent: {r2_note}"
+            if no_email:
+                return "not sent: --no-email run"
+            try:
+                summary = push_gs_authorizations(gs_auths["at"])
+                return f"{summary}; {r2_note}" if r2_note else summary
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 - recorded on the run instead
+                logger.exception("[GS AUTHS] could not send the authorizations")
+                return f"not sent: {exc}"
+
         def on_retry(label: str, reason: str) -> None:
             # A report tried again in a new browser session. The attempt count
             # is what stays: a retry that works leaves the run as green as any
@@ -756,10 +835,7 @@ class Command(BaseCommand):
                     chunked_reports=chunked_reports,
                     on_report_ready=on_report_ready,
                     matrix_reports=matrix_reports,
-                    assemble_matrix=lambda parts, name: _assemble_accrual(
-                        parts, name, output_dir, timestamp_label,
-                        exceptions["accruals"],
-                    ),
+                    assemble_matrix=_assemble,
                     on_retry=on_retry,
                     on_invoice_parts=on_invoice_parts,
                 )
@@ -775,6 +851,7 @@ class Command(BaseCommand):
                 while deferred:
                     _send(*deferred.pop(0))
             run.gs_status_summary = _push_gs_status()
+            run.gs_auths_summary = _push_gs_auths()
         except Exception as exc:
             # Algunos reportes pueden haberse entregado antes del fallo.
             run.status = Run.Status.FAILED
@@ -804,6 +881,13 @@ class Command(BaseCommand):
             elif push_after_failure:
                 # Replaced by the push's own line below; stays only if it is cut off.
                 run.gs_status_summary = "not sent: the push after the failure did not finish"
+            # Same for the authorizations: what R2 or R3 stored is good.
+            push_auths_after_failure = bool(gs_auths) and not run.gs_auths_summary
+            if push_auths_after_failure and isinstance(exc, SoftTimeLimitExceeded):
+                run.gs_auths_summary = "not sent: the run hit its time limit"
+                push_auths_after_failure = False
+            elif push_auths_after_failure:
+                run.gs_auths_summary = "not sent: the push after the failure did not finish"
             _stamp_matches_safely(exceptions, complete=False)
             run.finished_at = timezone.now()
             run.save()
@@ -813,6 +897,9 @@ class Command(BaseCommand):
                 # cannot leave the run without its FAILED record.
                 run.gs_status_summary = _push_gs_status()
                 run.save(update_fields=["gs_status_summary"])
+            if push_auths_after_failure:
+                run.gs_auths_summary = _push_gs_auths()
+                run.save(update_fields=["gs_auths_summary"])
             raise
         finally:
             # Sent files are unlinked by `_send`; anything still deferred never

@@ -38,6 +38,8 @@ class Run(models.Model):
     # What happened to the G&S status push to tcgservices (see app.gs_status),
     # e.g. "sent 384 entries in 1 batch(es): ...". Never affects the run's status.
     gs_status_summary = models.TextField(blank=True, default="", db_default="")
+    # Same, for the G&S authorizations push (see app.gs_auths).
+    gs_auths_summary = models.TextField(blank=True, default="", db_default="")
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"
@@ -296,6 +298,22 @@ class PaSchedule(models.Model):
     # tellable from one the authorization report confirmed today.
     source = models.CharField(max_length=16, default="auth_report")
     updated_at = models.DateTimeField(auto_now=True)
+
+    # What tcgservices needs to bill a G&S invoice against this authorization
+    # (see app.gs_auths). Read from the authorization report only, so a seeded
+    # row keeps them empty. The text ones are wide on purpose: a value too long
+    # aborts the whole refresh, accrual lookup included.
+    authorization_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    client_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    service_code = models.CharField(max_length=255, blank=True, default="", db_default="")
+    rate = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    total_units = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    initial_balance = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    status = models.CharField(max_length=255, blank=True, default="", db_default="")
+    # From the accrual matrix: the first week (Sunday) with an amount, and how
+    # many weeks have one. None / 0 = not known yet.
+    scheduled_week = models.DateField(null=True, blank=True)
+    scheduled_weeks = models.PositiveIntegerField(default=0, db_default=0)
 
     class Meta:
         ordering = ["pa_number"]

@@ -143,6 +143,7 @@ async def download_reports(
     matrix_reports: list["MatrixReport"] = (),
     assemble_matrix=None,
     on_retry=None,
+    on_invoice_parts=None,
 ) -> list[tuple[Path, str]]:
     """Login una vez, descarga cada reporte reusando el popup.
 
@@ -179,6 +180,11 @@ async def download_reports(
     `on_retry(label, reason)` (opcional): se invoca, tambien en un thread, justo
     antes de reintentar un reporte en una sesion nueva (ver
     `_retry_in_new_session`), para que el caller lo deje registrado.
+
+    `on_invoice_parts(part_paths)` (optional): called once the invoice file's
+    parts (every tab) are all on disk, before they are classified or merged, so
+    the caller can read the raw rows (see `app.gs_status`). Called again if the
+    report is retried in a new session; the last call is the one that counts.
 
     Devuelve lista de (path, display_name) por archivo descargado — un tuple
     por reporte simple, N tuples por reporte chunked. El display_name va al
@@ -239,6 +245,7 @@ async def download_reports(
                         exceptions=spec.exceptions,
                         required_columns=spec.required_columns,
                         extra_tabs=spec.extra_tabs,
+                        on_parts=on_invoice_parts if spec.invoice_split else None,
                     )
 
                 chunked_items = await _attempt(spec.button_name, export_chunked)
@@ -1030,6 +1037,7 @@ async def _export_chunked_report(
     exceptions: DropSpec | None = None,
     required_columns: tuple[str, ...] = (),
     extra_tabs: tuple[str, ...] = (),
+    on_parts=None,
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -1303,6 +1311,10 @@ async def _export_chunked_report(
 
     if extra_tabs:
         _normalise_part_headers(part_paths)
+
+    # The raw rows of every tab, before the split and before File Exceptions.
+    if on_parts is not None:
+        on_parts(list(part_paths))
 
     # One pile for a plain chunked report (R3), two for the invoice file (R1).
     # The pile goes into the slug: both piles cover the same date range, so

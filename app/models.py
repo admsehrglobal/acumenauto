@@ -35,6 +35,9 @@ class Run(models.Model):
     # "Invoices: 12 rows dropped (3 of 40 keys matched)". Empty when no list
     # applied to the files of this run.
     exceptions_summary = models.TextField(blank=True, default="", db_default="")
+    # What happened to the G&S status push to tcgservices (see app.gs_status),
+    # e.g. "sent 384 entries in 1 batch(es): ...". Never affects the run's status.
+    gs_status_summary = models.TextField(blank=True, default="", db_default="")
 
     def __str__(self) -> str:
         return f"Run {self.pk} ({self.status})"

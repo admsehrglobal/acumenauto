@@ -6,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import xlsxwriter
+from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
@@ -63,6 +64,7 @@ from app.models import (
     Run,
     SharedKey,
 )
+from app.gs_status import extract_gs_entries, push_gs_entries
 from app.invoice_split import PILE_PAYABLE, subject_override_for
 from app.scraper import (
     ChunkedReport,
@@ -597,6 +599,10 @@ class Command(BaseCommand):
         # is closed, so the wait costs a sleeping worker and not a live session.
         deferred: list[tuple[Path, str]] = []
 
+        # The invoice file's TCG rows, for tcgservices (see app.gs_status). Filled
+        # by `on_invoice_parts`; empty = R1 did not get that far in this run.
+        gs_status: dict = {}
+
         def _emptied_by(path: Path):
             """The list that left this file with no data rows, if any."""
             for spec in exceptions.values():
@@ -695,6 +701,42 @@ class Command(BaseCommand):
                 return
             _send(path, display_name)
 
+        def on_invoice_parts(part_paths: list[Path]) -> None:
+            # Lets nothing out: the status push is a side channel, and nothing
+            # about it may cost ZipRide its files. A retried report calls this
+            # again, and the last reading replaces the first.
+            gs_status.clear()
+            try:
+                gs_status["entries"] = extract_gs_entries(part_paths)
+                gs_status["at"] = timezone.now()
+            except SoftTimeLimitExceeded:
+                # The run's own deadline, not a bad export: the command's
+                # except has to see it and record the run as FAILED.
+                raise
+            except Exception as exc:  # noqa: BLE001 - recorded on the run below
+                logger.exception("[GS STATUS] no pude leer las filas TCG del export")
+                gs_status["error"] = f"not sent: could not read the export ({exc})"
+
+        def _push_gs_status() -> str:
+            """Send what `on_invoice_parts` read; the line for the run record.
+
+            Runs after the payable pile has gone out, or after a failed run
+            has been recorded. Raises nothing but the soft time limit, and its
+            outcome never changes the run's status."""
+            if "error" in gs_status:
+                return gs_status["error"]
+            if "entries" not in gs_status:
+                return ""
+            if no_email:
+                return "not sent: --no-email run"
+            try:
+                return push_gs_entries(gs_status["entries"], gs_status["at"])
+            except SoftTimeLimitExceeded:
+                raise
+            except Exception as exc:  # noqa: BLE001 - recorded on the run instead
+                logger.exception("[GS STATUS] no pude mandar el estado a tcgservices")
+                return f"not sent: {exc}"
+
         def on_retry(label: str, reason: str) -> None:
             # A report tried again in a new browser session. The attempt count
             # is what stays: a retry that works leaves the run as green as any
@@ -719,6 +761,7 @@ class Command(BaseCommand):
                         exceptions["accruals"],
                     ),
                     on_retry=on_retry,
+                    on_invoice_parts=on_invoice_parts,
                 )
             )
             if deferred:
@@ -731,6 +774,7 @@ class Command(BaseCommand):
                 # what never went out, which is what the failure has to report.
                 while deferred:
                     _send(*deferred.pop(0))
+            run.gs_status_summary = _push_gs_status()
         except Exception as exc:
             # Algunos reportes pueden haberse entregado antes del fallo.
             run.status = Run.Status.FAILED
@@ -748,10 +792,27 @@ class Command(BaseCommand):
                 )
             run.error_message = " | ".join(messages)
             run.exceptions_summary = summarize(exceptions.values())
+            # The status rows do not depend on the rest of the run: when R1 was
+            # read, they still go out (below), so a report that keeps failing
+            # (R3 during the September outage) does not freeze tcgservices.
+            # Not on the soft limit, whose last two minutes belong to the
+            # record above and the cleanup.
+            push_after_failure = bool(gs_status) and not run.gs_status_summary
+            if push_after_failure and isinstance(exc, SoftTimeLimitExceeded):
+                run.gs_status_summary = "not sent: the run hit its time limit"
+                push_after_failure = False
+            elif push_after_failure:
+                # Replaced by the push's own line below; stays only if it is cut off.
+                run.gs_status_summary = "not sent: the push after the failure did not finish"
             _stamp_matches_safely(exceptions, complete=False)
             run.finished_at = timezone.now()
             run.save()
             _notify_failure(run)
+            if push_after_failure:
+                # After the save, so a push that runs into the time limit
+                # cannot leave the run without its FAILED record.
+                run.gs_status_summary = _push_gs_status()
+                run.save(update_fields=["gs_status_summary"])
             raise
         finally:
             # Sent files are unlinked by `_send`; anything still deferred never

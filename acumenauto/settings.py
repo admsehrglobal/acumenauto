@@ -67,6 +67,12 @@ DEFAULT_FROM_EMAIL = os.environ["DEFAULT_FROM_EMAIL"]
 # Casilla a la que Paul puede reportar errores con un click desde run detail.
 SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "ebanvk@gmail.com")
 
+# tcgservices' G&S status ingest endpoint (full URL, ending in
+# /api/acumen/entries/) and its bearer token, which must match tcgservices'
+# ACUMEN_STATUS_TOKEN. Either one empty = the push is skipped (see app.gs_status).
+TCGSERVICES_STATUS_URL = os.environ.get("TCGSERVICES_STATUS_URL", "")
+TCGSERVICES_STATUS_TOKEN = os.environ.get("TCGSERVICES_STATUS_TOKEN", "")
+
 # Celery
 CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)

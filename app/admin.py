@@ -28,6 +28,7 @@ class RunAdmin(admin.ModelAdmin):
         "error_message",
         "attempt_number",
         "exceptions_summary",
+        "gs_status_summary",
     )
 
 

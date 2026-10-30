@@ -27,6 +27,10 @@ CHECK_EVERY_S = 15 * 60
 # may take up to CELERY_TASK_TIME_LIMIT (40 min), and the beat writes last_run_at
 # to the database only every few minutes.
 GRACE = timedelta(minutes=60)
+# How long past the hard time limit a "running" run is left before it is called
+# dead. Only covers runs started by Celery: one started by hand with
+# `manage.py download_report` has no time limit and is failed here past 50 min.
+STUCK_MARGIN = timedelta(minutes=10)
 # The download tasks only; celery.backend_cleanup does not create a Run.
 WATCHED_TASK_PREFIX = "app.tasks.download_dci_reports"
 
@@ -86,6 +90,33 @@ def check(now: datetime, watching: str) -> list[str]:
     return problems
 
 
+def fail_stuck_runs(now: datetime) -> list:
+    """Mark FAILED every run still "running" past the hard time limit, and return
+    them. Celery kills a task at CELERY_TASK_TIME_LIMIT, so such a run is dead: its
+    process stopped without saving the outcome (Run #1111, 2026-10-29, stayed
+    "running" for good and no one was told). Both processes call this; the
+    conditional update means only one of them flips, and alerts for, each run."""
+    from django.conf import settings
+
+    from app.models import Run
+
+    cutoff = now - timedelta(seconds=settings.CELERY_TASK_TIME_LIMIT) - STUCK_MARGIN
+    failed = []
+    for run in Run.objects.filter(status=Run.Status.RUNNING, started_at__lt=cutoff):
+        message = (
+            f"[run] still 'running' at {now:%Y-%m-%d %H:%M} UTC, past the "
+            f"{settings.CELERY_TASK_TIME_LIMIT // 60} min time limit: its process "
+            f"stopped without saving the outcome. Some reports may have been "
+            f"emailed; check Brevo for what went out."
+        )
+        flipped = Run.objects.filter(pk=run.pk, status=Run.Status.RUNNING).update(
+            status=Run.Status.FAILED, finished_at=now, error_message=message
+        )
+        if flipped:
+            failed.append(Run.objects.get(pk=run.pk))
+    return failed
+
+
 _WATCHES = {"worker": "beat", "beat": "worker"}
 _started = False
 
@@ -104,11 +135,18 @@ class Watchdog:
         from django.db import close_old_connections, connection
         from django.utils import timezone
 
-        from app.email_utils import send_watchdog_alert
+        from app.email_utils import send_error_report, send_watchdog_alert
 
         try:
             close_old_connections()
-            problems = check(timezone.now(), self.watching)
+            now = timezone.now()
+            for run in fail_stuck_runs(now):
+                logger.warning("[watchdog] Run #%s was stuck in 'running'", run.pk)
+                try:
+                    send_error_report(run, f"watchdog ({self.process})")
+                except Exception:  # noqa: BLE001 - the run is FAILED on the dashboard
+                    logger.exception("[watchdog] could not alert Run #%s", run.pk)
+            problems = check(now, self.watching)
             # One line per tick, so the logs show the watchdog is alive.
             logger.warning("[watchdog] %s: %d problem(s)", self.process, len(problems))
             new = [p for p in problems if p not in self.alerted]

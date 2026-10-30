@@ -759,42 +759,58 @@ class Command(BaseCommand):
             for path, _ in deferred:
                 path.unlink(missing_ok=True)
 
-        # Que Brevo acepte el mail no es que haya llegado: confirmamos contra sus
-        # eventos antes de dar el run por bueno.
-        delivery_problems, unconfirmed = verify_delivery(accepted)
-        recheck = bool(unconfirmed) and not (send_errors or delivery_problems)
-        if unconfirmed and not recheck:
-            # The run is failing and alerting anyway: say it all in one mail.
-            delivery_problems += unconfirmed_problems(unconfirmed, "90s")
-        for problem in delivery_problems:
-            logger.error("[email] %s", problem)
+        # Everything below runs after the mails went out. Run #1111 (2026-10-29)
+        # delivered its three files and stayed "running" forever with no alert:
+        # nothing here was guarded, so whatever raised left the row as it was.
+        try:
+            # Que Brevo acepte el mail no es que haya llegado: confirmamos contra
+            # sus eventos antes de dar el run por bueno.
+            delivery_problems, unconfirmed = verify_delivery(accepted)
+            recheck = bool(unconfirmed) and not (send_errors or delivery_problems)
+            if unconfirmed and not recheck:
+                # The run is failing and alerting anyway: say it all in one mail.
+                delivery_problems += unconfirmed_problems(unconfirmed, "90s")
+            for problem in delivery_problems:
+                logger.error("[email] %s", problem)
 
-        run.filenames = ";".join(sent)
-        run.exceptions_summary = summarize(exceptions.values())
-        _stamp_matches_safely(exceptions)
-        failures = send_errors + delivery_problems
-        if recheck:
-            from app.tasks import recheck_delivery
+            run.filenames = ";".join(sent)
+            run.exceptions_summary = summarize(exceptions.values())
+            _stamp_matches_safely(exceptions)
+            failures = send_errors + delivery_problems
+            if recheck:
+                from app.tasks import recheck_delivery
 
-            try:
-                recheck_delivery.apply_async(
-                    args=[run.pk, unconfirmed], countdown=DELIVERY_RECHECK_S
-                )
-                logger.warning(
-                    "[email] Run #%s: %d mail(s) sin confirmar todavia; "
-                    "re-chequeo en %d min", run.pk, len(unconfirmed),
-                    DELIVERY_RECHECK_S // 60,
-                )
-            except Exception:  # noqa: BLE001 - sin re-chequeo, avisamos ahora
-                logger.exception("[email] no pude programar el re-chequeo")
-                failures = unconfirmed_problems(unconfirmed, "90s")
-        if failures:
+                try:
+                    recheck_delivery.apply_async(
+                        args=[run.pk, unconfirmed], countdown=DELIVERY_RECHECK_S
+                    )
+                    logger.warning(
+                        "[email] Run #%s: %d mail(s) sin confirmar todavia; "
+                        "re-chequeo en %d min", run.pk, len(unconfirmed),
+                        DELIVERY_RECHECK_S // 60,
+                    )
+                except Exception:  # noqa: BLE001 - sin re-chequeo, avisamos ahora
+                    logger.exception("[email] no pude programar el re-chequeo")
+                    failures = unconfirmed_problems(unconfirmed, "90s")
+            if failures:
+                run.status = Run.Status.FAILED
+                run.error_message = "[email] " + " | ".join(failures)
+            else:
+                run.status = Run.Status.SUCCESS
+            run.finished_at = timezone.now()
+            run.save()
+        except Exception as exc:
+            logger.exception("[run] fallo despues de los envios")
             run.status = Run.Status.FAILED
-            run.error_message = "[email] " + " | ".join(failures)
-        else:
-            run.status = Run.Status.SUCCESS
-        run.finished_at = timezone.now()
-        run.save()
+            run.filenames = ";".join(sent)
+            run.error_message = (
+                f"[run] failed after sending {len(sent)} file(s), before checking "
+                f"their delivery: {type(exc).__name__}: {exc}"
+            )
+            run.finished_at = timezone.now()
+            run.save()
+            _notify_failure(run)
+            raise
         if failures:
             _notify_failure(run)
 

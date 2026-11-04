@@ -192,6 +192,33 @@ class FlaggedWhileAliveTests(TestCase):
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("follow-up", self.alerts[0][1])
 
+    def test_a_pending_delivery_after_the_flag_is_still_rechecked(self):
+        """Brevo had not confirmed yet: the follow-up must not call it a clean
+        SUCCESS, and a problem found by the re-check still alerts."""
+        from app import tasks
+
+        pending = [("Rejected", "msg-id")]
+        notified = []
+        with mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], pending)),                 mock.patch.object(tasks.recheck_delivery, "apply_async") as queued:
+            self._run_command()
+        queued.assert_called_once()
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertIn(f"flagged it: SUCCESS, {cmd.DELIVERY_PENDING_NOTE}",
+                      run.error_message)
+
+        with mock.patch("app.email_utils.verify_delivery",
+                        lambda *a, **k: (["Rejected: NO llego (hardBounces)"], [])),                 mock.patch.object(cmd, "_notify_failure", notified.append):
+            tasks.recheck_delivery.run(run.pk, [list(t) for t in pending])
+            # A redelivered task finds nothing left to change.
+            tasks.recheck_delivery.run(run.pk, [list(t) for t in pending])
+        run.refresh_from_db()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertNotIn(cmd.DELIVERY_PENDING_NOTE, run.error_message)
+        self.assertIn("delivery recheck FAILED: [email] Rejected: NO llego",
+                      run.error_message)
+        self.assertEqual([r.pk for r in notified], [run.pk])
+
     def test_a_run_not_flagged_ends_as_before(self):
         self._run_command(flag=False)
         run = Run.objects.get()

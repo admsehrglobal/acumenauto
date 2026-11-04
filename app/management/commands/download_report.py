@@ -109,6 +109,11 @@ INVOICE_PILE_GAP_S = 10 * 60
 # an unacked task after an hour, so a worker restart does not lose the re-check
 # (and a duplicate is harmless: see `recheck_delivery`).
 DELIVERY_RECHECK_S = 30 * 60
+# Put in a flagged run's follow-up when its delivery is still awaiting that
+# re-check; `recheck_delivery` swaps it for the problems it finds.
+DELIVERY_PENDING_NOTE = (
+    f"delivery not confirmed yet (rechecked in {DELIVERY_RECHECK_S // 60} min)"
+)
 
 
 
@@ -306,7 +311,7 @@ def _notify_failure(run: Run) -> None:
         logger.exception("[email] no pude avisar del fallo del Run #%s", run.pk)
 
 
-def _save_outcome(run: Run) -> bool:
+def _save_outcome(run: Run, pending_recheck: bool = False) -> bool:
     """Save how the run ended; True when the watchdog had already closed it.
 
     A run started by hand (`manage.py download_report`) has no Celery time limit
@@ -316,6 +321,8 @@ def _save_outcome(run: Run) -> bool:
     FAILED, the real outcome is appended, and support gets one follow-up saying
     the stuck-run alert was a false alarm. Taking the status with a conditional
     update first means the watchdog cannot flip the run between check and save.
+    With `pending_recheck` the follow-up says the delivery is not confirmed yet,
+    and `recheck_delivery` alerts if the re-check then finds a problem.
     """
     if Run.objects.filter(pk=run.pk, status=Run.Status.RUNNING).update(
         status=run.status
@@ -325,6 +332,8 @@ def _save_outcome(run: Run) -> bool:
     outcome = run.status.upper()
     if run.status == Run.Status.FAILED and run.error_message:
         outcome += f": {run.error_message}"
+    elif pending_recheck:
+        outcome += f", {DELIVERY_PENDING_NOTE}"
     flagged = Run.objects.get(pk=run.pk).error_message
     run.status = Run.Status.FAILED
     run.error_message = (
@@ -833,7 +842,7 @@ class Command(BaseCommand):
             else:
                 run.status = Run.Status.SUCCESS
             run.finished_at = timezone.now()
-            flagged = _save_outcome(run)
+            flagged = _save_outcome(run, pending_recheck=recheck and not failures)
         except Exception as exc:
             logger.exception("[run] fallo despues de los envios")
             run.status = Run.Status.FAILED

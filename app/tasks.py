@@ -31,15 +31,21 @@ def recheck_delivery(run_id, unconfirmed):
     """Second look at the mails a run sent but Brevo had not confirmed yet.
 
     The run already finished as SUCCESS; it only flips to FAILED (and alerts) if
-    Brevo now shows a real failure or still shows nothing at all. Safe to run
-    twice (a retry, or Redis redelivering it after the visibility timeout while
-    a long run holds the only worker slot): only the run that flips the row
-    alerts.
+    Brevo now shows a real failure or still shows nothing at all. A run the
+    watchdog had flagged is already FAILED with a follow-up saying the delivery
+    was pending: its note is replaced with the problems and the alert goes out.
+    Safe to run twice (a retry, or Redis redelivering it after the visibility
+    timeout while a long run holds the only worker slot): only the run that
+    changes the row alerts.
     """
     import logging
 
+    from django.db.models import Value
+    from django.db.models.functions import Replace
+
     from app.email_utils import unconfirmed_problems, verify_delivery
     from app.management.commands.download_report import (
+        DELIVERY_PENDING_NOTE,
         DELIVERY_RECHECK_S,
         _notify_failure,
     )
@@ -63,6 +69,14 @@ def recheck_delivery(run_id, unconfirmed):
     flipped = Run.objects.filter(pk=run_id, status=Run.Status.SUCCESS).update(
         status=Run.Status.FAILED, error_message="[email] " + " | ".join(problems)
     )
+    if not flipped:
+        flipped = Run.objects.filter(
+            pk=run_id, status=Run.Status.FAILED,
+            error_message__contains=DELIVERY_PENDING_NOTE,
+        ).update(error_message=Replace(
+            "error_message", Value(DELIVERY_PENDING_NOTE),
+            Value("delivery recheck FAILED: [email] " + " | ".join(problems)),
+        ))
     if flipped:
         _notify_failure(Run.objects.get(pk=run_id))
 

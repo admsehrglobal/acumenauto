@@ -306,6 +306,41 @@ def _notify_failure(run: Run) -> None:
         logger.exception("[email] no pude avisar del fallo del Run #%s", run.pk)
 
 
+def _save_outcome(run: Run) -> bool:
+    """Save how the run ended; True when the watchdog had already closed it.
+
+    A run started by hand (`manage.py download_report`) has no Celery time limit
+    and can outlive the watchdog's cutoff, which then marks it FAILED and alerts
+    while it is still working. Saving the real outcome over that would wipe the
+    alert's reason and leave a row that contradicts the mail, so the run stays
+    FAILED, the real outcome is appended, and support gets one follow-up saying
+    the stuck-run alert was a false alarm. Taking the status with a conditional
+    update first means the watchdog cannot flip the run between check and save.
+    """
+    if Run.objects.filter(pk=run.pk, status=Run.Status.RUNNING).update(
+        status=run.status
+    ):
+        run.save()
+        return False
+    outcome = run.status.upper()
+    if run.status == Run.Status.FAILED and run.error_message:
+        outcome += f": {run.error_message}"
+    flagged = Run.objects.get(pk=run.pk).error_message
+    run.status = Run.Status.FAILED
+    run.error_message = (
+        f"{flagged} | False alarm: the process was still alive and finished "
+        f"after the watchdog flagged it: {outcome}, files sent: "
+        f"{run.filenames or '(none)'}"
+    )
+    run.save()
+    logger.warning("[run] Run #%s finished after the watchdog failed it", run.pk)
+    try:
+        send_error_report(run, "download_report (follow-up to the watchdog alert)")
+    except Exception:  # noqa: BLE001 - the real outcome is already on the row
+        logger.exception("[email] could not send the follow-up for Run #%s", run.pk)
+    return True
+
+
 def _load_exceptions() -> dict[str, DropSpec | None]:
     """The File Exceptions lists, one spec per file (None when the list is empty).
 
@@ -558,7 +593,7 @@ class Command(BaseCommand):
         if not reports and not chunked_reports and not matrix_reports:
             run.status = Run.Status.SUCCESS
             run.finished_at = timezone.now()
-            run.save()
+            _save_outcome(run)
             self.stdout.write(
                 self.style.WARNING(
                     f"No reports to run (filter={sorted(filter_ids)}, config: "
@@ -579,8 +614,8 @@ class Command(BaseCommand):
                 run.status = Run.Status.FAILED
                 run.error_message = "[email] No active recipients configured."
                 run.finished_at = timezone.now()
-                run.save()
-                _notify_failure(run)
+                if not _save_outcome(run):
+                    _notify_failure(run)
                 raise CommandError("No active recipients configured.")
 
         # Entrega incremental: cada reporte se manda apenas esta listo, NO al
@@ -750,8 +785,8 @@ class Command(BaseCommand):
             run.exceptions_summary = summarize(exceptions.values())
             _stamp_matches_safely(exceptions, complete=False)
             run.finished_at = timezone.now()
-            run.save()
-            _notify_failure(run)
+            if not _save_outcome(run):
+                _notify_failure(run)
             raise
         finally:
             # Sent files are unlinked by `_send`; anything still deferred never
@@ -798,7 +833,7 @@ class Command(BaseCommand):
             else:
                 run.status = Run.Status.SUCCESS
             run.finished_at = timezone.now()
-            run.save()
+            flagged = _save_outcome(run)
         except Exception as exc:
             logger.exception("[run] fallo despues de los envios")
             run.status = Run.Status.FAILED
@@ -808,10 +843,10 @@ class Command(BaseCommand):
                 f"their delivery: {type(exc).__name__}: {exc}"
             )
             run.finished_at = timezone.now()
-            run.save()
-            _notify_failure(run)
+            if not _save_outcome(run):
+                _notify_failure(run)
             raise
-        if failures:
+        if failures and not flagged:
             _notify_failure(run)
 
         if no_email:

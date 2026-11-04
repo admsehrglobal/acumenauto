@@ -28,8 +28,10 @@ CHECK_EVERY_S = 15 * 60
 # to the database only every few minutes.
 GRACE = timedelta(minutes=60)
 # How long past the hard time limit a "running" run is left before it is called
-# dead. Only covers runs started by Celery: one started by hand with
-# `manage.py download_report` has no time limit and is failed here past 50 min.
+# dead. Exact for runs started by Celery. One started by hand with
+# `manage.py download_report` has no time limit and is failed and alerted here
+# past 50 min even if it is still alive; when it finishes, the command keeps it
+# FAILED, appends the real outcome and mails a follow-up (`_save_outcome`).
 STUCK_MARGIN = timedelta(minutes=10)
 # The download tasks only; celery.backend_cleanup does not create a Run.
 WATCHED_TASK_PREFIX = "app.tasks.download_dci_reports"

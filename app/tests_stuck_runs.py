@@ -7,7 +7,9 @@ watchdog fails and alerts a run still "running" past the hard time limit
 (which also covers a process that died without raising at all).
 """
 import datetime as dt
+import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from django.conf import settings
@@ -105,3 +107,109 @@ class TickTests(TestCase):
                            started_at=NOW - dt.timedelta(hours=2))
         _, check = self._tick(alert_error=ConnectionError("brevo down"))
         check.assert_called_once()
+
+
+class FlaggedWhileAliveTests(TestCase):
+    """A run started by hand has no Celery time limit, so the watchdog can fail
+    and alert it while it is still working. When it finishes, the row must stay
+    FAILED (as the alert said), carry the real outcome, and one follow-up goes out."""
+
+    def setUp(self):
+        self.tmp = Path(os.environ.get("TEMP", "/tmp")) / "acumen_flagged_test"
+        self.tmp.mkdir(parents=True, exist_ok=True)
+        self.alerts = []
+        config = mock.Mock(report_1_enabled=True, report_2_enabled=False,
+                           report_3_enabled=False, date_range_chunks=4)
+        config.effective_dci_credentials.return_value = ("u", "p")
+        recipients = mock.Mock()
+        recipients.filter.return_value.values_list.return_value = ["paul@example.com"]
+        for p in (
+            mock.patch.object(cmd, "send_reports_email",
+                              lambda items, *a, **k: [(n, "msg-id") for _, n in items]),
+            mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], [])),
+            mock.patch.object(cmd, "send_error_report",
+                              lambda run, who: self.alerts.append((run.pk, who))),
+            mock.patch.object(cmd, "AppConfig", mock.Mock(load=lambda: config)),
+            mock.patch.object(cmd, "Recipient", mock.Mock(objects=recipients)),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run_command(self, flag=True, fail_after=None):
+        items = base.DeliveryOrderTests._piles(self)
+
+        async def _fake_download(**kwargs):
+            ready = kwargs["on_report_ready"]
+            for item in items:
+                ready(*item)
+            return items
+
+        def _gap(seconds):
+            # During the 10-min wait before the payable pile the process is alive,
+            # and that is where the watchdog ticks.
+            if flag:
+                later = Run.objects.get().started_at + dt.timedelta(hours=2)
+                self.assertEqual(len(watchdog.fail_stuck_runs(later)), 1)
+            if fail_after is not None:
+                raise fail_after
+
+        with mock.patch.object(cmd, "download_reports", _fake_download),                 mock.patch.object(cmd.time, "sleep", _gap):
+            cmd.Command().handle(output_dir=str(self.tmp), no_email=False, reports="1")
+
+    def test_finishing_success_after_the_flag_stays_failed_and_says_so(self):
+        self._run_command()
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertIn("still 'running'", run.error_message)
+        self.assertIn("False alarm", run.error_message)
+        self.assertIn("flagged it: SUCCESS, files sent: ", run.error_message)
+        self.assertEqual(len(run.file_names), 2)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("follow-up", self.alerts[0][1])
+
+    def test_finishing_failed_after_the_flag_keeps_the_real_reason(self):
+        with self.assertRaises(RuntimeError):
+            self._run_command(fail_after=RuntimeError("R3 timed out"))
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertIn("still 'running'", run.error_message)
+        self.assertIn("flagged it: FAILED: R3 timed out", run.error_message)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("follow-up", self.alerts[0][1])
+
+    def test_a_crash_after_the_sends_after_the_flag_is_one_follow_up(self):
+        def _boom(accepted):
+            raise ConnectionError("brevo unreachable")
+
+        with mock.patch.object(cmd, "verify_delivery", _boom):
+            with self.assertRaises(ConnectionError):
+                self._run_command()
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertIn("still 'running'", run.error_message)
+        self.assertIn("flagged it: FAILED: [run] failed after sending 2 file(s)",
+                      run.error_message)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("follow-up", self.alerts[0][1])
+
+    def test_a_run_not_flagged_ends_as_before(self):
+        self._run_command(flag=False)
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.SUCCESS)
+        self.assertEqual(run.error_message, "")
+        self.assertEqual(len(run.file_names), 2)
+        self.assertEqual(self.alerts, [])
+
+    def test_a_run_not_flagged_that_fails_alerts_once_as_before(self):
+        with self.assertRaises(RuntimeError):
+            self._run_command(flag=False, fail_after=RuntimeError("R3 timed out"))
+        run = Run.objects.get()
+        self.assertEqual(run.status, Run.Status.FAILED)
+        self.assertTrue(run.error_message.startswith("R3 timed out"))
+        self.assertEqual(self.alerts, [(run.pk, "scheduled run")])
+
+    def test_a_finished_run_cannot_be_flagged_afterwards(self):
+        self._run_command(flag=False)
+        run = Run.objects.get()
+        later = run.started_at + dt.timedelta(hours=2)
+        self.assertEqual(watchdog.fail_stuck_runs(later), [])

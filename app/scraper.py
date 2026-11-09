@@ -879,10 +879,9 @@ async def _export_matrix_report(
     await asyncio.sleep(10)
 
     date_inputs = iframe.locator("input[aria-label*='Available input range']")
-    label = await date_inputs.nth(0).get_attribute("aria-label")
-    lo, hi = label.split("Available input range ")[1].split(" to ")
-    slicer_min, date_fmt = _parse_filter_date(lo.strip())
-    slicer_max, _ = _parse_filter_date(hi.strip())
+    start_idx, end_idx, slicer_min, slicer_max, date_fmt = (
+        await _read_single_slicer(date_inputs)
+    )
     start = max(slicer_min, floor_date)
     logger.warning(
         "[REPORT matrix] slicer %s..%s, pidiendo desde %s",
@@ -900,7 +899,7 @@ async def _export_matrix_report(
         )
         for attempt in range(1, 4):
             await _set_date_filter(
-                date_inputs.nth(0), date_inputs.nth(1),
+                date_inputs.nth(start_idx), date_inputs.nth(end_idx),
                 chunk_start, chunk_end, date_fmt,
             )
             if not await _export_matrix_visual(page, iframe, target):
@@ -2124,12 +2123,19 @@ async def _read_single_slicer(
     `_identify_accrual_slicer`. Los indices son posiciones dentro de
     `date_inputs` para que el caller use `date_inputs.nth(idx)` como selector
     estable (el aria-label se mueve al aplicar un filtro, la posicion no).
+
+    The extent comes from BOTH labels, because each box's range is bounded by
+    the other box's current value: the start box reads "<data min> to <selected
+    end>" and the end box reads "<selected start> to <data max>". Reading the
+    max from the start box returns the report's saved end selection, not the
+    data max — that is how the accrual file stopped at 9/26/2027 while Acumen
+    had weeks through 12/19/2027 (Nov 2026).
     """
     inputs = await date_inputs.evaluate_all(
         "els => els.map((e, i) => ({i: i, label: e.getAttribute('aria-label')}))"
     )
     start_idx = end_idx = None
-    range_s: tuple[str, str] | None = None
+    min_s = max_s = None
     for item in inputs:
         label = item["label"] or ""
         m = _LABEL_RANGE_RE.search(label)
@@ -2137,17 +2143,18 @@ async def _read_single_slicer(
             continue
         if label.startswith("Start date."):
             start_idx = item["i"]
-            range_s = (m.group(1), m.group(2))
+            min_s = m.group(1)
         elif label.startswith("End date."):
             end_idx = item["i"]
+            max_s = m.group(2)
 
-    if start_idx is None or end_idx is None or range_s is None:
+    if start_idx is None or end_idx is None:
         raise ValueError(
             f"No single date-range slicer found. Inputs were: {inputs!r}"
         )
 
-    min_d, date_fmt = _parse_filter_date(range_s[0])
-    max_d, _ = _parse_filter_date(range_s[1])
+    min_d, date_fmt = _parse_filter_date(min_s)
+    max_d, _ = _parse_filter_date(max_s)
     return start_idx, end_idx, min_d, max_d, date_fmt
 
 

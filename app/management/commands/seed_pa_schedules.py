@@ -16,7 +16,7 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 
-from app.accrual_rebuild import as_date
+from app.accrual_rebuild import _is_later, as_date
 from app.models import PaSchedule
 from app.scraper import _read
 
@@ -88,13 +88,16 @@ class Command(BaseCommand):
             if isinstance(pa, float) and pa.is_integer():
                 pa = int(pa)
             pa = str(pa).strip()
-            if pa in seen:
+            # An extended authorization is listed with two End Dates: keep the
+            # latest, same rule as build_lookup.
+            end = as_date(row[index["End Date"]])
+            if pa in seen and not _is_later(end, seen[pa].end_date):
                 continue
             seen[pa] = PaSchedule(
                 pa_number=pa,
                 client_dddid=str(row[index["Client DDDID"]] or "").strip(),
                 start_date=as_date(row[index["Start Date"]]),
-                end_date=as_date(row[index["End Date"]]),
+                end_date=end,
                 source="seed",
             )
 

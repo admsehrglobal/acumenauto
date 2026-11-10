@@ -14,6 +14,7 @@ from django.utils import timezone
 from app.accrual_rebuild import (
     OUTPUT_COLUMNS,
     PaFacts,
+    _is_later,
     as_date,
     rebuild,
     scan_funded_spans,
@@ -151,11 +152,16 @@ def _refresh_pa_schedules(path: Path) -> int:
             if isinstance(pa, float) and pa.is_integer():
                 pa = int(pa)
             pa = str(pa).strip()
+            # R2 lists a PA once per service line, in the portal's order: keep
+            # the latest End Date, same rule as build_lookup.
+            end = as_date(row[index["End Date"]])
+            if pa in seen and not _is_later(end, seen[pa].end_date):
+                continue
             seen[pa] = PaSchedule(
                 pa_number=pa,
                 client_dddid=str(row[index["Client DDDID"]] or "").strip(),
                 start_date=as_date(row[index["Start Date"]]),
-                end_date=as_date(row[index["End Date"]]),
+                end_date=end,
                 source="auth_report",
             )
         PaSchedule.objects.bulk_create(

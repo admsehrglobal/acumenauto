@@ -274,8 +274,60 @@ def scan_funded_spans(matrix_rows: list, lookup: dict,
     return spans
 
 
+def _norm_name(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def scan_client_names(matrix_rows: list, into: dict | None = None) -> dict:
+    """PA -> every Client Name the matrix lists it under, across date slices."""
+    names = {} if into is None else into
+    header_at, pa_col, client_col, _, _ = _columns(matrix_rows)
+    for row in matrix_rows[header_at + 1 :]:
+        if _is_blank(row):
+            continue
+        pa = _norm_pa(row[pa_col])
+        if pa:
+            names.setdefault(pa, set()).add(_norm_name(row[client_col]))
+    return names
+
+
+def resolve_shared_pas(pa_names: dict, lookup: dict) -> dict:
+    """For each PA listed under more than one client: {client name: DDDID}.
+
+    The lookup is keyed by PA alone, so a PA the matrix lists under two clients
+    used to stamp ONE client's DDDID on both: on the file of 2026-11-08, 3 PAs
+    and 124 rows repeated (Client DDDID, PA Number, week), 75 with money.
+
+    A name's DDDID is learned from the PAs listed under that name only, and
+    counts only when it is exactly one. The client whose name maps to the
+    lookup DDDID keeps it; the others get the DDDID their name maps to, or None.
+    If no client maps to the lookup DDDID, all of them get None — never a guess.
+    """
+    by_name: dict[str, dict] = {}
+    for pa, names in pa_names.items():
+        facts = lookup.get(pa)
+        if len(names) != 1 or facts is None or facts.client_dddid in (None, ""):
+            continue
+        value = facts.client_dddid
+        by_name.setdefault(next(iter(names)), {})[str(value).strip()] = value
+    known = {n: next(iter(d.items())) for n, d in by_name.items() if len(d) == 1}
+
+    shared: dict[str, dict] = {}
+    for pa, names in pa_names.items():
+        facts = lookup.get(pa)
+        if len(names) < 2 or facts is None:
+            continue
+        dddid = _norm_name(facts.client_dddid)
+        owned = bool(dddid) and any(n in known and known[n][0] == dddid for n in names)
+        shared[pa] = {
+            n: (known[n][1] if owned and n in known else None) for n in names
+        }
+    return shared
+
+
 def rebuild(matrix_rows: list, lookup: dict,
-            funded_span: dict | None = None) -> RebuildResult:
+            funded_span: dict | None = None,
+            shared: dict | None = None) -> RebuildResult:
     """Turn one matrix export into accrual-file rows.
 
     The matrix prints a line per PA per week whether or not anything is
@@ -323,6 +375,10 @@ def rebuild(matrix_rows: list, lookup: dict,
     if funded_span is None:
         funded_span = _funded_spans(matrix_rows, header_at, pa_col, date_col,
                                     amount_col, lookup)
+    # Same for the PAs listed under more than one client: see
+    # `resolve_shared_pas`, and pass it in when the matrix comes in slices.
+    if shared is None:
+        shared = resolve_shared_pas(scan_client_names(matrix_rows), lookup)
 
     out: list = []
     unmatched: set = set()
@@ -343,6 +399,10 @@ def rebuild(matrix_rows: list, lookup: dict,
             facts = PaFacts(None, None, None)
         else:
             matched += 1
+            if pa in shared:
+                facts = facts._replace(
+                    client_dddid=shared[pa].get(_norm_name(row[client_col]))
+                )
         out.append(
             [
                 row[client_col],

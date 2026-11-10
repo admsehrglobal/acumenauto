@@ -17,6 +17,8 @@ from app.accrual_rebuild import (
     _is_later,
     as_date,
     rebuild,
+    resolve_shared_pas,
+    scan_client_names,
     scan_funded_spans,
 )
 
@@ -240,14 +242,29 @@ def _assemble_accrual(parts, button_name, output_dir, timestamp_label, drop=None
     # the cost; holding all of them in memory at once is not an option on a 2 GB
     # machine.
     spans: dict = {}
+    names: dict = {}
     for part in parts:
-        scan_funded_spans(_read(part), lookup, into=spans)
+        matrix = _read(part)
+        scan_funded_spans(matrix, lookup, into=spans)
+        # A PA listed under two clients is resolved on the whole matrix too:
+        # the two clients, and the PAs that tell their DDDIDs apart, may sit in
+        # different slices.
+        scan_client_names(matrix, into=names)
+    shared = resolve_shared_pas(names, lookup)
 
     rows, unmatched = [], set()
     for part in parts:
-        result = rebuild(_read(part), lookup, funded_span=spans)
+        result = rebuild(_read(part), lookup, funded_span=spans, shared=shared)
         rows.extend(result.rows)
         unmatched |= result.unmatched_pas
+
+    if shared:
+        on_shared = [r for r in rows if r[2] in shared]
+        logger.warning(
+            "[REPORT matrix] %d PAs listados bajo mas de un cliente (%d filas); "
+            "%d de esas filas quedan sin Client DDDID por no poder resolverlo",
+            len(shared), len(on_shared), sum(1 for r in on_shared if not r[1]),
+        )
 
     if not rows:
         raise ValueError(

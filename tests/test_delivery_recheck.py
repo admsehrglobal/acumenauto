@@ -32,7 +32,7 @@ class RunWithUnconfirmedMailTests(unittest.TestCase):
         self.notified = []
         verify = mock.patch.object(
             cmd, "verify_delivery",
-            lambda accepted: (list(problems), list(UNCONFIRMED)),
+            lambda accepted, **kwargs: (list(problems), list(UNCONFIRMED)),
         )
         notify = mock.patch.object(cmd, "_notify_failure", self.notified.append)
         recheck = mock.patch.object(tasks.recheck_delivery, "apply_async",
@@ -46,7 +46,8 @@ class RunWithUnconfirmedMailTests(unittest.TestCase):
         self.assertEqual(self.run.status, cmd.Run.Status.SUCCESS)
         self.assertEqual(self.notified, [])
         apply_async.assert_called_once_with(
-            args=[self.run.pk, UNCONFIRMED], countdown=cmd.DELIVERY_RECHECK_S
+            args=[self.run.pk, UNCONFIRMED, ["paul@example.com"]],
+            countdown=cmd.DELIVERY_RECHECK_S,
         )
 
     def test_no_recheck_scheduled_means_alerting_now(self):

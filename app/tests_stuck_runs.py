@@ -33,7 +33,7 @@ class FailureAfterTheSendsTests(unittest.TestCase):
     def test_a_crash_checking_delivery_fails_the_run_and_alerts(self):
         notified = []
 
-        def _boom(accepted):
+        def _boom(accepted, **kwargs):
             raise ConnectionError("brevo unreachable")
 
         with mock.patch.object(cmd, "verify_delivery", _boom), \
@@ -126,7 +126,7 @@ class FlaggedWhileAliveTests(TestCase):
         for p in (
             mock.patch.object(cmd, "send_reports_email",
                               lambda items, *a, **k: [(n, "msg-id") for _, n in items]),
-            mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], [])),
+            mock.patch.object(cmd, "verify_delivery", lambda accepted, **kwargs: ([], [])),
             mock.patch.object(cmd, "send_error_report",
                               lambda run, who: self.alerts.append((run.pk, who))),
             mock.patch.object(cmd, "AppConfig", mock.Mock(load=lambda: config)),
@@ -178,7 +178,7 @@ class FlaggedWhileAliveTests(TestCase):
         self.assertIn("follow-up", self.alerts[0][1])
 
     def test_a_crash_after_the_sends_after_the_flag_is_one_follow_up(self):
-        def _boom(accepted):
+        def _boom(accepted, **kwargs):
             raise ConnectionError("brevo unreachable")
 
         with mock.patch.object(cmd, "verify_delivery", _boom):
@@ -199,7 +199,7 @@ class FlaggedWhileAliveTests(TestCase):
 
         pending = [("Rejected", "msg-id")]
         notified = []
-        with mock.patch.object(cmd, "verify_delivery", lambda accepted: ([], pending)),                 mock.patch.object(tasks.recheck_delivery, "apply_async") as queued:
+        with mock.patch.object(cmd, "verify_delivery", lambda accepted, **kwargs: ([], pending)),                 mock.patch.object(tasks.recheck_delivery, "apply_async") as queued:
             self._run_command()
         queued.assert_called_once()
         run = Run.objects.get()

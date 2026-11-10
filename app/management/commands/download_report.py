@@ -840,7 +840,9 @@ class Command(BaseCommand):
         try:
             # Que Brevo acepte el mail no es que haya llegado: confirmamos contra
             # sus eventos antes de dar el run por bueno.
-            delivery_problems, unconfirmed = verify_delivery(accepted)
+            delivery_problems, unconfirmed = verify_delivery(
+                accepted, recipients=recipients
+            )
             recheck = bool(unconfirmed) and not (send_errors or delivery_problems)
             if unconfirmed and not recheck:
                 # The run is failing and alerting anyway: say it all in one mail.
@@ -857,7 +859,8 @@ class Command(BaseCommand):
 
                 try:
                     recheck_delivery.apply_async(
-                        args=[run.pk, unconfirmed], countdown=DELIVERY_RECHECK_S
+                        args=[run.pk, unconfirmed, recipients],
+                        countdown=DELIVERY_RECHECK_S,
                     )
                     logger.warning(
                         "[email] Run #%s: %d mail(s) sin confirmar todavia; "

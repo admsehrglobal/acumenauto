@@ -131,7 +131,10 @@ FAILURE_EVENTS = {
 
 
 def verify_delivery(
-    sent: list[tuple[str, str]], timeout_s: int = 90, poll_s: int = 10
+    sent: list[tuple[str, str]],
+    timeout_s: int = 90,
+    poll_s: int = 10,
+    recipients: list[str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Confirma contra Brevo que cada mail de `sent` llego.
 
@@ -146,12 +149,20 @@ def verify_delivery(
     Unconfirmed is NOT a failure: Brevo's event API can lag many minutes behind
     the actual delivery (Run #1080, 23-oct-2026: delivered 4 s after sending,
     still invisible to the API at 90 s). The caller re-checks it later instead.
+
+    `recipients` are the addresses each mail was sent to. One message_id covers
+    all of them and Brevo reports events per address, so a mail only counts as
+    delivered once EVERY recipient has a "delivered" event; a failure event for
+    any of them is a problem, and one still without a terminal event keeps the
+    mail pending. Without `recipients` (a re-check queued before this existed)
+    the addresses seen in the events are the ones expected.
     """
     if not sent:
         return [], []
 
     api = _get_brevo_api_instance()
     pending = {mid: name for name, mid in sent}
+    expected = {r.lower() for r in recipients or []}
     problems: list[str] = []
     deadline = time.monotonic() + timeout_s
 
@@ -166,16 +177,34 @@ def verify_delivery(
                     name, message_id, exc,
                 )
                 continue
-            events = {e.event for e in (report.events or [])}
-            if DELIVERED_EVENT in events:
-                logger.warning("[email] %s entregado (message_id=%s)", name, message_id)
-                del pending[message_id]
-            elif events & FAILURE_EVENTS:
+            by_address: dict[str | None, set[str]] = {
+                address: set() for address in expected
+            }
+            for e in report.events or []:
+                address = getattr(e, "email", None)
+                address = address.lower() if address else None
+                if expected and address not in by_address:
+                    continue  # an address this mail was not sent to
+                by_address.setdefault(address, set()).add(e.event)
+            failed = [
+                (address, sorted(events & FAILURE_EVENTS))
+                for address, events in by_address.items()
+                if DELIVERED_EVENT not in events and events & FAILURE_EVENTS
+            ]
+            if failed:
+                details = "; ".join(
+                    ", ".join(events) + (f": {address}" if address else "")
+                    for address, events in failed
+                )
                 problems.append(
                     f"{name}: Brevo lo acepto pero NO llego "
-                    f"({', '.join(sorted(events & FAILURE_EVENTS))}; "
-                    f"message_id={message_id})"
+                    f"({details}; message_id={message_id})"
                 )
+                del pending[message_id]
+            elif by_address and all(
+                DELIVERED_EVENT in events for events in by_address.values()
+            ):
+                logger.warning("[email] %s entregado (message_id=%s)", name, message_id)
                 del pending[message_id]
         if not pending or time.monotonic() >= deadline:
             break

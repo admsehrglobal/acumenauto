@@ -27,7 +27,7 @@ def download_dci_reports_weekly():
     max_retries=3,
     default_retry_delay=60,
 )
-def recheck_delivery(run_id, unconfirmed):
+def recheck_delivery(run_id, unconfirmed, recipients=None):
     """Second look at the mails a run sent but Brevo had not confirmed yet.
 
     The run already finished as SUCCESS; it only flips to FAILED (and alerts) if
@@ -37,6 +37,9 @@ def recheck_delivery(run_id, unconfirmed):
     Safe to run twice (a retry, or Redis redelivering it after the visibility
     timeout while a long run holds the only worker slot): only the run that
     changes the row alerts.
+
+    `recipients` are the addresses the mails went to; every one of them must
+    show "delivered". None for a re-check queued before they were passed.
     """
     import logging
 
@@ -55,7 +58,9 @@ def recheck_delivery(run_id, unconfirmed):
     unconfirmed = [tuple(item) for item in unconfirmed]
     # A short poll, not a single query, so one Brevo API error is not read as
     # "still no event" (verify_delivery leaves an id it could not query pending).
-    problems, still = verify_delivery(unconfirmed, timeout_s=60, poll_s=15)
+    problems, still = verify_delivery(
+        unconfirmed, timeout_s=60, poll_s=15, recipients=recipients
+    )
     problems += unconfirmed_problems(still, f"{DELIVERY_RECHECK_S // 60} min")
     if not problems:
         logger.warning(

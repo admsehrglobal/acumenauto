@@ -278,6 +278,24 @@ class LateEntryTests(unittest.TestCase):
             "Invoices: 1 rows dropped (1 of 1 keys matched)",
         )
 
+    def test_an_entry_added_to_an_empty_list_comes_out_of_every_part_of_a_split_payable_pile(self):
+        """A payable pile over the attachment ceiling goes out as several files;
+        with the list empty at start none of them was filtered by the merge."""
+        self.live["invoices"] = [("200", "")]
+        parts = []
+        for n in (1, 2):
+            part = self.d / f"payable_{n}.xlsx"
+            _make_xlsx(part, R1_HEADER, [_r1(f"{n}0", "200"), _r1(f"{n}1", "400")])
+            parts.append(part)
+        exceptions = {"invoices": None}
+        for part in parts:
+            cmd._drop_late_entries(part, exceptions, frozenset(), payable=True)
+        column = R1_HEADER.index("Invoice #")
+        for part in parts:
+            self.assertEqual([str(r[column]) for r in _rows(part)[1:]], ["400"], part.name)
+        spec = exceptions["invoices"]
+        self.assertEqual(sum(n for n, _ in spec.stats.values()), 2)
+
     def test_an_empty_list_that_stays_empty_leaves_the_payable_pile_untouched(self):
         self.live["invoices"] = []
         self._run([_r1("1", "300", "Rejected")], [_r1("2", "200"), _r1("3", "400")])

@@ -5,6 +5,12 @@ seed) or last (the R2 refresh). An extended authorization then kept its OLD
 period: in the file delivered 2026-11-08, PAs 1553364014 and 1553407554 put out
 68 funded rows ($18,602.50) dated after their own End Date. Both loaders now use
 the same rule as `build_lookup`.
+
+This does NOT fix those 68 rows: production seeds through
+`_seed_pa_schedules_if_empty`, which reads app/data/pa_seed.csv as-is (one row
+per PA, still holding the old End Dates), and R2 no longer lists those two
+expired PAs, so the refresh never overwrites them. That needs the CSV and the
+loaded `source='seed'` rows corrected from a trusted source.
 """
 import datetime as dt
 import tempfile

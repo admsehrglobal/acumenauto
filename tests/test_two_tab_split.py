@@ -198,7 +198,10 @@ class SplitKeepsCrossTabDedupTests(unittest.TestCase):
                 self.merged, self.parts, self.part_meta, self.report_range,
                 self.d, "r1", "ts", self.keep,
             )
-        self.assertEqual(len(outputs), 2)
+        # The target is derived from the zipped size, which varies by a few
+        # bytes between runs, so the split can come out as 3 groups; the
+        # duplicate is in different groups either way.
+        self.assertGreaterEqual(len(outputs), 2)
         got = sorted(e for p, _, _ in outputs for e in _entries(p))
         self.assertEqual(got, single)
 

@@ -421,14 +421,15 @@ def _drop_late_entries(
 
     With the list empty at start the merge ran with no spec, so `stats` cannot
     tell which file is an invoice pile; `payable` says so for the payable pile,
-    the one that goes out after the gap.
+    the one that goes out after the gap. Every part of it: a pile split across
+    several mails has none of its parts filtered, and the spec the first part
+    set holds the stats of that part only.
     """
     spec = exceptions["invoices"]
-    if spec is None:
-        if payable:
-            _apply_fresh_list(path, exceptions)
+    if not read_at_start and payable and (spec is None or path not in spec.stats):
+        _apply_fresh_list(path, exceptions)
         return
-    if path not in spec.stats:
+    if spec is None or path not in spec.stats:
         return
     fresh = _load_list("invoices")
     late = (fresh.keys if fresh is not None else frozenset()) - read_at_start
@@ -465,6 +466,13 @@ def _apply_fresh_list(path: Path, exceptions: dict[str, DropSpec | None]) -> Non
     # The merge refuses a file with no rows, and there is nothing to take out.
     if not any(True for _ in _data_rows(_read(path))):
         return
+    earlier = exceptions["invoices"]
+    if earlier is not None:
+        # An earlier part of the same pile: one record for the whole run.
+        fresh = fresh._replace(
+            stats=earlier.stats, emptied=earlier.emptied,
+            owners=earlier.owners or fresh.owners,
+        )
     _apply_exceptions_in_place(path, fresh)
     # The run record and the stamp then count it like a list read at start.
     exceptions["invoices"] = fresh

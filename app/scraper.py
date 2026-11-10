@@ -35,6 +35,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from app.accrual_rebuild import find_header_row
 from app.file_exceptions import DropSpec, RowFilter
 from app.invoice_split import (
     PILE_PAYABLE,
@@ -895,10 +896,8 @@ async def _export_matrix_report(
     )
 
     slug = "_".join(button_name.lower().split())
-    parts: list[Path] = []
-    for seq, (chunk_start, chunk_end) in enumerate(
-        _chunk_date_range(start, slicer_max, n_chunks), start=1
-    ):
+
+    async def _export_one(chunk_start, chunk_end, seq):
         target = output_dir / (
             f"{slug}_matrix_{seq:02d}_{chunk_start.isoformat()}"
             f"_to_{chunk_end.isoformat()}_{timestamp_label}.xlsx"
@@ -923,19 +922,34 @@ async def _export_matrix_report(
                     "[REPORT matrix] Part %d (%s a %s) OK (%d lineas)",
                     seq, chunk_start, chunk_end, len(rows),
                 )
-                parts.append(target)
-                break
+                return target, _matrix_data_rows(rows)
             logger.warning(
                 "[REPORT matrix] Part %d: el export dice %s, reaplicando el "
                 "filtro (intento %d/3)",
                 seq, _applied_ranges(rows) or "ningun rango", attempt,
             )
-        else:
-            raise ValueError(
-                f"accrual matrix: el chunk {seq} ({chunk_start}..{chunk_end}) "
-                f"no se pudo bajar en 3 intentos"
-            )
-    return parts
+        raise ValueError(
+            f"accrual matrix: el chunk {seq} ({chunk_start}..{chunk_end}) "
+            f"no se pudo bajar en 3 intentos"
+        )
+
+    # Same 150k-cap guard as the other chunked reports: a chunk that comes
+    # back near the cap is discarded and its range split in two, instead of
+    # being accepted truncated.
+    return await _export_ranges_adaptive(
+        _export_one,
+        _chunk_date_range(start, slicer_max, n_chunks),
+        threshold=_RESPLIT_THRESHOLD,
+        max_parts=_MAX_PARTS,
+    )
+
+
+def _matrix_data_rows(rows: list) -> int:
+    """Data lines of a matrix export: everything below its header row, minus
+    blank rows and the 'Applied filters:' line (which this export puts first).
+    """
+    header_at = find_header_row(rows)
+    return sum(1 for _ in _data_rows(rows[header_at:]))
 
 
 async def _prepare_tab(

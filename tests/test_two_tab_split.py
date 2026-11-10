@@ -128,5 +128,80 @@ class TwoTabSplitTests(unittest.TestCase):
                 self.assertEqual(got, expected)
 
 
+
+INVOICE_HEADER = ["Entry ID", "Invoice #", "Status", "Amount"]
+
+
+def _make_invoice_xlsx(path: Path, rows: list[tuple[str, str]]) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.append(INVOICE_HEADER)
+    for entry_id, status in rows:
+        ws.append([entry_id, f"INV{entry_id}", status, 10.0])
+    ws.append(["Applied filters: DateOfService is on or after X", None, None, None])
+    wb.save(path)
+
+
+def _entries(path: Path) -> list[tuple[str, str]]:
+    wb = load_workbook(path, read_only=True)
+    try:
+        rows = list(wb.active.iter_rows(values_only=True))
+    finally:
+        wb.close()
+    return [(r[0], r[2]) for r in rows[1:]]
+
+
+class SplitKeepsCrossTabDedupTests(unittest.TestCase):
+    """An entry paid between the two tab exports comes back in both, with the
+    same Entry ID. The single-file merge keeps only its last copy (the Paid
+    one); the split must keep that same copy, even when the two copies land in
+    different groups."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        self.parts = []
+        self.part_meta = {}
+        for tab, status in (("main", "Pending"), ("extra", "Paid")):
+            for i in range(CHUNKS_PER_TAB):
+                p = self.d / f"r1_{tab}_part_{i:03d}.xlsx"
+                rows = [(f"{tab}{i}-{j}", status) for j in range(ROWS_PER_CHUNK)]
+                # The duplicate: first chunk of the main tab, last of the extra.
+                if (tab, i) in (("main", 0), ("extra", CHUNKS_PER_TAB - 1)):
+                    rows.append(("DUP", status))
+                _make_invoice_xlsx(p, rows)
+                start = D0 + dt.timedelta(days=10 * i)
+                self.part_meta[p] = (start, start + dt.timedelta(days=9),
+                                     len(rows))
+                self.parts.append(p)
+        self.keep = frozenset(
+            eid for p in self.parts for eid, _ in _entries(p)
+        )
+        self.report_range = (D0, D0 + dt.timedelta(days=39))
+        self.merged = self.d / "r1_merged_ts.xlsx"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_duplicate_across_groups_goes_out_once_with_its_last_copy(self):
+        _merge_xlsx_files(self.parts, self.merged, self.keep)
+        single = sorted(_entries(self.merged))
+        self.assertIn(("DUP", "Paid"), single)
+        self.assertNotIn(("DUP", "Pending"), single)
+
+        size = self.merged.stat().st_size
+        total_rows = sum(m[2] for m in self.part_meta.values())
+        # Two groups: the main tab's parts, then the extra tab's.
+        target = int((total_rows // 2) * (size / total_rows))
+        with patch.object(scraper, "_ATTACHMENT_MAX_BYTES", size - 1),                 patch.object(scraper, "_ATTACHMENT_TARGET_BYTES", target):
+            outputs = _split_for_email(
+                self.merged, self.parts, self.part_meta, self.report_range,
+                self.d, "r1", "ts", self.keep,
+            )
+        self.assertEqual(len(outputs), 2)
+        got = sorted(e for p, _, _ in outputs for e in _entries(p))
+        self.assertEqual(got, single)
+
+
 if __name__ == "__main__":
     unittest.main()

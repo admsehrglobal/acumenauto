@@ -314,6 +314,13 @@ class ExceptionWiringTests(unittest.TestCase):
         for name in ("Entry ID", "Invoice #", "Client DDDID", "Amount", "Aging"):
             self.assertIn(name, spec.required_columns)
 
+    def test_the_paid_tab_is_checked_against_its_own_columns(self):
+        """'Paid Invoices' had no guard: losing 'Status' emptied the payable pile."""
+        kwargs = self._run()
+        spec = kwargs["chunked_reports"][0]
+        self.assertEqual(spec.extra_tabs, ("Paid Invoices",))
+        self.assertEqual(spec.extra_tab_required_columns, cmd.PAID_INVOICE_COLUMNS)
+
 
 if __name__ == "__main__":
     unittest.main()

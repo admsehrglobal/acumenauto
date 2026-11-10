@@ -35,6 +35,11 @@ INVOICE_COLUMNS = (
     "Rejected Reason", "Date Of Service", "Entry Creation Date", "Amount",
     "Aging",
 )
+# What 'Paid Invoices' carries: the same columns minus the two only the
+# rejected entries have (measured 2026-09-05: 12 columns).
+PAID_INVOICE_COLUMNS = tuple(
+    c for c in INVOICE_COLUMNS if c not in ("Rejected Reason", "Aging")
+)
 AUTH_COLUMNS = (
     "Authorization ID", "PA Number", "Client Name", "Client ID",
     "Client DDDID", "Service Code", "Plan", "Outcome", "Service",
@@ -597,6 +602,9 @@ class Command(BaseCommand):
                     # 2.420 contra 100.462, porque los 96.660 pagados se fueron
                     # a esta otra pestaña. Las dos se exportan y se unen.
                     extra_tabs=("Paid Invoices",),
+                    # Without it a 'Paid Invoices' that lost 'Status' or
+                    # 'Entry ID' dropped every paid row and the run was SUCCESS.
+                    extra_tab_required_columns=PAID_INVOICE_COLUMNS,
                 )
             )
         # R2 (Vendor Authorization report) sigue siendo export simple.

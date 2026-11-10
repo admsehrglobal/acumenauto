@@ -121,6 +121,11 @@ class ChunkedReport(NamedTuple):
     # 'Amount' igual que el bueno, asi que el invoice split lo hubiera aceptado
     # y entregado un archivo con SOLO los pagados y la pila de rechazados vacia.
     required_columns: tuple[str, ...] = ()
+    # Columns every chunk of the `extra_tabs` must carry. The main tab's list
+    # cannot be reused (it is what tells the main tab apart, so the extra tab
+    # by definition lacks some of it), but no list at all let a missing
+    # 'Status' or 'Entry ID' blank the column and empty the payable pile.
+    extra_tab_required_columns: tuple[str, ...] = ()
 
 
 # R1 goes out as two files: the rejections first, the payable entries after the
@@ -239,6 +244,7 @@ async def download_reports(
                         exceptions=spec.exceptions,
                         required_columns=spec.required_columns,
                         extra_tabs=spec.extra_tabs,
+                        extra_tab_required_columns=spec.extra_tab_required_columns,
                     )
 
                 chunked_items = await _attempt(spec.button_name, export_chunked)
@@ -1029,6 +1035,7 @@ async def _export_chunked_report(
     exceptions: DropSpec | None = None,
     required_columns: tuple[str, ...] = (),
     extra_tabs: tuple[str, ...] = (),
+    extra_tab_required_columns: tuple[str, ...] = (),
 ) -> list[tuple[Path, str]]:
     """Click el boton del reporte una vez y exporta N veces cambiando el rango
     (sin recargar la pagina entre chunks).
@@ -1283,8 +1290,8 @@ async def _export_chunked_report(
             "min": extra_min,
             "max": extra_max,
             # `required_columns` identifica al tab principal; este tab, por
-            # definicion, no las tiene todas.
-            "required_columns": (),
+            # definicion, no las tiene todas. It is checked against its own.
+            "required_columns": extra_tab_required_columns,
             "prefix": f"_tab{index}",
         })
         extra_end = extra_max if full_range else min(today, extra_max)
@@ -1619,6 +1626,7 @@ def _merge_xlsx_files(
     keep_entry_ids: frozenset | None = None,
     drop: DropSpec | None = None,
     sheet_name: str | None = None,
+    entry_id_counts: dict | None = None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
@@ -1653,9 +1661,11 @@ def _merge_xlsx_files(
     without this function growing a second code path: passing None leaves every
     line below identical to what R3 has always run. Passing it also deduplicates
     by `Entry ID`, keeping the last row seen — see the write loop for why the
-    two tabs can hand us the same entry twice. The dedup only sees the paths of
-    one call, which is every part of the report on the merge that matters; a
-    per-group re-merge in `_split_for_email` works on already-merged rows. A filter that matches nothing
+    two tabs can hand us the same entry twice. On its own the dedup only sees
+    the paths of one call, so `_split_for_email` passes `entry_id_counts`, the
+    copies of each Entry ID over the whole pile: every group then decrements
+    the same dict and only the pile's last copy is written, the one the
+    single-file merge keeps. The dict is consumed. A filter that matches nothing
     writes a header-only file rather than failing — a day with no rejected-only
     invoices is a legitimate empty pile, not a broken report. The zero-row guard
     below covers the whole merge; with more than one tab it can no longer tell
@@ -1681,7 +1691,7 @@ def _merge_xlsx_files(
     entry_id_col: int | None = None
     # Veces que aparece cada Entry ID. El loop de escritura lo decrementa y
     # solo escribe cuando llega a cero, o sea en la ULTIMA aparicion.
-    entry_id_seen: dict = {}
+    entry_id_seen: dict = {} if entry_id_counts is None else entry_id_counts
     for path in paths:
         rows = _read(path)
         if not rows or not any(c not in (None, "") for c in rows[0]):
@@ -1697,7 +1707,7 @@ def _merge_xlsx_files(
             )
         for row in _data_rows(rows):
             total_rows += 1
-            if entry_id_col is not None:
+            if entry_id_col is not None and entry_id_counts is None:
                 eid = row[entry_id_col]
                 entry_id_seen[eid] = entry_id_seen.get(eid, 0) + 1
 
@@ -1862,6 +1872,18 @@ def _split_for_email(
         len(groups), rows_budget,
     )
 
+    # Copies of each Entry ID over the whole pile, not per group: the two
+    # copies of an entry paid between the tab exports can land in different
+    # groups, and each group alone would write its own.
+    entry_id_counts: dict | None = None
+    if keep_entry_ids is not None:
+        entry_id_counts = {}
+        for path in parts:
+            rows = _read(path)
+            col = resolve_columns(rows[0]).entry_id
+            for row in _data_rows(rows):
+                entry_id_counts[row[col]] = entry_id_counts.get(row[col], 0) + 1
+
     outputs: list[tuple[Path, dt.date, dt.date]] = []
     for idx, group in enumerate(groups, 1):
         # min/max over the group, not first/last: `parts` is only chronological
@@ -1877,7 +1899,10 @@ def _split_for_email(
             f"{slug}_{group_start.isoformat()}_to_{group_end.isoformat()}"
             f"_{idx:02d}_{timestamp_label}.xlsx"
         )
-        _merge_xlsx_files(group, out_path, keep_entry_ids, drop)
+        _merge_xlsx_files(
+            group, out_path, keep_entry_ids, drop,
+            entry_id_counts=entry_id_counts,
+        )
         outputs.append((out_path, group_start, group_end))
     merged_path.unlink(missing_ok=True)
     if drop is not None:

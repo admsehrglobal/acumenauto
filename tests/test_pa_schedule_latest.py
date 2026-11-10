@@ -10,7 +10,8 @@ This does NOT fix those 68 rows: production seeds through
 `_seed_pa_schedules_if_empty`, which reads app/data/pa_seed.csv as-is (one row
 per PA, still holding the old End Dates), and R2 no longer lists those two
 expired PAs, so the refresh never overwrites them. That needs the CSV and the
-loaded `source='seed'` rows corrected from a trusted source.
+loaded `source='seed'` rows corrected from a trusted source: done by the
+regenerated CSV plus migration 0019 (see test_seed_end_date_migration).
 """
 import datetime as dt
 import tempfile

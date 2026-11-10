@@ -77,3 +77,11 @@ class CorrectSeedEndDates(TestCase):
         self.assertEqual(mig.correct_seed_end_dates(PaSchedule), 2)
         self.assertEqual(self._dates("1553364014")[1], dt.date(2026, 7, 7))
         self.assertEqual(self._dates("1553407554")[1], dt.date(2026, 8, 28))
+
+    def test_repo_csv_keeps_newest_export_start_on_end_date_tie(self):
+        # Both exports end 1553453320 on 2026-09-07; the newer one (2026-08-28)
+        # keeps the original 2025-09-08 start, the older one says 2025-10-12.
+        self._row("1553453320", dt.date(2025, 9, 8), dt.date(2025, 12, 31))
+        self.assertEqual(mig.correct_seed_end_dates(PaSchedule), 1)
+        self.assertEqual(self._dates("1553453320"),
+                         (dt.date(2025, 9, 8), dt.date(2026, 9, 7)))

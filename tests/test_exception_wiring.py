@@ -290,6 +290,31 @@ class ExceptionWiringTests(unittest.TestCase):
         self.assertEqual(sent, [], "se mando un archivo con una columna renombrada")
         self.assertFalse(path.exists(), "el archivo retenido tiene que borrarse")
 
+    def test_a_header_only_auth_file_is_not_emailed_even_with_an_empty_auths_list(self):
+        """The zero-row guard used to live only inside the exceptions filter, so
+        an empty R2 went out with the run green whenever the auths list was empty."""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        wb.active.append(list(cmd.AUTH_COLUMNS))
+        path = self.tmp / "r_empty.xlsx"
+        wb.save(path)
+        sent = []
+
+        def _ready(callback):
+            with mock.patch.object(cmd, "_refresh_pa_schedules", lambda p: None), \
+                    mock.patch.object(
+                        cmd, "send_reports_email",
+                        lambda items, r, l, override=None: sent.append(items) or []):
+                callback(path, settings.DCI_REPORT_BUTTON_NAME_2)
+
+        with mock.patch.dict(_ROWS, {"auths": []}):
+            self._run(ready=_ready)
+        self.assertEqual(sent, [], "an auth file with no rows was emailed")
+        self.assertFalse(path.exists(), "the held-back file has to be deleted")
+        self.assertEqual(self.run.status, cmd.Run.Status.FAILED)
+        self.assertIn(settings.DCI_REPORT_BUTTON_NAME_2, self.run.error_message)
+
     def test_a_new_auth_column_still_goes_out(self):
         """Una columna que no conocemos es dato agregado, no una perdida.
 

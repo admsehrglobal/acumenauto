@@ -176,6 +176,20 @@ class DeliveryOrderTests(unittest.TestCase):
         self._run_command()
         self.assertEqual(self.run.attempt_number, 1)
 
+    def test_a_failure_after_a_send_error_reports_both(self):
+        """A mail Brevo refused earlier in the run must not vanish from the
+        record (and the alert built from it) because something else raised."""
+        def _refused(items, recipients, label, override=None):
+            raise RuntimeError("Brevo refused the mail")
+
+        with mock.patch.object(cmd, "send_reports_email", _refused), \
+                self.assertRaises(RuntimeError):
+            self._run_command(fail_after=RuntimeError("R3: Timeout 60000ms exceeded"))
+
+        self.assertIn("R3: Timeout", self.run.error_message)
+        self.assertIn("Brevo refused the mail", self.run.error_message)
+        self.assertIn(PILE_REJECTED, self.run.error_message)
+
 
 if __name__ == "__main__":
     unittest.main()

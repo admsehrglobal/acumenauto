@@ -399,7 +399,10 @@ def _load_list(slug: str) -> DropSpec | None:
 
 
 def _drop_late_entries(
-    path: Path, exceptions: dict[str, DropSpec | None], read_at_start: frozenset
+    path: Path,
+    exceptions: dict[str, DropSpec | None],
+    read_at_start: frozenset,
+    payable: bool = False,
 ) -> None:
     """Take out of an invoice file what went on the list after the run read it.
 
@@ -415,9 +418,17 @@ def _drop_late_entries(
     Only the invoice file: the auth file is filtered a minute or two after the
     list is read, and the accrual file is written by its own code, which a
     rewrite here would undo.
+
+    With the list empty at start the merge ran with no spec, so `stats` cannot
+    tell which file is an invoice pile; `payable` says so for the payable pile,
+    the one that goes out after the gap.
     """
     spec = exceptions["invoices"]
-    if spec is None or path not in spec.stats:
+    if spec is None:
+        if payable:
+            _apply_fresh_list(path, exceptions)
+        return
+    if path not in spec.stats:
         return
     fresh = _load_list("invoices")
     late = (fresh.keys if fresh is not None else frozenset()) - read_at_start
@@ -442,6 +453,24 @@ def _drop_late_entries(
     logger.warning(
         "[EXCEPTIONS] %s: %d entradas cargadas durante la corrida, %d filas mas",
         path.name, len(late), dropped,
+    )
+
+
+def _apply_fresh_list(path: Path, exceptions: dict[str, DropSpec | None]) -> None:
+    """Apply the invoice list as it is now to a pile the merge left unfiltered
+    because the list was empty when the run read it."""
+    fresh = _load_list("invoices")
+    if fresh is None:
+        return
+    # The merge refuses a file with no rows, and there is nothing to take out.
+    if not any(True for _ in _data_rows(_read(path))):
+        return
+    _apply_exceptions_in_place(path, fresh)
+    # The run record and the stamp then count it like a list read at start.
+    exceptions["invoices"] = fresh
+    logger.warning(
+        "[EXCEPTIONS] %s: %d entradas cargadas durante la corrida, %d filas mas",
+        path.name, len(fresh.keys), sum(n for n, _ in fresh.stats.values()),
     )
 
 
@@ -681,7 +710,10 @@ class Command(BaseCommand):
 
         def _send(path: Path, display_name: str) -> None:
             try:
-                _drop_late_entries(path, exceptions, invoice_keys_read)
+                _drop_late_entries(
+                    path, exceptions, invoice_keys_read,
+                    payable=PILE_PAYABLE in display_name,
+                )
             except Exception:  # noqa: BLE001 - it still goes out as the merge left it
                 logger.exception(
                     "[EXCEPTIONS] no pude sacar de %s lo cargado durante la corrida",
@@ -737,6 +769,14 @@ class Command(BaseCommand):
                         "[REPORT] columnas inesperadas en %s", display_name
                     )
                     send_errors.append(f"{display_name}: {exc}")
+                    path.unlink(missing_ok=True)
+                    return
+                # A header-only export (a dropped session, a filter left on in
+                # the portal) is held back the same way, whatever the auths list
+                # holds: the merge's zero-row check only ran when it was non-empty.
+                if not any(True for _ in _data_rows(_read(path))):
+                    logger.error("[REPORT] %s llego sin filas", display_name)
+                    send_errors.append(f"{display_name}: export has no data rows")
                     path.unlink(missing_ok=True)
                     return
                 # El refresh va con el archivo ENTERO, antes de filtrarlo: una
@@ -810,7 +850,9 @@ class Command(BaseCommand):
             # Algunos reportes pueden haberse entregado antes del fallo.
             run.status = Run.Status.FAILED
             run.filenames = ";".join(sent)
-            messages = [str(exc)]
+            # Earlier send or validation failures (an R2 held back, a mail Brevo
+            # refused) go in too, or the alert names only what raised last.
+            messages = [str(exc)] + send_errors
             if deferred:
                 # The payable pile is a delivery of its own. Losing it to a later
                 # failure — R3 timing out, or the soft limit landing inside the

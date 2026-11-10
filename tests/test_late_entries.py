@@ -263,6 +263,27 @@ class LateEntryTests(unittest.TestCase):
         cmd._drop_late_entries(other, {"invoices": spec}, spec.keys)
         self.assertEqual(other.read_bytes(), before)
 
+    def test_an_entry_added_during_the_gap_to_an_empty_list_comes_out_of_the_payable_pile(self):
+        """With nothing on the list at start the merge ran with no spec at all;
+        what Paul adds during the gap still has to come out of the payable pile."""
+        self.live["invoices"] = []
+        self.during_gap = lambda: self.live["invoices"].append(("200", ""))
+        self._run(
+            [_r1("1", "300", "Rejected")],
+            [_r1("2", "200"), _r1("3", "400")],
+        )
+        self.assertEqual(self._invoices(PILE_PAYABLE), ["400"])
+        self.assertEqual(
+            self.run.exceptions_summary,
+            "Invoices: 1 rows dropped (1 of 1 keys matched)",
+        )
+
+    def test_an_empty_list_that_stays_empty_leaves_the_payable_pile_untouched(self):
+        self.live["invoices"] = []
+        self._run([_r1("1", "300", "Rejected")], [_r1("2", "200"), _r1("3", "400")])
+        self.assertEqual(self.sent_bytes[PILE_PAYABLE], self.written_bytes[PILE_PAYABLE])
+        self.assertEqual(self.run.exceptions_summary, "")
+
     def test_the_late_entry_is_stamped_as_matched(self):
         self.during_download = lambda: self.live["invoices"].append(("200", ""))
         self._run([_r1("9", "300", "Rejected")], [_r1("2", "200"), _r1("3", "400")])

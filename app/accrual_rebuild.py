@@ -302,6 +302,12 @@ def resolve_shared_pas(pa_names: dict, lookup: dict) -> dict:
     counts only when it is exactly one. The client whose name maps to the
     lookup DDDID keeps it; the others get the DDDID their name maps to, or None.
     If no client maps to the lookup DDDID, all of them get None — never a guess.
+
+    A client with no PA of its own keeps the PA's lookup DDDID (once another
+    client is shown to own it): Acumen's own accrual file of 2026-08-28 listed
+    'McAllen, R.' and 'McAllen, L.' on PA 1553416016 with the same 664508, and
+    R1 bills both under it, so blanking R. would drop 53 funded rows that import
+    fine today. Only a name seen with two DDDIDs goes out blank.
     """
     by_name: dict[str, dict] = {}
     for pa, names in pa_names.items():
@@ -320,7 +326,10 @@ def resolve_shared_pas(pa_names: dict, lookup: dict) -> dict:
         dddid = _norm_name(facts.client_dddid)
         owned = bool(dddid) and any(n in known and known[n][0] == dddid for n in names)
         shared[pa] = {
-            n: (known[n][1] if owned and n in known else None) for n in names
+            n: (None if not owned else
+                known[n][1] if n in known else
+                facts.client_dddid if n not in by_name else None)
+            for n in names
         }
     return shared
 

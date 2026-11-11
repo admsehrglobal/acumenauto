@@ -9,8 +9,10 @@ and an exception on (653983, 1553308787) could never match.
 Rule (owner's decision): the client whose name maps to the lookup DDDID keeps
 it; every other client gets the DDDID its name maps to in the same matrix
 (built from PAs listed under one client only, and only when the name maps to
-exactly one DDDID), or a blank. If no client can be shown to own the lookup
-DDDID, all of them go out blank. Start/End Date still come from the lookup.
+exactly one DDDID), or a blank. A client with no PA of its own keeps the
+lookup DDDID, as Acumen's own file did. If no client can be shown to own the
+lookup DDDID, all of them go out blank. Start/End Date still come from the
+lookup.
 """
 import datetime as dt
 import logging
@@ -67,16 +69,17 @@ class SharedPaTests(unittest.TestCase):
         # The dates still come from the lookup.
         self.assertEqual(got["Schlitt, N."][3:5], [START, END])
 
-    def test_an_unresolvable_second_client_is_blank_not_guessed(self):
-        """'VOID, V.' has no PA of its own: it cannot be told apart, so blank."""
+    def test_a_second_client_with_no_pa_of_its_own_keeps_the_pa_dddid(self):
+        """'McAllen, R.' has no PA of its own; Acumen lists it on PA 1553416016
+        with the same DDDID as 'McAllen, L.', so blanking it would drop rows."""
         rows = matrix([
-            line("SHARED", WEEK, 5, client="Bailey, C."),
-            line("SHARED", WEEK, 5, client="VOID, V."),
-            line("ABREU_ONLY", WEEK, 5, client="Bailey, C."),
+            line("SHARED", WEEK, 5, client="McAllen, L."),
+            line("SHARED", WEEK, 5, client="McAllen, R."),
+            line("ABREU_ONLY", WEEK, 5, client="McAllen, L."),
         ])
         got = _by_client(rebuild(rows, _lookup()).rows)
-        self.assertEqual(got["Bailey, C."][1], "431798")
-        self.assertIsNone(got["VOID, V."][1])
+        self.assertEqual(got["McAllen, L."][1], "431798")
+        self.assertEqual(got["McAllen, R."][1], "431798")
 
     def test_a_name_with_two_dddids_is_ambiguous(self):
         rows = matrix([

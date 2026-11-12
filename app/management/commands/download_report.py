@@ -77,6 +77,7 @@ from app.scraper import (
     MatrixReport,
     _apply_exceptions_in_place,
     _data_rows,
+    _drop_ended_authorizations,
     _read,
     download_reports,
     require_known_columns,
@@ -792,6 +793,32 @@ class Command(BaseCommand):
                 # se filtrara primero ese PA quedaria congelado en la tabla que
                 # alimenta el accrual.
                 _refresh_pa_schedules(path)
+                # After the refresh for the same reason: an ended authorization
+                # leaves the email, not the lookup the accrual file is built from.
+                try:
+                    ended = _drop_ended_authorizations(path, nj_started.date())
+                except Exception as exc:
+                    # Held back like a failed exceptions filter: the run goes
+                    # FAILED with a notice instead of mailing the ended rows.
+                    logger.exception(
+                        "[REPORT] no se pudieron sacar las auths vencidas de %s",
+                        display_name,
+                    )
+                    send_errors.append(f"{display_name}: {exc}")
+                    path.unlink(missing_ok=True)
+                    return
+                if ended:
+                    logger.warning(
+                        "[REPORT] %s: %d autorizaciones con End Date antes de %s, "
+                        "fuera del mail", display_name, ended, nj_started.date(),
+                    )
+                    if not any(True for _ in _data_rows(_read(path))):
+                        logger.error("[REPORT] %s: todas vencidas", display_name)
+                        send_errors.append(
+                            f"{display_name}: every authorization had ended"
+                        )
+                        path.unlink(missing_ok=True)
+                        return
                 drop = exceptions["auths"]
                 if drop is not None:
                     try:

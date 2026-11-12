@@ -35,7 +35,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
-from app.accrual_rebuild import find_header_row
+from app.accrual_rebuild import as_date, find_header_row
 from app.file_exceptions import DropSpec, RowFilter
 from app.invoice_split import (
     PILE_PAYABLE,
@@ -814,6 +814,37 @@ def _apply_exceptions_in_place(path: Path, drop: DropSpec) -> None:
         # original Path, and that is the one the command checks before emailing.
         drop.emptied.discard(filtered)
         drop.emptied.add(path)
+
+
+def _drop_ended_authorizations(path: Path, today: dt.date) -> int:
+    """Take out of R2 the authorizations whose End Date is before `today`.
+
+    Until 2026-10-29 the Vendor Authorization Report only listed authorizations
+    still running. By 2026-11-08 Acumen had widened it: it also lists the ones
+    that ended in the last ~90 days (1,071 of 4,833 rows; none of them past its
+    Expiration Date). ZipRide loads this file as its SDR import, and Jessica
+    asked on 2026-11-11 for the ended ones to stay out, because they hide the
+    clients who stopped service. Rows ending today are still running and stay;
+    a row whose End Date cannot be read stays too, so nothing leaves on a guess.
+
+    Rewritten in place like `_apply_exceptions_in_place`, and only when there is
+    something to take out. Returns how many rows were taken out.
+    """
+    rows = _read(path)
+    end_col = [str(c).strip() for c in rows[0]].index("End Date")
+
+    def ended(row) -> bool:
+        end = as_date(row[end_col]) if end_col < len(row) else None
+        return end is not None and end < today
+
+    n = sum(1 for row in _data_rows(rows) if ended(row))
+    if n:
+        sheet_name = python_calamine.CalamineWorkbook.from_path(str(path)).sheet_names[0]
+        filtered = path.with_name(f"{path.stem}.current{path.suffix}")
+        _merge_xlsx_files([path], filtered, sheet_name=sheet_name,
+                          keep_row=lambda row: not ended(row))
+        os.replace(filtered, path)
+    return n
 async def _export_matrix_visual(page, iframe, target: Path) -> bool:
     """Export the matrix visual as 'Summarized data'. True if a file landed.
 
@@ -1641,6 +1672,7 @@ def _merge_xlsx_files(
     drop: DropSpec | None = None,
     sheet_name: str | None = None,
     entry_id_counts: dict | None = None,
+    keep_row=None,
 ) -> Path:
     """Concat vertical de N xlsx con single-row header.
 
@@ -1692,6 +1724,8 @@ def _merge_xlsx_files(
     split; an optional one simply reads as empty).
     What was dropped is recorded on the spec itself, per output file.
     `sheet_name` (optional) names the output sheet; the default is xlsxwriter's.
+    `keep_row` (optional) writes only the rows it returns True for; see
+    `_drop_ended_authorizations`.
     """
     if not paths:
         raise ValueError("No paths to merge")
@@ -1772,6 +1806,8 @@ def _merge_xlsx_files(
                 if entry_id_seen[eid] > 0:
                     continue
             if row_filter is not None and row_filter.drops(row):
+                continue
+            if keep_row is not None and not keep_row(row):
                 continue
             _write_row(row)
             written += 1
